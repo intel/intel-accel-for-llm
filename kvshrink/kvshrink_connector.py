@@ -329,8 +329,9 @@ class KVShrinkConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        state = self._req_states.pop(request.request_id, None)
-        return state is None or not state.is_async, None
+        # True = defer freeing to get_finished() (async load/save may still run).
+        self._req_states.pop(request.request_id, None)
+        return True, None
 
     def build_connector_meta(
         self,
