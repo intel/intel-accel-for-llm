@@ -401,10 +401,18 @@ class KVShrinkConnector(KVConnectorBase_V1):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        # Activate early-promoted tasks (first N layers already loaded) for this
-        # forward pass; wait_for_layer_load() waits on their remaining layers.
-        self._active_promoted_tasks = self._early_promoted_tasks
-        self._early_promoted_tasks = {}
+        # A no-forward batch cannot consume promoted tasks layer by layer.
+        if forward_context.attn_metadata is not None:
+            duplicates = (
+                self._active_promoted_tasks.keys()
+                & self._early_promoted_tasks.keys()
+            )
+            if duplicates:
+                raise RuntimeError(
+                    f"Duplicate promoted load tasks for requests {duplicates}"
+                )
+            self._active_promoted_tasks.update(self._early_promoted_tasks)
+            self._early_promoted_tasks = {}
 
         sync_block_ids: list[int] = []
         sync_block_hashes: list[str] = []
