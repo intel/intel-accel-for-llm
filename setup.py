@@ -100,16 +100,13 @@ class CMakeBuild(build_ext):
 def get_package_data():
     packages = find_packages(include=PACKAGE_INCLUDES)
     package_data = {}
-    # Patterns are relative to each package dir. "**" is expanded recursively by
-    # setuptools, so version-scoped patch folders (e.g. patch/v0.23.0/) are
-    # packaged with their subpath preserved.
-    patterns = ["*.so", "*.sh", "*.patch", "patch/**/*.patch"]
+    patterns = ["*.so", "*.sh", "*.patch"]
 
     for package in packages:
         found_patterns = []
         package_dir = os.path.join(ROOT_DIR, package.replace(".", os.sep))
         for pattern in patterns:
-            files = glob(os.path.join(package_dir, pattern), recursive=True)
+            files = glob(os.path.join(package_dir, pattern))
             if files:
                 found_patterns.append(pattern)
         if found_patterns:

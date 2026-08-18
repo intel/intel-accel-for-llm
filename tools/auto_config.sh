@@ -1,48 +1,5 @@
 #!/usr/bin/env bash
 
-apply_vllm_scheduler_patch() {
-    local patch_file=$1
-    local vllm_package_dir scheduler_file
-
-    if [[ ! -f "$patch_file" ]]; then
-        echo "ERROR: vLLM scheduler patch not found: $patch_file" >&2
-        return 1
-    fi
-    if ! command -v patch >/dev/null 2>&1; then
-        echo "ERROR: patch is required to update the installed vLLM" >&2
-        return 1
-    fi
-    vllm_package_dir=$(python3 -c '
-import importlib.util
-import os
-
-spec = importlib.util.find_spec("vllm")
-if spec is not None and spec.origin is not None:
-    print(os.path.dirname(spec.origin))
-') || return 1
-    if [[ -z "$vllm_package_dir" ]]; then
-        echo "vLLM is not installed; skipping scheduler-factor.patch"
-        return
-    fi
-    scheduler_file="$vllm_package_dir/v1/core/sched/scheduler.py"
-    if [[ ! -f "$scheduler_file" ]]; then
-        echo "ERROR: vLLM scheduler not found: $scheduler_file" >&2
-        return 1
-    fi
-
-    if grep -q "KVSHRINK_VLLM_SCHEDULER_FACTOR" "$scheduler_file"; then
-        echo "scheduler-factor.patch already applied to $vllm_package_dir"
-        return
-    fi
-    if ! patch --dry-run --silent -p1 -d "$vllm_package_dir" < "$patch_file"; then
-        echo "ERROR: scheduler-factor.patch does not apply to $vllm_package_dir" >&2
-        return 1
-    fi
-
-    echo "Applying scheduler-factor.patch to $vllm_package_dir ..."
-    patch --silent -p1 -d "$vllm_package_dir" < "$patch_file"
-}
-
 validate_tp_size() {
     local tp_size=$1
     if ! [[ "$tp_size" =~ ^[1-9][0-9]*$ ]]; then
