@@ -23,6 +23,8 @@ export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy t
 # ---- Async KV load ----------------------------------------------------------
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=${KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD:--1} # -1=always sync, 0=always async, N=async when in-flight reqs >= N
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS:--1}       # -1=wait all layers, N=start prefill after first N layers (needs THRESHOLD>=0)
+export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC:-1} # 0=fixed LAYERS, 1=select layers from DYNAMIC_MAP per request concurrency
+export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP:-6:4,*:8}" # Inclusive max-concurrency:layers rules; numeric bounds must be >= THRESHOLD and '*' is the required fallback
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
@@ -62,7 +64,9 @@ printf '%s\n' \
     "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
     "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=$KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS"
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
 
 # ---- Cache / compression ----------------------------------------------------
 export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy LSB truncation: 'auto', 0 (off), or N bits
@@ -131,6 +135,7 @@ ENV_VARS=(
     https_proxy
     HOST_IP
     MODEL
+    TP_SIZE
     DEVICE
 )
 
