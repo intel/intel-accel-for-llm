@@ -12,6 +12,8 @@ vllm serve "$MODEL" \
     --trust-remote-code \
     --gpu-memory-utilization 0.8 \
     -tp "$TP_SIZE" \
-    --max-model-len 18k \
+    --max-model-len 32765 \
+    --block-size "${BLOCK_SIZE:-16}" \
+    --port "${PORT:-8000}" \
     --no-enable-prefix-caching \
     2>&1 | tee log.kvshrink-vllm

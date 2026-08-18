@@ -21,10 +21,10 @@ export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-1} # Enable CPU compression wo
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
 
 # ---- Async KV load ----------------------------------------------------------
-export KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=${KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD:--1} # -1=always sync, 0=always async, N=async when in-flight reqs >= N
-export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS:--1}       # -1=wait all layers, N=start prefill after first N layers (needs THRESHOLD>=0)
+export KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=${KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED:-1}      # Enable asynchronous KV loading (0/1)
+export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS:--1}       # -1=wait all layers, N=start prefill after first N layers (used when DYNAMIC=0)
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC:-1} # 0=fixed LAYERS, 1=select layers from DYNAMIC_MAP per request concurrency
-export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP:-6:4,*:8}" # Inclusive max-concurrency:layers rules; numeric bounds must be >= THRESHOLD and '*' is the required fallback
+export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP:-0-3:0,4-6:4,7-:8}" # Contiguous START-END:LAYERS rules from 0; 0 layers means sync and the final range is open-ended
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
@@ -63,7 +63,7 @@ printf '%s\n' \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
     "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=$KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=$KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"

@@ -75,10 +75,15 @@ With early-layer promotion, the worker reports a load complete after the first c
 - **Intel QAT reduces cache size.** KV blocks are compressed before entering the host cache. The smaller representation raises effective DDR capacity and lowers persistence bandwidth.
 - **Minimal compute interference.** When QAT is enabled, compression and decompression run asynchronously on dedicated hardware, so cache-size reduction adds little pressure to inference CPU resources and is designed to have minimal impact on model execution performance. Compatible CPU DEFLATE workers remain available when software capacity is needed.
 
-## Scheduling and Data-Path Optimizations
+## Data-Path Optimizations
 
 - **Decompression-inference overlap:** KVShrink starts prefill after the configured leading KV layers are ready, while IAXL continues decompressing and loading later layers in parallel with inference.
-- **Adaptive asynchronous loading:** `KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD` enables background loading according to in-flight request pressure.
+- **Adaptive asynchronous loading:** `KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED` enables background loading, while `KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP` selects synchronous or layer-gated asynchronous loading for each request-concurrency range.
 - **Layer-level overlap:** `KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS` controls when a partially loaded request may resume.
-- **Load-aware scheduling:** `KVSHRINK_VLLM_SCHEDULER_FACTOR` reserves token budget in proportion to externally loaded tokens, limiting load bursts in one scheduler step.
 - **Rank-local affinity:** CPU cores, QAT devices, and DSA work queues are assigned per tensor-parallel rank to preserve NUMA locality.
+
+The dynamic layer map uses contiguous inclusive concurrency ranges. It must
+start at zero and end with an open range. For example,
+`0-3:0,4-6:4,7-:8` selects synchronous loading for concurrency 0–3, waits for
+four layers at concurrency 4–6, and waits for eight layers at concurrency 7 or
+higher. A layer value of zero means synchronous loading for that range.

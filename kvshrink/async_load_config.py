@@ -16,30 +16,32 @@ logger = logging.getLogger(__name__)
 class AsyncLoadLayerConfig:
     """Select the number of leading KV layers required before prefill."""
 
-    load_threshold: int
+    enabled: bool
     dynamic: bool = False
     fixed_layers: int = -1
-    dynamic_rules: tuple[tuple[int, int], ...] = ()
-    dynamic_fallback: int = -1
+    dynamic_rules: tuple[tuple[int, Optional[int], int], ...] = ()
 
     def select(self, concurrency: int) -> int:
-        """Return the layer count selected for the request concurrency."""
+        """Return the layer count selected for the request concurrency.
+
+        A return value of zero selects synchronous loading for the request.
+        """
+        if not self.enabled:
+            return 0
         if not self.dynamic:
             return self.fixed_layers
-        for max_concurrency, layers in self.dynamic_rules:
-            if concurrency <= max_concurrency:
+        for start, end, layers in self.dynamic_rules:
+            if concurrency >= start and (end is None or concurrency <= end):
                 return layers
-        return self.dynamic_fallback
+        raise RuntimeError(f"No async load layer rule for concurrency {concurrency}")
 
 
 def _parse_dynamic_layer_map(
     specification: str,
     num_layers: int,
-    load_threshold: int,
-) -> tuple[tuple[tuple[int, int], ...], int]:
-    rules: list[tuple[int, int]] = []
-    fallback: Optional[int] = None
-    previous_max = 0
+) -> tuple[tuple[int, Optional[int], int], ...]:
+    rules: list[tuple[int, Optional[int], int]] = []
+    expected_start = 0
     entries = [entry.strip() for entry in specification.split(",")]
 
     if not entries or any(not entry for entry in entries):
@@ -52,9 +54,9 @@ def _parse_dynamic_layer_map(
         if len(parts) != 2:
             raise ValueError(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP entries must "
-                f"use MAX_CONCURRENCY:LAYERS, got {entry!r}"
+                f"use START-END:LAYERS, got {entry!r}"
             )
-        max_concurrency_text, layers_text = parts
+        concurrency_range, layers_text = (part.strip() for part in parts)
         try:
             layers = int(layers_text)
         except ValueError as error:
@@ -62,53 +64,64 @@ def _parse_dynamic_layer_map(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP layer values "
                 f"must be integers, got {layers_text!r}"
             ) from error
-        if not 1 <= layers < num_layers:
+        if not 0 <= layers < num_layers:
             raise ValueError(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP layer values "
-                f"must be in [1, {num_layers}), got {layers}"
+                f"must be in [0, {num_layers}), got {layers}"
             )
 
-        if max_concurrency_text == "*":
-            if index != len(entries) - 1:
-                raise ValueError(
-                    "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP wildcard "
-                    "must be the final entry"
-                )
-            fallback = layers
-            continue
-
+        range_parts = concurrency_range.split("-")
+        if len(range_parts) != 2:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP ranges must "
+                f"use START-END:LAYERS, got {entry!r}"
+            )
+        start_text, end_text = (part.strip() for part in range_parts)
         try:
-            max_concurrency = int(max_concurrency_text)
+            start = int(start_text)
+            end = int(end_text) if end_text else None
         except ValueError as error:
             raise ValueError(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP concurrency "
-                f"bounds must be positive integers or '*', got "
-                f"{max_concurrency_text!r}"
+                f"range bounds must be non-negative integers, got "
+                f"{concurrency_range!r}"
             ) from error
-        if max_concurrency <= previous_max:
+        if start < 0 or (end is not None and end < 0):
             raise ValueError(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP concurrency "
-                "bounds must be positive and strictly increasing"
+                "range bounds must be non-negative"
             )
-        if max_concurrency < load_threshold:
+        if start != expected_start:
             raise ValueError(
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP concurrency "
-                f"bounds must be at least the async load threshold "
-                f"{load_threshold}, got {max_concurrency}"
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP ranges must "
+                f"start at 0 and be contiguous; expected start "
+                f"{expected_start}, got {start}"
             )
-        rules.append((max_concurrency, layers))
-        previous_max = max_concurrency
+        if end is None:
+            if index != len(entries) - 1:
+                raise ValueError(
+                    "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP open "
+                    "range must be the final entry"
+                )
+        elif end < start:
+            raise ValueError(
+                "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP range end "
+                f"must be at least its start, got {concurrency_range!r}"
+            )
+        else:
+            expected_start = end + 1
+        rules.append((start, end, layers))
 
-    if fallback is None:
+    if rules[-1][1] is not None:
         raise ValueError(
-            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP must end with a "
-            "wildcard entry such as '*:8'"
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP must end with an "
+            "open range such as '7-:8'"
         )
-    return tuple(rules), fallback
+    return tuple(rules)
 
 
 def build_async_load_layer_config(
-    load_threshold: int,
+    async_enabled: int,
     fixed_layers: int,
     dynamic_enabled: int,
     dynamic_map: str,
@@ -116,10 +129,10 @@ def build_async_load_layer_config(
     dynamic_map_configured: bool = True,
 ) -> AsyncLoadLayerConfig:
     """Validate async-load layer settings and build the selection policy."""
-    if load_threshold < -1:
+    if async_enabled not in (0, 1):
         raise ValueError(
-            "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD must be at least -1, "
-            f"got {load_threshold}"
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED must be 0 or 1, got "
+            f"{async_enabled}"
         )
     if dynamic_enabled not in (0, 1):
         raise ValueError(
@@ -127,14 +140,13 @@ def build_async_load_layer_config(
             f"{dynamic_enabled}"
         )
 
-    if load_threshold == -1:
-        if fixed_layers != -1 or dynamic_enabled:
-            logger.warning(
-                "Ignoring async load layer configuration because "
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=-1 disables async "
-                "loading"
-            )
-        return AsyncLoadLayerConfig(load_threshold=load_threshold)
+    if not async_enabled:
+        logger.warning(
+            "Ignoring async load layer configuration because "
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=0 disables async "
+            "loading"
+        )
+        return AsyncLoadLayerConfig(enabled=False)
 
     if dynamic_enabled:
         if fixed_layers != -1:
@@ -143,16 +155,14 @@ def build_async_load_layer_config(
                 "dynamic async load layers are enabled",
                 fixed_layers,
             )
-        rules, fallback = _parse_dynamic_layer_map(
+        rules = _parse_dynamic_layer_map(
             dynamic_map,
             num_layers,
-            load_threshold,
         )
         return AsyncLoadLayerConfig(
-            load_threshold=load_threshold,
+            enabled=True,
             dynamic=True,
             dynamic_rules=rules,
-            dynamic_fallback=fallback,
         )
 
     if dynamic_map_configured:
@@ -167,7 +177,7 @@ def build_async_load_layer_config(
             f"[1, {num_layers}), got {fixed_layers}"
         )
     return AsyncLoadLayerConfig(
-        load_threshold=load_threshold,
+        enabled=True,
         fixed_layers=fixed_layers,
     )
 
@@ -202,8 +212,8 @@ def load_async_load_layer_config_from_env(
             raise ValueError(f"{name} must be an integer, got {value!r}") from error
 
     return build_async_load_layer_config(
-        load_threshold=required_int(
-            "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD"
+        async_enabled=required_int(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED"
         ),
         fixed_layers=required_int("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS"),
         dynamic_enabled=required_int(

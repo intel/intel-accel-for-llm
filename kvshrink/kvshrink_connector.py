@@ -242,22 +242,21 @@ class KVShrinkConnector(KVConnectorBase_V1):
         # Decide sync vs async for this request. The load can only be async when
         # there are external tokens to load and async is enabled. Concurrency is
         # approximated by the number of in-flight requests (this one included).
-        use_async = (
-            num_new_tokens > 0
-            and self._async_load_layer_config.load_threshold >= 0
-            and len(self._req_states)
-            >= self._async_load_layer_config.load_threshold
+        selected_layers = self._async_load_layer_config.select(
+            len(self._req_states)
         )
+        # A dynamic-map layer value of 0 selects synchronous loading. It is not
+        # an async request that resumes before layer 0.
+        use_async = num_new_tokens > 0 and selected_layers != 0
         state.is_async = use_async
         if use_async:
-            state.async_load_layers = self._async_load_layer_config.select(
-                len(self._req_states)
-            )
+            state.async_load_layers = selected_layers
 
         logger.info(
             f"get_num_new_matched_tokens, req-{request.request_id}, "
             f"externally-cached tokens: {num_new_tokens}, "
             f"locally-cached tokens: {num_computed_tokens}, async={use_async}, "
+            f"selected_load_layers={selected_layers}, "
             f"async_load_layers={state.async_load_layers}"
         )
         return num_new_tokens, use_async
