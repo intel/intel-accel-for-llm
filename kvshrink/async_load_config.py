@@ -4,6 +4,8 @@
 """Configuration policy for KVShrink asynchronous KV loading."""
 
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,6 +16,7 @@ logger = logging.getLogger(__name__)
 class AsyncLoadLayerConfig:
     """Select the number of leading KV layers required before prefill."""
 
+    load_threshold: int
     dynamic: bool = False
     fixed_layers: int = -1
     dynamic_rules: tuple[tuple[int, int], ...] = ()
@@ -113,6 +116,11 @@ def build_async_load_layer_config(
     dynamic_map_configured: bool = True,
 ) -> AsyncLoadLayerConfig:
     """Validate async-load layer settings and build the selection policy."""
+    if load_threshold < -1:
+        raise ValueError(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD must be at least -1, "
+            f"got {load_threshold}"
+        )
     if dynamic_enabled not in (0, 1):
         raise ValueError(
             "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC must be 0 or 1, got "
@@ -126,7 +134,7 @@ def build_async_load_layer_config(
                 "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=-1 disables async "
                 "loading"
             )
-        return AsyncLoadLayerConfig()
+        return AsyncLoadLayerConfig(load_threshold=load_threshold)
 
     if dynamic_enabled:
         if fixed_layers != -1:
@@ -141,6 +149,7 @@ def build_async_load_layer_config(
             load_threshold,
         )
         return AsyncLoadLayerConfig(
+            load_threshold=load_threshold,
             dynamic=True,
             dynamic_rules=rules,
             dynamic_fallback=fallback,
@@ -157,4 +166,52 @@ def build_async_load_layer_config(
             "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS must be -1 or in "
             f"[1, {num_layers}), got {fixed_layers}"
         )
-    return AsyncLoadLayerConfig(fixed_layers=fixed_layers)
+    return AsyncLoadLayerConfig(
+        load_threshold=load_threshold,
+        fixed_layers=fixed_layers,
+    )
+
+
+def load_async_load_layer_config_from_env(
+    num_layers: int,
+    environ: Mapping[str, str] | None = None,
+) -> AsyncLoadLayerConfig:
+    """Load async KV settings exported by ``setvars.sh``.
+
+    No defaults are supplied here. This keeps ``setvars.sh`` as the single
+    source of runtime defaults and makes missing configuration explicit.
+    """
+    source = os.environ if environ is None else environ
+
+    def required(name: str) -> str:
+        try:
+            value = source[name]
+        except KeyError as error:
+            raise ValueError(
+                f"{name} must be set; source setvars.sh before starting vLLM"
+            ) from error
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        return value
+
+    def required_int(name: str) -> int:
+        value = required(name)
+        try:
+            return int(value)
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from error
+
+    return build_async_load_layer_config(
+        load_threshold=required_int(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD"
+        ),
+        fixed_layers=required_int("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS"),
+        dynamic_enabled=required_int(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC"
+        ),
+        dynamic_map=required(
+            "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
+        ),
+        num_layers=num_layers,
+        dynamic_map_configured=True,
+    )

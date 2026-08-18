@@ -29,36 +29,10 @@ if TYPE_CHECKING:
 
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
 
-from .async_load_config import build_async_load_layer_config
+from .async_load_config import load_async_load_layer_config_from_env
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
-
-# Async KV load concurrency threshold:
-#   -1 = always sync (default), 0 = always async,
-#   N (>0) = use async load when the number of in-flight requests >= N.
-LOAD_KV_ASYNC_THRESHOLD = int(
-    os.getenv("KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD", "-1")
-)
-# Async early-start layer count (requires LOAD_KV_ASYNC_THRESHOLD >= 0):
-#   -1 = disabled (wait for all layers before marking the load finished),
-#   N (>=1) = mark the load finished once the first N layers are loaded; the
-#   remaining layers are waited on-demand during the prefill forward pass.
-ASYNC_LOAD_LAYER = int(os.getenv("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS", "-1"))
-# Dynamic async early-start configuration. The map uses inclusive concurrency
-# upper bounds followed by a required wildcard, for example 4:4,*:8.
-ASYNC_LOAD_LAYERS_DYNAMIC = int(
-    os.getenv("KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC", "0")
-)
-_ASYNC_LOAD_LAYERS_DYNAMIC_MAP_ENV = os.getenv(
-    "KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
-)
-ASYNC_LOAD_LAYERS_DYNAMIC_MAP = (
-    _ASYNC_LOAD_LAYERS_DYNAMIC_MAP_ENV or "4:4,*:8"
-)
-ASYNC_LOAD_LAYERS_DYNAMIC_MAP_CONFIGURED = (
-    _ASYNC_LOAD_LAYERS_DYNAMIC_MAP_ENV is not None
-)
 
 ReqId = str
 
@@ -157,20 +131,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
         # Early-promoted tasks active for the current forward pass.
         self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
 
-        if LOAD_KV_ASYNC_THRESHOLD < -1:
-            raise ValueError(
-                "KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD must be at least -1, "
-                f"got {LOAD_KV_ASYNC_THRESHOLD}"
-            )
-        self._async_load_layer_config = build_async_load_layer_config(
-            load_threshold=LOAD_KV_ASYNC_THRESHOLD,
-            fixed_layers=ASYNC_LOAD_LAYER,
-            dynamic_enabled=ASYNC_LOAD_LAYERS_DYNAMIC,
-            dynamic_map=ASYNC_LOAD_LAYERS_DYNAMIC_MAP,
+        self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
-            dynamic_map_configured=(
-                ASYNC_LOAD_LAYERS_DYNAMIC_MAP_CONFIGURED
-            ),
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -282,8 +244,9 @@ class KVShrinkConnector(KVConnectorBase_V1):
         # approximated by the number of in-flight requests (this one included).
         use_async = (
             num_new_tokens > 0
-            and LOAD_KV_ASYNC_THRESHOLD >= 0
-            and len(self._req_states) >= LOAD_KV_ASYNC_THRESHOLD
+            and self._async_load_layer_config.load_threshold >= 0
+            and len(self._req_states)
+            >= self._async_load_layer_config.load_threshold
         )
         state.is_async = use_async
         if use_async:
