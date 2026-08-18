@@ -4,6 +4,11 @@
 
 `iaxl` uses Intel hardware accelerators to improve LLM inference performance.
 
+## Design Documentation
+
+- [IAXL Design](doc/design/iaxl.md)
+- [KVShrink Design](doc/design/kvshrink.md)
+
 ## Host Setup
 
 1. Add `intel_iommu=on,sm_on iommu=pt` to the kernel command line, then reboot the host:

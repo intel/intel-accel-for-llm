@@ -2,6 +2,11 @@
 
 `iaxl` 利用 Intel 硬件加速器提升 LLM 推理性能。
 
+## 设计文档
+
+- [IAXL 设计](doc/design/iaxl.md)
+- [KVShrink 设计](doc/design/kvshrink.md)
+
 ## 配置宿主机
 
 1. 配置 kernel cmdline，加入 `intel_iommu=on,sm_on iommu=pt`，然后重启宿主机：
