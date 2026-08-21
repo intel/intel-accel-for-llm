@@ -81,6 +81,20 @@ export IAXL_PREALLOC_LIMIT=${IAXL_PREALLOC_LIMIT:-0}                     # Cap p
 export IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS=${IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS:-1} # Store the first N KV layers without compression
 # export IAXL_DDR_POOL_SIZE_GB=...         # DDR (host) cache pool size in GB (unset = 1/10 of RAM)
 
+# ---- Hybrid (GDN/Mamba) models ----------------------------------------------
+# Used only when the model has GDN/Mamba layers (e.g. Qwen3.5); pure
+# attention models ignore every knob below.
+export KVSHRINK_SAVE=${KVSHRINK_SAVE:-1}                     # Persist newly computed KV/state (0/1)
+export KVSHRINK_SAVE_PIPELINED=${KVSHRINK_SAVE_PIPELINED:-1} # Submit attention saves per layer during forward (0 = all after forward)
+# export KVSHRINK_PERSIST_DIR=...          # Commit-manifest root (unset = $IAXL_CACHE_DIR/kv4-manifests)
+export KVSHRINK_METRICS_PORT=${KVSHRINK_METRICS_PORT:-18801} # Metrics exporter base port, +rank per worker (0 = disabled)
+# export KVSHRINK_DEBUG_LOG=1              # Verbose per-request plan logging
+# export KVSHRINK_DEBUG_DUMP=1             # Log GDN state page digests after each forward
+# Cross-restart cache reuse requires reproducible block hashes: vLLM
+# seeds its first-block hash from PYTHONHASHSEED and falls back to a
+# random value when unset, which makes every restart miss.
+export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
+
 # ---- Intel QAT (compression accelerator) ------------------------------------
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
 export IAXL_QAT_ZIP_INSTANCES_PER_DEVICE=${IAXL_QAT_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per device
@@ -122,8 +136,10 @@ export IAXL_API_WORKER_BASE_PORT=${IAXL_API_WORKER_BASE_PORT:-18800} # Worker se
 export IAXL_API_CONTROLLER_PORT=${IAXL_API_CONTROLLER_PORT:-18700}   # Controller server port
 export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP request timeout in seconds
 
-HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
-export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
+# Only used to widen no_proxy. Containers often ship without iproute2,
+# and that must not stop the engine from starting.
+HOST_IP=$(ip route get 1 2>/dev/null | awk '{print $7}' | tr -d '\n') || HOST_IP=""
+export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12${HOST_IP:+,$HOST_IP}
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 

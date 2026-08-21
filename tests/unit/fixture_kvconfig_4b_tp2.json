@@ -1,0 +1,240 @@
+{
+  "num_blocks": 1843,
+  "kv_cache_tensors": [
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.0.linear_attn",
+        "language_model.model.layers.1.linear_attn",
+        "language_model.model.layers.2.linear_attn",
+        "language_model.model.layers.3.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.4.linear_attn",
+        "language_model.model.layers.5.linear_attn",
+        "language_model.model.layers.6.linear_attn",
+        "language_model.model.layers.7.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.8.linear_attn",
+        "language_model.model.layers.9.linear_attn",
+        "language_model.model.layers.10.linear_attn",
+        "language_model.model.layers.11.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.12.linear_attn",
+        "language_model.model.layers.13.linear_attn",
+        "language_model.model.layers.14.linear_attn",
+        "language_model.model.layers.15.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.16.linear_attn",
+        "language_model.model.layers.17.linear_attn",
+        "language_model.model.layers.18.linear_attn",
+        "language_model.model.layers.19.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.20.linear_attn",
+        "language_model.model.layers.21.linear_attn",
+        "language_model.model.layers.22.linear_attn",
+        "language_model.model.layers.23.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.24.linear_attn",
+        "language_model.model.layers.25.linear_attn",
+        "language_model.model.layers.26.linear_attn",
+        "language_model.model.layers.27.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    },
+    {
+      "size": 1992916992,
+      "shared_by": [
+        "language_model.model.layers.28.linear_attn",
+        "language_model.model.layers.29.linear_attn",
+        "language_model.model.layers.30.linear_attn",
+        "language_model.model.layers.31.self_attn.attn"
+      ],
+      "offset": null,
+      "block_stride": null
+    }
+  ],
+  "kv_cache_groups": [
+    {
+      "layer_names": [
+        "language_model.model.layers.0.linear_attn",
+        "language_model.model.layers.4.linear_attn",
+        "language_model.model.layers.8.linear_attn",
+        "language_model.model.layers.12.linear_attn",
+        "language_model.model.layers.16.linear_attn",
+        "language_model.model.layers.20.linear_attn",
+        "language_model.model.layers.24.linear_attn",
+        "language_model.model.layers.28.linear_attn"
+      ],
+      "is_eagle_group": false,
+      "spec": {
+        "type": "MambaSpec",
+        "block_size": 528,
+        "page_size_bytes": 1081344,
+        "real_page_size_bytes": null,
+        "page_size_padded": 1081344,
+        "dtype": "None",
+        "mamba_type": "MambaAttentionBackendEnum.GDN_ATTN",
+        "mamba_cache_mode": "align",
+        "num_speculative_blocks": 0,
+        "shapes": [
+          [
+            3,
+            4096
+          ],
+          [
+            16,
+            128,
+            128
+          ]
+        ],
+        "dtypes": [
+          "torch.bfloat16",
+          "torch.float32"
+        ],
+        "max_memory_usage_bytes": "<bound method MambaSpec.max_memory_usage_bytes of MambaSpec(block_size=528, shapes=((3, 4096), (16, 128, 128)), dtypes=(torch.bfloat16, torch.float32), page_size_padded=1081344, mamba_type=<MambaAttentionBackendEnum.GDN_ATTN: 'vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend'>, mamba_cache_mode='align', num_speculative_blocks=0)>"
+      }
+    },
+    {
+      "layer_names": [
+        "language_model.model.layers.1.linear_attn",
+        "language_model.model.layers.5.linear_attn",
+        "language_model.model.layers.9.linear_attn",
+        "language_model.model.layers.13.linear_attn",
+        "language_model.model.layers.17.linear_attn",
+        "language_model.model.layers.21.linear_attn",
+        "language_model.model.layers.25.linear_attn",
+        "language_model.model.layers.29.linear_attn"
+      ],
+      "is_eagle_group": false,
+      "spec": {
+        "type": "MambaSpec",
+        "block_size": 528,
+        "page_size_bytes": 1081344,
+        "real_page_size_bytes": null,
+        "page_size_padded": 1081344,
+        "dtype": "None",
+        "mamba_type": "MambaAttentionBackendEnum.GDN_ATTN",
+        "mamba_cache_mode": "align",
+        "num_speculative_blocks": 0,
+        "shapes": [
+          [
+            3,
+            4096
+          ],
+          [
+            16,
+            128,
+            128
+          ]
+        ],
+        "dtypes": [
+          "torch.bfloat16",
+          "torch.float32"
+        ],
+        "max_memory_usage_bytes": "<bound method MambaSpec.max_memory_usage_bytes of MambaSpec(block_size=528, shapes=((3, 4096), (16, 128, 128)), dtypes=(torch.bfloat16, torch.float32), page_size_padded=1081344, mamba_type=<MambaAttentionBackendEnum.GDN_ATTN: 'vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend'>, mamba_cache_mode='align', num_speculative_blocks=0)>"
+      }
+    },
+    {
+      "layer_names": [
+        "language_model.model.layers.2.linear_attn",
+        "language_model.model.layers.6.linear_attn",
+        "language_model.model.layers.10.linear_attn",
+        "language_model.model.layers.14.linear_attn",
+        "language_model.model.layers.18.linear_attn",
+        "language_model.model.layers.22.linear_attn",
+        "language_model.model.layers.26.linear_attn",
+        "language_model.model.layers.30.linear_attn"
+      ],
+      "is_eagle_group": false,
+      "spec": {
+        "type": "MambaSpec",
+        "block_size": 528,
+        "page_size_bytes": 1081344,
+        "real_page_size_bytes": null,
+        "page_size_padded": 1081344,
+        "dtype": "None",
+        "mamba_type": "MambaAttentionBackendEnum.GDN_ATTN",
+        "mamba_cache_mode": "align",
+        "num_speculative_blocks": 0,
+        "shapes": [
+          [
+            3,
+            4096
+          ],
+          [
+            16,
+            128,
+            128
+          ]
+        ],
+        "dtypes": [
+          "torch.bfloat16",
+          "torch.float32"
+        ],
+        "max_memory_usage_bytes": "<bound method MambaSpec.max_memory_usage_bytes of MambaSpec(block_size=528, shapes=((3, 4096), (16, 128, 128)), dtypes=(torch.bfloat16, torch.float32), page_size_padded=1081344, mamba_type=<MambaAttentionBackendEnum.GDN_ATTN: 'vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend'>, mamba_cache_mode='align', num_speculative_blocks=0)>"
+      }
+    },
+    {
+      "layer_names": [
+        "language_model.model.layers.3.self_attn.attn",
+        "language_model.model.layers.7.self_attn.attn",
+        "language_model.model.layers.11.self_attn.attn",
+        "language_model.model.layers.15.self_attn.attn",
+        "language_model.model.layers.19.self_attn.attn",
+        "language_model.model.layers.23.self_attn.attn",
+        "language_model.model.layers.27.self_attn.attn",
+        "language_model.model.layers.31.self_attn.attn"
+      ],
+      "is_eagle_group": false,
+      "spec": {
+        "type": "FullAttentionSpec",
+        "block_size": 528,
+        "page_size_bytes": 1081344,
+        "real_page_size_bytes": 1081344,
+        "page_size_padded": null,
+        "dtype": "torch.bfloat16",
+        "num_kv_heads": 2,
+        "head_size": 256,
+        "head_size_v": 256,
+        "kv_quant_mode": "0"
+      }
+    }
+  ]
+}
