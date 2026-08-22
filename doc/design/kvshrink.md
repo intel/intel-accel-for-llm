@@ -1,5 +1,10 @@
 # KVShrink Design
 
+This document describes the attention-only connector. Models that also
+have GDN/Mamba layers (Qwen3.5 and similar) take a separate path with
+different restore rules; see
+[KVShrink Hybrid Design](kvshrink-hybrid.md).
+
 ## Purpose
 
 KVShrink is a reference vLLM V1 KV-cache connector built on IAXL. It shows how a serving runtime can reuse prompt KV blocks from host memory or persistent storage while Intel Data Streaming Accelerator (DSA) and Intel QuickAssist Technology (QAT) optimize the data path.

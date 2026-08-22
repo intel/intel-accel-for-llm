@@ -18,14 +18,19 @@ export HOST=${HOST:-localhost}
 export PORT=${PORT:-8000}
 export ENDPOINT=http://$HOST:$PORT
 
-input_len=8000
-output_len=128
-num_prompts=10
-concurrency=4
-hit_rate=80
+# Defaults unchanged; overridable so a comparison run can enlarge the
+# sample without editing this file. SEED matters most: leaving it on the
+# clock gives each run a different prompt set, which is fine for a single
+# measurement but makes an A/B comparison meaningless.
+input_len=${INPUT_LEN:-8000}
+output_len=${OUTPUT_LEN:-128}
+num_prompts=${NUM_PROMPTS:-10}
+concurrency=${CONCURRENCY:-4}
+hit_rate=${HIT_RATE:-80}
 random_prefix_len=$((input_len * hit_rate / 100))
 random_input_len=$((input_len - random_prefix_len))
-seed=$(date +%s)
+seed=${SEED:-$(date +%s)}
+num_warmups=${NUM_WARMUPS:-5}
 
 ARGS=(
     --backend vllm
@@ -45,8 +50,8 @@ ARGS=(
     --request-rate inf
 )
 
-echo "=== Hit_rate=${hit_rate} Input=${input_len} (${random_prefix_len}+${random_input_len}), Output=${output_len} Concurrency=${concurrency}, num_prompts=${num_prompts} === "
+echo "=== Hit_rate=${hit_rate} Input=${input_len} (${random_prefix_len}+${random_input_len}), Output=${output_len} Concurrency=${concurrency}, num_prompts=${num_prompts}, seed=${seed} === "
 vllm bench serve "${ARGS[@]}" \
-    --num-warmups 5 \
+    --num-warmups $num_warmups \
     --num-prompts $num_prompts \
     --max-concurrency $concurrency

@@ -63,6 +63,13 @@ class KVFlow:
         else:
             self.has_only_mode = False
 
+        # Per-instance switch defaulting to the module-level env snapshot,
+        # so a second in-process engine (e.g. the hybrid GDN store) can
+        # require get_stream to wait on the compute stream without
+        # affecting the default engine. H2D restores must not overtake
+        # pending compute work such as the mamba prev->curr slot copy.
+        self.stream_sync_on_get = stream_sync_on_get
+
         if not self.has_only_mode:
             self.storage = Storage(self.persist_dir)
             logger.info("Cache size %d GB", cache_size_gb)
@@ -306,7 +313,7 @@ class KVFlow:
                 work_stream=self.get_stream,
             )
             if first_tensor:
-                if stream_sync_on_get:
+                if self.stream_sync_on_get:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
             ctx.unzip_from_mem(
@@ -536,4 +543,32 @@ class KVFlow:
             "evicted": len(groups),
             "bytes_freed": total_freed,
             "labels": sorted(groups),
+        }
+
+    def evict_to_size(self, target_bytes: int) -> dict:
+        """Evict LRU-oldest groups until memory usage is at or below
+        ``target_bytes``.
+
+        Only persisted groups may be evicted here: evicting an
+        unpersisted group drops its Record entry (permanent miss), so
+        callers must drain persist first. The C++ Mem API is
+        count-based, so loop in batches until the byte target is met.
+        """
+        if self.has_only_mode:
+            return {"evicted": 0, "bytes_freed": 0, "labels": []}
+
+        total_evicted = 0
+        total_freed = 0
+        labels: List[str] = []
+        while self.mem.current_bytes > target_bytes:
+            res = self.evict(64)
+            if not res["evicted"]:
+                break
+            total_evicted += res["evicted"]
+            total_freed += res["bytes_freed"]
+            labels.extend(res["labels"])
+        return {
+            "evicted": total_evicted,
+            "bytes_freed": total_freed,
+            "labels": sorted(labels),
         }

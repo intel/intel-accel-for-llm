@@ -8,6 +8,7 @@
 
 - [IAXL Design](doc/design/iaxl.md)
 - [KVShrink Design](doc/design/kvshrink.md)
+- [KVShrink Hybrid (GDN/Mamba) Design](doc/design/kvshrink-hybrid.md) — sequence diagrams for the hybrid path
 
 ## Host Setup
 
