@@ -36,6 +36,7 @@ class KVStore:
         layer_names: Optional[List[str]] = None,
         rank: int = 0,
         tp_size: int = 1,
+        hybrid: bool = False,
     ):
 
         if kv_caches is None and layer_names is None:
@@ -58,6 +59,12 @@ class KVStore:
         self.block_dim = block_dim
         self.rank = rank
         self.tp_size = tp_size
+        # Hybrid (DSv4) mode: a single logical block is stored across many
+        # per-key put() calls with heterogeneous shapes and chunk labels
+        # (plain hash for MLA, "hash:r" for SWA). Auto put_finish would mark a
+        # block present after only one key was written, so it is disabled here
+        # and the connector calls finish() explicitly once all layers are saved.
+        self.hybrid = hybrid
 
         if kv_caches is not None:
             self.layer_names = list(kv_caches.keys())
@@ -187,11 +194,28 @@ class KVStore:
             skip_compression_count=local_skip,
         )
 
-        if self.layer_names[-1] in layer_names:
+        # In hybrid (DSv4) mode the connector flushes the presence record via
+        # finish() with the plain block hashes once every layer of a block has
+        # been saved; auto put_finish here would mark the block present too
+        # early (and with per-key chunk labels like "hash:r").
+        if not self.hybrid and self.layer_names[-1] in layer_names:
             self.tensorzip.put_finish(self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
         return result
+
+    def finish(self, block_hashs: List[str]) -> None:
+        """Flush a presence record for fully-saved blocks (hybrid/DSv4 mode).
+
+        A DSv4 block is written across many per-key put() calls (MLA, SWA and
+        indexer caches, each with its own shape and chunk labels). The connector
+        calls finish() once, with the PLAIN block hashes, after all layers of a
+        block have been saved so the scheduler's has() can observe it.
+        """
+        if self.has_only_mode:
+            raise RuntimeError("finish() not available in has-only mode")
+        self.tensorzip.put_finish(self.LABEL, block_hashs)
+        self.tensorzip.record_flush()
 
     def put_wait(
         self,
