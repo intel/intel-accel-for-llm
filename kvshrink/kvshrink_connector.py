@@ -50,6 +50,20 @@ logger = logging.getLogger(__name__)
 # C4A vs C128A is told apart by block size: C4A state shape[1]==4, C128A==8.
 _SAVE_COMPRESSOR_STATE = os.getenv("KVSHRINK_SAVE_COMPRESSOR_STATE", "c4a").lower()
 
+# DSv4 C4A compressor-state windowing (offload-only optimization).
+# The C4A compressor reads only a sliding window of the last
+# (1 + overlap) * compress_ratio == (1 + 1) * 4 == 8 token-states to compress
+# each next 4-token boundary; states older than that window are never re-read
+# (their compressed output already lives in the main MLA KV cache). So when the
+# offload connector stores a 256-token hash-block, it only needs the LAST few
+# token-states of the block's C4A compressor-state group (block_size 4), not all
+# 256. This stores/loads only the last KVSHRINK_C4A_STATE_WINDOW_TOKENS
+# token-states per hash-block for C4A compressor-state groups, cutting that
+# group's footprint by (block_size / window) (e.g. 256/8 = 32x). It is an
+# offload-tier optimization only: vLLM's own paged state cache and prefix
+# caching are untouched. Set to 0 to disable (store the full state, legacy).
+_C4A_STATE_WINDOW_TOKENS = int(os.getenv("KVSHRINK_C4A_STATE_WINDOW_TOKENS", "8"))
+
 ReqId = str
 
 
@@ -165,6 +179,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._layer_to_group: dict[str, int] = {}
         self._layer_name_to_storable_keys: dict[str, list[str]] = {}
         self._dsv4_group_keys: dict[int, list[str]] = {}
+        # HMA groups holding the C4A compressor state (block_size 4). For these
+        # the connector may store only the trailing window of token-states per
+        # hash-block (see _C4A_STATE_WINDOW_TOKENS).
+        self._dsv4_c4a_state_groups: set[int] = set()
         self._dsv4_num_layers = 0
         self._dsv4_save_progress: dict[str, set] = {}
         self.num_blocks = 0
@@ -642,6 +660,26 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             gid = self._layer_to_group.get(key, 0)
             self._dsv4_group_keys.setdefault(gid, []).append(key)
 
+        # Identify the C4A compressor-state groups: block_size == 4 (so ratio ==
+        # block_size // 4) and every key is a compressor.state_cache. Only these
+        # are eligible for trailing-window storage; nothing else has block_size
+        # 4, and requiring state_cache keys keeps the check conservative.
+        _c4a_ratio = self.block_size // 4 if self.block_size >= 4 else 0
+        for gid, keys in self._dsv4_group_keys.items():
+            if _c4a_ratio and self._group_block_ratio.get(gid, 1) == _c4a_ratio and all(
+                "compressor.state_cache" in k for k in keys
+            ):
+                self._dsv4_c4a_state_groups.add(gid)
+        if _C4A_STATE_WINDOW_TOKENS > 0 and self._dsv4_c4a_state_groups:
+            logger.info(
+                "DSv4: C4A state windowing ON: storing last %d token-states "
+                "per hash-block for groups %s (ratio %d -> %d sub-blocks kept).",
+                _C4A_STATE_WINDOW_TOKENS,
+                sorted(self._dsv4_c4a_state_groups),
+                _c4a_ratio,
+                max(1, -(-_C4A_STATE_WINDOW_TOKENS // 4)),
+            )
+
         # Worker KVStore in hybrid mode: heterogeneous shapes and no auto
         # put_finish (the connector flushes presence records via finish()).
         self.kvstore = KVStore(
@@ -934,12 +972,29 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if available < expected:
                 # Partial trailing block: only the fully-covered hashes.
                 n_full = available // ratio if ratio > 0 else len(block_hashes)
-                block_indices = list(all_gids[g_idx][: n_full * ratio])
                 hashes = block_hashes[:n_full]
             else:
-                block_indices = list(all_gids[g_idx][:expected])
                 hashes = block_hashes
-            chunk_labels = [f"{h}_{r}" for h in hashes for r in range(ratio)]
+            gids = all_gids[g_idx]
+            # C4A compressor-state windowing: for these groups keep only the
+            # last `w` sub-blocks (== last w*group_block_size token-states) per
+            # hash-block; the compressor never re-reads older states. Both the
+            # save (put) and load (get) paths call this method, so the window is
+            # applied symmetrically and each stored sub-block is restored to the
+            # exact same relative slot (label "{hash}_{r}" encodes position r).
+            if _C4A_STATE_WINDOW_TOKENS > 0 and g_idx in self._dsv4_c4a_state_groups:
+                gbs = self.block_size // ratio if ratio else self.block_size
+                w = max(1, min(ratio, -(-_C4A_STATE_WINDOW_TOKENS // gbs)))
+                sub_range = range(ratio - w, ratio)
+            else:
+                sub_range = range(ratio)
+            block_indices = []
+            chunk_labels = []
+            for i, h in enumerate(hashes):
+                base = i * ratio
+                for r in sub_range:
+                    block_indices.append(gids[base + r])
+                    chunk_labels.append(f"{h}_{r}")
         assert len(block_indices) == len(chunk_labels), (
             f"[DSv4] group-slot mismatch g={g_idx} ratio={ratio} "
             f"n_idx={len(block_indices)} n_lbl={len(chunk_labels)}"
