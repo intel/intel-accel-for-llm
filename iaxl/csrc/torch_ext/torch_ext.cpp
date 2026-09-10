@@ -7,6 +7,7 @@
 
 #include "context.h"
 #include "kv_pool.h"
+#include "kv_zip.h"
 
 using namespace profiler;
 
@@ -462,6 +463,60 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly(
             "pending_count", [](kv_pool::Record &self) { return self.pending_count(); },
             "Number of pending record requests");
+
+    // GPU-less compress/decompress entry points that bypass Context entirely: they operate
+    // directly on already-CPU-resident tensors and share the same QAT/IAA/CPU zip task pool and
+    // native Mem cache used by the local (GPU-attached) KVStore path. Intended for the remote NIXL
+    // cache daemon (iaxl.remote), which receives KV bytes via RDMA into CPU staging buffers and has
+    // no GPU/Context of its own.
+    m.def(
+        "zip_compress_to_mem",
+        [](kv_pool::Mem &mem, const std::vector<std::string> &full_chunk_labels,
+           const std::vector<torch::Tensor> &cpu_tensors, bool compress) {
+            IAXL_CHECK(full_chunk_labels.size() == cpu_tensors.size(),
+                       "zip_compress_to_mem: labels and tensors must have the same length");
+            py::gil_scoped_release release;
+            const size_t n = cpu_tensors.size();
+            std::vector<char *> out_bufs(n);
+            std::vector<size_t> out_sizes(n), orig_sizes(n);
+            kv_zip::kv_zip_compress_batch(cpu_tensors, out_bufs, out_sizes, orig_sizes, compress);
+            mem.put(full_chunk_labels, std::move(out_bufs), out_sizes, orig_sizes);
+        },
+        "Compress a batch of contiguous CPU tensors (shared QAT/IAA/CPU zip pool, same code path\n"
+        "as the local KVStore) and insert the results directly into a native Mem cache. No\n"
+        "Context/GPU transfer is involved.",
+        py::arg("mem"), py::arg("full_chunk_labels"), py::arg("cpu_tensors"),
+        py::arg("compress") = true);
+
+    m.def(
+        "zip_decompress_from_mem",
+        [](kv_pool::Mem &mem, const std::vector<std::string> &full_chunk_labels,
+           const std::vector<torch::Tensor> &cpu_tensors) {
+            IAXL_CHECK(full_chunk_labels.size() == cpu_tensors.size(),
+                       "zip_decompress_from_mem: labels and tensors must have the same length");
+            py::gil_scoped_release release;
+            mem.acquire_deletion_guard();
+            try {
+                auto results = mem.get(full_chunk_labels);
+                std::vector<const char *> data_ptrs(results.size());
+                for (size_t i = 0; i < results.size(); i++) {
+                    IAXL_CHECK(results[i].first != nullptr,
+                               ("zip_decompress_from_mem: cache key missing: " +
+                                full_chunk_labels[i])
+                                   .c_str());
+                    data_ptrs[i] = results[i].first;
+                }
+                kv_zip::kv_zip_decompress_batch(data_ptrs, cpu_tensors);
+            } catch (...) {
+                mem.release_deletion_guard();
+                throw;
+            }
+            mem.release_deletion_guard();
+        },
+        "Fetch compressed blobs for full_chunk_labels from a native Mem cache and decompress\n"
+        "directly into the given CPU tensors (shared QAT/IAA/CPU zip pool, same code path as the\n"
+        "local KVStore). Raises if any key is missing.",
+        py::arg("mem"), py::arg("full_chunk_labels"), py::arg("cpu_tensors"));
 
     m.def(
         "metrics_set_enabled", [](bool enable) { profiler::g_metrics_enabled = enable; },
