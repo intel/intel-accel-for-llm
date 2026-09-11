@@ -828,6 +828,7 @@ class RemoteCacheDaemon:
         per_group = []
         total_groups = 0
         total_bytes = 0
+        total_ready_dropped = 0
         for key, group in selected:
             entries = group.mem.evict_groups(count)
             labels = sorted(e[0] for e in entries)
@@ -835,19 +836,39 @@ class RemoteCacheDaemon:
             total_groups += len(entries)
             total_bytes += nbytes
             m, tp, rank = key
+            # Sync the readiness index with the pool: has() answers from
+            # self._ready, so any block that has been dropped from the pool
+            # must also be dropped here, otherwise a subsequent has() -> get()
+            # sequence would report the block as present and then return a
+            # zero-filled shard (see _h_get_nixl's missing-key branch). The
+            # native group_key is "kv:<block_hash>", split at the first ":".
+            dropped = 0
+            with self._state_lock:
+                for lbl in labels:
+                    block_hash = lbl.split(":", 1)[1] if ":" in lbl else lbl
+                    key_tuple = (m, tp, rank, block_hash)
+                    if key_tuple in self._ready:
+                        self._ready.discard(key_tuple)
+                        dropped += 1
+            total_ready_dropped += dropped
             per_group.append({
                 "model_name": m, "tp_size": tp, "tp_rank": rank,
                 "evicted": len(entries),
                 "bytes_freed": nbytes,
+                "ready_dropped": dropped,
                 "labels": labels,
             })
         if not selected:
             logger.warning("evict: no matching group for filter %s", {
                 k: header.get(k) for k in ("model_name", "tp_size", "tp_rank")})
+        elif total_groups:
+            logger.info("evict: dropped %d groups (%d bytes), removed %d ready entries",
+                        total_groups, total_bytes, total_ready_dropped)
         protocol.send_message(conn, {
             "status": "ok",
             "evicted": total_groups,
             "bytes_freed": total_bytes,
+            "ready_dropped": total_ready_dropped,
             "groups": per_group,
         })
 
