@@ -63,11 +63,14 @@ cd /root/iaxl-remote-daemon-v0.1
 **推荐示例(每个 GPU rank 一个 daemon 实例,双轨 RDMA):**
 
 ```bash
+KVSHRINK_REMOTE_DAEMON_ADDR="10.10.10.10:19000|10.10.10.10:19001|10.10.10.10:19002|10.10.10.10:19003" \
+KVSHRINK_REMOTE_NIXL_ADDR="10.10.10.10:19100|10.10.10.10:19101|10.10.10.10:19102|10.10.10.10:19103" \
 NUM_INSTANCES=4 CONTROL_PORT_BASE=19000 NIXL_PORT_BASE=19100 \
 TRANSPORT=nixl \
 NIXL_DEVICE=rocep21s0f0:1,rocep21s0f1:1 \
 NIXL_HOST=10.10.10.10 \
-POOL_SIZE_GB=64 STAGING_SLOTS=256 STAGING_SLOT_MB=8 \
+POOL_SIZE_GB=64 STAGING_SLOTS=2048 STAGING_SLOT_MB=8 \
+KVSHRINK_REMOTE_MAX_STAGING_SLOTS=16384 \
 KVSHRINK_REMOTE_QAT_DEVICES="0|1|4|5" \
 tools/remote_daemon/run-daemon-multi.sh
 ```
@@ -135,7 +138,8 @@ CONTROL_PORT=19000 \
 TRANSPORT=nixl \
 NIXL_DEVICE=rocep21s0f0:1 \
 NIXL_HOST=10.10.10.10 NIXL_PORT=19100 \
-POOL_SIZE_GB=64 STAGING_SLOTS=256 STAGING_SLOT_MB=8 \
+POOL_SIZE_GB=64 STAGING_SLOTS=2048 STAGING_SLOT_MB=8 \
+KVSHRINK_REMOTE_MAX_STAGING_SLOTS=16384 \
 KVSHRINK_REMOTE_QAT_DEVICES="0,1,4,5" \
 tools/remote_daemon/docker-run-daemon.sh
 ```
@@ -152,6 +156,7 @@ tools/remote_daemon/docker-run-daemon.sh
 | `CACHE_DIR` | `_data/kvcache/remote` | 持久化 chunks.db + chunks/ 根目录 |
 | `STAGING_SLOTS` | `0` | NIXL staging 槽数;`TRANSPORT=nixl` 时**必须**设为 >0 |
 | `STAGING_SLOT_MB` | `4` | 名义槽大小;daemon 会按真实 shard 大小自动重切分 |
+| `KVSHRINK_REMOTE_MAX_STAGING_SLOTS` | `4096` | staging arena 按真实 shard 大小自动重切分后的槽数上限;高并发请求需要更多在飞 shard 时,可配合增大 `STAGING_SLOTS` 一起提高 |
 | `KVSHRINK_REMOTE_STATS_INTERVAL_SEC` | `30` | 周期打印吞吐/排队日志;`0` 关闭 |
 | `DEVICE` | `cpu` | NIXL staging buffer 所在设备 |
 
@@ -169,6 +174,8 @@ KVSHRINK_REMOTE_DAEMON_ADDR="10.10.10.10:19000|10.10.10.10:19001|10.10.10.10:190
 KVSHRINK_REMOTE_NIXL_ADDR="10.10.10.10:19100|10.10.10.10:19101|10.10.10.10:19102|10.10.10.10:19103" \
 KVSHRINK_REMOTE_NIXL_DEVICE=mlx5_0:1,mlx5_1:1 \
 UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1 \
+KVSHRINK_REMOTE_NIXL_MAX_SHARDS_PER_ROUND=1024 \
+KVSHRINK_REMOTE_NIXL_ROUNDS_IN_FLIGHT=4 \
 UCX_IB_GPU_DIRECT_RDMA=y \
 MODEL=/mnt/ssd1/model-space/Qwen/Qwen2.5-32B-Instruct \
 ./examples/kvshrink-vllm-serve.sh
@@ -209,6 +216,8 @@ KVSHRINK_REMOTE_NIXL_ADDR=10.10.10.10:19100 \
 | `KVSHRINK_REMOTE_CONNECT_TIMEOUT_SEC` / `..._RETRY_SEC` | 30 / 2 | 连接重试参数 |
 | `KVSHRINK_REMOTE_REQUEST_TIMEOUT_SEC` | 120 | 单次 RPC / 传输超时 |
 | `KVSHRINK_REMOTE_FAIL_IF_UNREACHABLE` | `1` | 初始化时连不上 daemon 直接退出 |
+| `KVSHRINK_REMOTE_NIXL_MAX_SHARDS_PER_ROUND` | `128` | 单轮 NIXL 传输最多携带的 shard 数;增大后可降低大 cache hit 请求的分轮控制面开销 |
+| `KVSHRINK_REMOTE_NIXL_ROUNDS_IN_FLIGHT` | `2` | 单个 rank 目标在飞 NIXL 轮数,用于重叠 RDMA 传输与 daemon 侧 codec 工作 |
 
 ### 2.3 网络与设备选择建议
 

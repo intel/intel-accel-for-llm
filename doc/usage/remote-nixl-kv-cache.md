@@ -70,11 +70,14 @@ cd /root/iaxl-remote-daemon-v0.1
 **Recommended example (one daemon instance per GPU rank, dual-rail RDMA):**
 
 ```bash
+KVSHRINK_REMOTE_DAEMON_ADDR="10.10.10.10:19000|10.10.10.10:19001|10.10.10.10:19002|10.10.10.10:19003" \
+KVSHRINK_REMOTE_NIXL_ADDR="10.10.10.10:19100|10.10.10.10:19101|10.10.10.10:19102|10.10.10.10:19103" \
 NUM_INSTANCES=4 CONTROL_PORT_BASE=19000 NIXL_PORT_BASE=19100 \
 TRANSPORT=nixl \
 NIXL_DEVICE=rocep21s0f0:1,rocep21s0f1:1 \
 NIXL_HOST=10.10.10.10 \
-POOL_SIZE_GB=64 STAGING_SLOTS=256 STAGING_SLOT_MB=8 \
+POOL_SIZE_GB=64 STAGING_SLOTS=2048 STAGING_SLOT_MB=8 \
+KVSHRINK_REMOTE_MAX_STAGING_SLOTS=16384 \
 KVSHRINK_REMOTE_QAT_DEVICES="0|1|4|5" \
 tools/remote_daemon/run-daemon-multi.sh
 ```
@@ -149,7 +152,8 @@ CONTROL_PORT=19000 \
 TRANSPORT=nixl \
 NIXL_DEVICE=rocep21s0f0:1 \
 NIXL_HOST=10.10.10.10 NIXL_PORT=19100 \
-POOL_SIZE_GB=64 STAGING_SLOTS=256 STAGING_SLOT_MB=8 \
+POOL_SIZE_GB=64 STAGING_SLOTS=2048 STAGING_SLOT_MB=8 \
+KVSHRINK_REMOTE_MAX_STAGING_SLOTS=16384 \
 KVSHRINK_REMOTE_QAT_DEVICES="0,1,4,5" \
 tools/remote_daemon/docker-run-daemon.sh
 ```
@@ -167,6 +171,7 @@ useful for light load or debugging; production deployments should prefer
 | `CACHE_DIR` | `_data/kvcache/remote` | Root of persistent `chunks.db` + `chunks/` |
 | `STAGING_SLOTS` | `0` | NIXL staging slot count; **must** be > 0 when `TRANSPORT=nixl` |
 | `STAGING_SLOT_MB` | `4` | Nominal slot size; the daemon repartitions once the real shard size is known |
+| `KVSHRINK_REMOTE_MAX_STAGING_SLOTS` | `4096` | Upper bound after autosizing the staging arena to the real shard size; raise with larger `STAGING_SLOTS` when high-concurrency requests need more in-flight shards |
 | `KVSHRINK_REMOTE_STATS_INTERVAL_SEC` | `30` | Periodic throughput/queueing log; `0` disables |
 | `DEVICE` | `cpu` | Device backing the NIXL staging buffer |
 
@@ -186,6 +191,8 @@ KVSHRINK_REMOTE_DAEMON_ADDR="10.10.10.10:19000|10.10.10.10:19001|10.10.10.10:190
 KVSHRINK_REMOTE_NIXL_ADDR="10.10.10.10:19100|10.10.10.10:19101|10.10.10.10:19102|10.10.10.10:19103" \
 KVSHRINK_REMOTE_NIXL_DEVICE=mlx5_0:1,mlx5_1:1 \
 UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1 \
+KVSHRINK_REMOTE_NIXL_MAX_SHARDS_PER_ROUND=1024 \
+KVSHRINK_REMOTE_NIXL_ROUNDS_IN_FLIGHT=4 \
 UCX_IB_GPU_DIRECT_RDMA=y \
 MODEL=/mnt/ssd1/model-space/Qwen/Qwen2.5-32B-Instruct \
 ./examples/kvshrink-vllm-serve.sh
@@ -229,6 +236,8 @@ KVSHRINK_REMOTE_NIXL_ADDR=10.10.10.10:19100 \
 | `KVSHRINK_REMOTE_CONNECT_TIMEOUT_SEC` / `..._RETRY_SEC` | 30 / 2 | Connect retry parameters |
 | `KVSHRINK_REMOTE_REQUEST_TIMEOUT_SEC` | 120 | Per-RPC / transfer timeout |
 | `KVSHRINK_REMOTE_FAIL_IF_UNREACHABLE` | `1` | Exit at init if the daemon is unreachable |
+| `KVSHRINK_REMOTE_NIXL_MAX_SHARDS_PER_ROUND` | `128` | Maximum shards in one NIXL transfer round; larger values reduce per-round control overhead for large cache hits |
+| `KVSHRINK_REMOTE_NIXL_ROUNDS_IN_FLIGHT` | `2` | Target number of NIXL rounds a rank keeps in flight to overlap RDMA transfer with daemon-side codec work |
 
 ### 2.3 Network & device selection notes
 
