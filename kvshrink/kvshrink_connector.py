@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
+from iaxl.remote import RemoteCacheConfig, RemoteKVStore
 
 from .async_load_config import load_async_load_layer_config_from_env
 
@@ -136,15 +137,67 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            self.kvstore: Optional[KVStore] = KVStore(
-                model_name=os.path.basename(self.model_config.model),
+            # Scheduler always talks to daemon instance 0 (rank 0): has()
+            # uses rank 0's readiness record as the deployment-level hit
+            # proxy, matching the worker-side convention below.
+            self.kvstore: Optional[KVStore] = self._make_kvstore(
                 layer_names=[str(index) for index in range(self.num_layers)],
-                tp_size=self.tp_size,
+                rank=0,
             )
         else:
             self.kvstore = None
             self._bind_cpu_affinity()
             self._bind_intel_accel()
+
+    def _remote_cache_config(self, rank: int) -> Optional[RemoteCacheConfig]:
+        extra_config = getattr(
+            self.vllm_config.kv_transfer_config, "kv_connector_extra_config", None
+        )
+        config = RemoteCacheConfig.from_vllm(extra_config, rank=rank, tp_size=self.tp_size)
+        return config if config.enabled else None
+
+    def _make_kvstore(
+        self,
+        *,
+        block_dim: Optional[int] = None,
+        kv_caches: Optional[dict[str, torch.Tensor]] = None,
+        layer_names: Optional[list[str]] = None,
+        rank: Optional[int] = None,
+    ) -> "KVStore | RemoteKVStore":
+        """Build the local (GPU-attached) or remote (NIXL cross-node) KVStore.
+
+        Selected by KVSHRINK_REMOTE_CACHE_ENABLE (see iaxl.remote.config);
+        both backends expose an identical block-level API (has/put/put_wait/
+        get/get_wait/stop), so nothing else in this connector needs to know
+        which one is in use.
+        """
+        rank = self.rank if rank is None else rank
+        model_name = os.path.basename(self.model_config.model)
+        remote_config = self._remote_cache_config(rank)
+        if remote_config is not None:
+            return RemoteKVStore(
+                model_name=model_name,
+                config=remote_config,
+                block_dim=block_dim,
+                kv_caches=kv_caches,
+                layer_names=layer_names,
+                rank=rank,
+                tp_size=self.tp_size,
+                block_size=self.block_size,
+            )
+        if kv_caches is None:
+            return KVStore(
+                model_name=model_name,
+                layer_names=layer_names,
+                tp_size=self.tp_size,
+            )
+        return KVStore(
+            model_name=model_name,
+            block_dim=block_dim,
+            kv_caches=kv_caches,
+            rank=rank,
+            tp_size=self.tp_size,
+        )
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
@@ -374,13 +427,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
-        self.kvstore = KVStore(
-            model_name=os.path.basename(self.model_config.model),
-            block_dim=block_dim,
-            kv_caches=kv_caches,
-            rank=self.rank,
-            tp_size=self.tp_size,
-        )
+        self.kvstore = self._make_kvstore(block_dim=block_dim, kv_caches=kv_caches)
         logger.info(
             "Registered %d KV cache layers with shape %s",
             len(kv_caches),
