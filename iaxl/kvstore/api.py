@@ -34,31 +34,37 @@ def register(method: str, path: str, handler: Callable) -> None:
 
 
 def start_mgmt_server(
-    role: str, rank: int = 0, num_workers: int = 1
+    role: str, global_rank: int = 0, tp_size: int = 1, dp_rank: int = 0
 ) -> Union["MgmtServer", "ControllerServer"]:
 
     if role == "controller":
-        port = envs.IAXL_API_CONTROLLER_PORT
-        worker_base_port = envs.IAXL_API_WORKER_BASE_PORT
+        # Offset each DP group's ports so groups do not collide: controller at
+        # CONTROLLER_PORT + dp_rank, workers at
+        # WORKER_BASE + dp_rank * tp_size .. +(tp_size - 1). ControllerServer is a
+        # generic aggregator, so tp_size is passed through as its num_workers.
+        port = envs.IAXL_API_CONTROLLER_PORT + dp_rank
+        worker_base_port = envs.IAXL_API_WORKER_BASE_PORT + dp_rank * tp_size
         server = ControllerServer(
             port=port,
-            num_workers=num_workers,
+            num_workers=tp_size,
             worker_base_port=worker_base_port,
         )
         server.start()
         logger.info(
             "Controller server started on port %d (workers: %d, base_port: %d)",
             port,
-            num_workers,
+            tp_size,
             worker_base_port,
         )
         return server
     elif role == "worker":
         base_port = envs.IAXL_API_WORKER_BASE_PORT
-        port = base_port + rank
-        server = MgmtServer(port=port, name=f"worker-{rank}")
+        port = base_port + global_rank
+        server = MgmtServer(port=port, name=f"worker-{global_rank}")
         server.start()
-        logger.info("Worker server started on port %d (rank %d)", port, rank)
+        logger.info(
+            "Worker server started on port %d (global rank %d)", port, global_rank
+        )
         return server
     else:
         raise ValueError(f"Unknown role: {role!r} (expected 'controller' or 'worker')")

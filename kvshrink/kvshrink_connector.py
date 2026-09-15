@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import (
-    get_world_group,
+    get_tensor_model_parallel_rank,
     model_parallel_is_initialized,
 )
 import vllm.envs as envs
@@ -110,7 +110,34 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
         self.use_mla = self.model_config.use_mla
         self.vllm_device = vllm_config.device_config.device_type
-        self.rank = get_world_group().rank if model_parallel_is_initialized() else 0
+        parallel_config = vllm_config.parallel_config
+        # This worker's data-parallel rank (which DP group, 0..DP-1). Use
+        # data_parallel_index, not data_parallel_rank: vLLM resets the latter
+        # to 0 for dense models.
+        self.dp_rank = parallel_config.data_parallel_index
+        # Number of DP groups. For MoE models vLLM keeps data_parallel_size, so
+        # use it directly. For dense models vLLM resets it to 1 (same as
+        # data_parallel_rank), so fall back to the launch value from setvars.sh.
+        if self.model_config.is_moe:
+            self.dp_size = parallel_config.data_parallel_size
+        else:
+            self.dp_size = int(os.environ.get("DP_SIZE", "1"))
+            logger.warning(
+                "Dense model: reading DP size from the DP_SIZE env var (%d) "
+                "because vLLM resets data_parallel_size to 1 for dense models.",
+                self.dp_size,
+            )
+        # This worker's tensor-parallel rank within its DP group (0..tp_size-1).
+        self.tp_rank = (
+            get_tensor_model_parallel_rank()
+            if model_parallel_is_initialized()
+            else 0
+        )
+        # This worker's globally-unique index across all DP groups, and the total
+        # worker count (DP * TP). Used as the KVStore / CPU / port identity so
+        # different DP groups do not collide.
+        self.global_rank = self.dp_rank * self.tp_size + self.tp_rank
+        self.global_size = self.dp_size * self.tp_size
 
         self._req_states: dict[ReqId, ReqState] = {}
         self._reqs_to_load = RequestMetadata()
@@ -142,6 +169,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(index) for index in range(self.num_layers)],
                 tp_size=self.tp_size,
+                global_rank=self.global_rank,
+                dp_rank=self.dp_rank,
             )
         else:
             self.kvstore = None
@@ -152,10 +181,12 @@ class KVShrinkConnector(KVConnectorBase_V1):
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
             return
-        bind_cpu_affinity(self.rank, self.tp_size, envs.VLLM_CPU_OMP_THREADS_BIND)
+        bind_cpu_affinity(
+            self.global_rank, self.global_size, envs.VLLM_CPU_OMP_THREADS_BIND
+        )
 
     def _bind_intel_accel(self) -> None:
-        bind_intel_accel(self.rank)
+        bind_intel_accel(self.global_rank)
 
     def _store(self) -> KVStore:
         if self.kvstore is None:
@@ -338,8 +369,9 @@ class KVShrinkConnector(KVConnectorBase_V1):
             model_name=os.path.basename(self.model_config.model),
             block_dim=block_dim,
             kv_caches=kv_caches,
-            rank=self.rank,
+            global_rank=self.global_rank,
             tp_size=self.tp_size,
+            dp_rank=self.dp_rank,
         )
         logger.info(
             "Registered %d KV cache layers with shape %s",

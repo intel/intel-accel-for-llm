@@ -35,8 +35,9 @@ class KVStoreLocal:
         block_dim: Optional[int] = None,
         kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
         layer_names: Optional[List[str]] = None,
-        rank: int = 0,
+        global_rank: int = 0,
         tp_size: int = 1,
+        dp_rank: int = 0,
     ):
 
         if kv_caches is None and layer_names is None:
@@ -57,8 +58,9 @@ class KVStoreLocal:
 
         self.kv_caches = kv_caches
         self.block_dim = block_dim
-        self.rank = rank
+        self.global_rank = global_rank
         self.tp_size = tp_size
+        self.dp_rank = dp_rank
 
         if kv_caches is not None:
             self.layer_names = list(kv_caches.keys())
@@ -86,10 +88,13 @@ class KVStoreLocal:
             self.kvcache_shape = None
             self.block_shape = None
 
+        # KVStore identity directory. A worker store uses its own global rank;
+        # the has-only (scheduler/controller) store reads its DP group's tp0
+        # worker records, whose global rank is dp_rank * tp_size.
         if self.has_only_mode:
-            final_persist_dir = f"{model_name}_rank0"
+            final_persist_dir = f"{model_name}_rank{dp_rank * tp_size}"
         else:
-            final_persist_dir = f"{model_name}_rank{rank}"
+            final_persist_dir = f"{model_name}_rank{global_rank}"
 
         if self.has_only_mode:
             pool_size_gb = 0.0
@@ -103,17 +108,17 @@ class KVStoreLocal:
         self.tensorzip = KVFlow(
             persist_dir=final_persist_dir,
             cache_size_gb=pool_size_gb,
-            rank=rank,
+            rank=global_rank,
         )
         start_profiling()
 
         logger.info(
             "KVStore initialized successfully: "
-            "model_name=%s, rank=%d, has_only_mode=%s, "
+            "model_name=%s, global_rank=%d, has_only_mode=%s, "
             "num_layers=%d, block_dim=%s, block_shape=%s, "
             "pool_size_gb=%.2f, persist_dir=%s",
             model_name,
-            self.rank,
+            self.global_rank,
             self.has_only_mode,
             len(self.layer_names),
             self.block_dim,
@@ -128,13 +133,13 @@ class KVStoreLocal:
             mgmt_register(
                 "GET",
                 "/v1/health",
-                lambda params, s=self: {"status": "ok", "rank": s.rank},
+                lambda params, s=self: {"status": "ok", "rank": s.global_rank},
             )
             mgmt_register(
                 "POST",
                 "/v1/cache/persist",
                 lambda body, s=self: {
-                    "rank": s.rank,
+                    "rank": s.global_rank,
                     "result": s.persist(int(body.get("count", 10))),
                 },
             )
@@ -142,7 +147,7 @@ class KVStoreLocal:
                 "POST",
                 "/v1/cache/evict",
                 lambda body, s=self: {
-                    "rank": s.rank,
+                    "rank": s.global_rank,
                     "result": s.evict(int(body.get("count", 10))),
                 },
             )
@@ -150,7 +155,10 @@ class KVStoreLocal:
                 "GET", "/v1/cache/metrics", lambda params, s=self: s.metrics(params)
             )
         self._mgmt_server = start_mgmt_server(
-            role=role, rank=self.rank, num_workers=self.tp_size
+            role=role,
+            global_rank=self.global_rank,
+            tp_size=self.tp_size,
+            dp_rank=self.dp_rank,
         )
 
     def put(
@@ -281,7 +289,7 @@ class KVStoreLocal:
 
     def status(self) -> dict:
         status = self.tensorzip.status()
-        status["rank"] = self.rank
+        status["rank"] = self.global_rank
         status["num_layers"] = len(self.layer_names)
         status["kvcache_shape"] = self.kvcache_shape
         return status
@@ -302,7 +310,7 @@ class KVStoreLocal:
             metrics_reset()
 
         result = metrics_read()
-        result["rank"] = self.rank
+        result["rank"] = self.global_rank
         return result
 
     def persist(self, max_count: int) -> dict:
