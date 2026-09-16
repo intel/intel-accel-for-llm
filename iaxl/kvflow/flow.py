@@ -165,7 +165,6 @@ class KVFlow:
             "chunk_indices and chunk_labels must have the same length"
         )
         first_t = next(iter(tensors.values()))
-        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
             assert tensor.is_cuda or tensor.is_xpu, (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
@@ -173,18 +172,31 @@ class KVFlow:
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
-            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
-            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
+            # Per-tensor chunk_shape (computed in the loop below) lets a single
+            # put/get carry heterogeneous shapes/dtypes, e.g. DSv4 hybrid KV:
+            # one HMA group mixes MLA ([N,64,584]) + indexer ([N,64,132]) caches.
+            # ScratchPool already buckets pinned buffers by (shape, dtype).
+            assert 0 <= chunk_dim < tensor.dim(), "chunk_dim is out of range"
+            # The transfer copies each chunk's inner bytes at stride(chunk_dim)
+            # (kv_xfer cudaMemcpy2DAsync), so FULL contiguity is not required:
+            # a chunk_dim-strided view is fine (HMA tensor-sharing pads each
+            # block's slot) as long as chunk_dim is the leading dim and every
+            # chunk's inner data is contiguous. Fail loudly for any other layout.
+            if not tensor.is_contiguous():
+                assert chunk_dim == 0 and tensor.select(0, 0).is_contiguous(), (
+                    f"Tensor '{tensor_key}' not transfer-compatible (inner data "
+                    f"must be contiguous): shape={tuple(tensor.shape)} "
+                    f"stride={tuple(tensor.stride())} chunk_dim={chunk_dim}"
+                )
 
         results = {}
         first_tensor = True
         num_chunks = len(chunk_indices)
-        chunk_shape = list(first_t.shape)
-        del chunk_shape[chunk_dim]
-        chunk_shape = tuple(chunk_shape)
 
         for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
+            chunk_shape = list(tensor.shape)
+            del chunk_shape[chunk_dim]
+            chunk_shape = tuple(chunk_shape)
             cpu_tensors = self.chunk_pool.allocate(
                 num_chunks, chunk_shape, tensor.dtype
             )
@@ -274,7 +286,6 @@ class KVFlow:
             "chunk_indices and chunk_labels must have the same length"
         )
         first_t = next(iter(tensors.values()))
-        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
             assert tensor.is_cuda or tensor.is_xpu, (
                 f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
@@ -282,18 +293,31 @@ class KVFlow:
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
-            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
-            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
+            # Per-tensor chunk_shape (computed in the loop below) lets a single
+            # put/get carry heterogeneous shapes/dtypes, e.g. DSv4 hybrid KV:
+            # one HMA group mixes MLA ([N,64,584]) + indexer ([N,64,132]) caches.
+            # ScratchPool already buckets pinned buffers by (shape, dtype).
+            assert 0 <= chunk_dim < tensor.dim(), "chunk_dim is out of range"
+            # The transfer copies each chunk's inner bytes at stride(chunk_dim)
+            # (kv_xfer cudaMemcpy2DAsync), so FULL contiguity is not required:
+            # a chunk_dim-strided view is fine (HMA tensor-sharing pads each
+            # block's slot) as long as chunk_dim is the leading dim and every
+            # chunk's inner data is contiguous. Fail loudly for any other layout.
+            if not tensor.is_contiguous():
+                assert chunk_dim == 0 and tensor.select(0, 0).is_contiguous(), (
+                    f"Tensor '{tensor_key}' not transfer-compatible (inner data "
+                    f"must be contiguous): shape={tuple(tensor.shape)} "
+                    f"stride={tuple(tensor.stride())} chunk_dim={chunk_dim}"
+                )
 
         results = {}
         num_chunks = len(chunk_indices)
-        chunk_shape = list(first_t.shape)
-        del chunk_shape[chunk_dim]
-        chunk_shape = tuple(chunk_shape)
 
         first_tensor = True
         for tensor_key, tensor in tensors.items():
+            chunk_shape = list(tensor.shape)
+            del chunk_shape[chunk_dim]
+            chunk_shape = tuple(chunk_shape)
             cpu_tensors = self.chunk_pool.allocate(
                 num_chunks, chunk_shape, tensor.dtype
             )
