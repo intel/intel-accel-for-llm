@@ -57,6 +57,7 @@ class KVStoreRemote:
         self.tp_size = tp_size
         self.has_only_mode = kv_caches is None
         self._pending: Dict[int, list] = {}  # job_id -> [tasks, remaining]
+        self._early_done: Dict[int, set] = {}  # done notifications that beat the job_id response
 
         if self.has_only_mode:
             name, self.peer = "client_sched", "daemon_sched"
@@ -107,6 +108,8 @@ class KVStoreRemote:
         job_id = int.from_bytes(self.rpc.call(method, payload), "little")
         tasks = {n: RemoteTask(job_id, n) for n in names}
         self._pending[job_id] = [tasks, len(tasks)]
+        for layer_idx in self._early_done.pop(job_id, set()):
+            self._mark_done(job_id, layer_idx)
         return tasks
 
     def put(self, block_indices, block_hashs, layer_names=None, description="") -> Dict[str, RemoteTask]:
@@ -137,9 +140,16 @@ class KVStoreRemote:
     def _on_done(self, job_id: int, layer_idx: int):
         entry = self._pending.get(job_id)
         if entry is None:
-            logger.warning("done for unknown job %d layer %d", job_id, layer_idx)
+            self._early_done.setdefault(job_id, set()).add(layer_idx)
             return
-        entry[0][self.layer_names[layer_idx]].done = True
+        self._mark_done(job_id, layer_idx)
+
+    def _mark_done(self, job_id: int, layer_idx: int):
+        entry = self._pending[job_id]
+        task = entry[0][self.layer_names[layer_idx]]
+        if task.done:
+            return
+        task.done = True
         entry[1] -= 1
         if entry[1] == 0:
             del self._pending[job_id]
