@@ -30,13 +30,24 @@ export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
-export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count
-VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
-export VLLM_CPU_OMP_THREADS_BIND # Per-rank CPU affinity
-rank_cpu_counts "$VLLM_CPU_OMP_THREADS_BIND" "$TP_SIZE" || return 1 2>/dev/null || exit 1
+# Parallelism strategy differs by model type:
+#   - Dense models: shard a single model copy with tensor parallelism (TP_SIZE>1,
+#     DP_SIZE=1, ENABLE_EXPERT_PARALLEL=0).
+#   - MoE models: use expert parallelism + data parallelism instead of TP
+#     (TP_SIZE=1, DP_SIZE=N, ENABLE_EXPERT_PARALLEL=1). Experts are sharded
+#     across the DP*TP ranks via all-to-all; attention/KV stay per DP group.
+export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count (set 1 for MoE)
+export DP_SIZE="${DP_SIZE:-1}"            # Data-parallel group count (>1 for MoE)
+export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}" # Expert parallelism for MoE (0/1)
+# Total workers across all DP groups (one per (dp, tp) pair). CPU/QAT/DSA specs
+# are generated and indexed per global worker so each worker gets distinct cores.
+NUM_WORKERS=$((TP_SIZE * DP_SIZE))
+VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
+export VLLM_CPU_OMP_THREADS_BIND # Per-worker CPU affinity (one entry per global rank)
+rank_cpu_counts "$VLLM_CPU_OMP_THREADS_BIND" "$NUM_WORKERS" || return 1 2>/dev/null || exit 1
 case "${IAXL_QAT_ZIP_ENABLE,,}" in
     1|true|yes|on)
-        KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(qat_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
+        KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(qat_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_QAT_DEVICES # Per-rank QAT device indices
         ;;
     *)
@@ -45,7 +56,7 @@ case "${IAXL_QAT_ZIP_ENABLE,,}" in
 esac
 case "${IAXL_DSA_GD_ENABLE,,}" in
     1|true|yes|on)
-        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$TP_SIZE")}" || return 1 2>/dev/null || exit 1
+        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_DSA_DEVICES # Per-rank DSA work queues
         export IAXL_DSA_WQS="${IAXL_DSA_WQS:-${KVSHRINK_DSA_DEVICES%%|*}}" # Use rank 0 DSA work queues by default
         ;;
@@ -58,6 +69,8 @@ printf '%s\n' \
     "vLLM configuration:" \
     "  MODEL=$MODEL" \
     "  TP_SIZE=$TP_SIZE" \
+    "  DP_SIZE=$DP_SIZE" \
+    "  ENABLE_EXPERT_PARALLEL=$ENABLE_EXPERT_PARALLEL" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
