@@ -165,12 +165,18 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
+            # The has-only scheduler store reads its DP group's tp0 records, so
+            # pass that group's tp0 rank (dp_rank * tp_size). Offset the mgmt
+            # ports by DP group (runs once per scheduler process) so multiple DP
+            # schedulers on one host do not clash and each controller aggregates
+            # its own group's workers (base + dp_rank * tp_size .. + tp_size-1).
+            iaxl_envs.IAXL_API_CONTROLLER_PORT += self.dp_rank
+            iaxl_envs.IAXL_API_WORKER_BASE_PORT += self.dp_rank * self.tp_size
             self.kvstore: Optional[KVStore] = KVStore(
                 model_name=os.path.basename(self.model_config.model),
                 layer_names=[str(index) for index in range(self.num_layers)],
+                rank=self.dp_rank * self.tp_size,
                 tp_size=self.tp_size,
-                global_rank=self.global_rank,
-                dp_rank=self.dp_rank,
             )
         else:
             self.kvstore = None
@@ -369,9 +375,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
             model_name=os.path.basename(self.model_config.model),
             block_dim=block_dim,
             kv_caches=kv_caches,
-            global_rank=self.global_rank,
+            rank=self.global_rank,
             tp_size=self.tp_size,
-            dp_rank=self.dp_rank,
         )
         logger.info(
             "Registered %d KV cache layers with shape %s",

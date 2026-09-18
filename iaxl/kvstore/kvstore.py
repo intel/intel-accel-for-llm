@@ -35,9 +35,8 @@ class KVStoreLocal:
         block_dim: Optional[int] = None,
         kv_caches: Optional[Mapping[str, Union[torch.Tensor, RemoteTensor]]] = None,
         layer_names: Optional[List[str]] = None,
-        global_rank: int = 0,
+        rank: int = 0,
         tp_size: int = 1,
-        dp_rank: int = 0,
     ):
 
         if kv_caches is None and layer_names is None:
@@ -58,9 +57,8 @@ class KVStoreLocal:
 
         self.kv_caches = kv_caches
         self.block_dim = block_dim
-        self.global_rank = global_rank
+        self.rank = rank
         self.tp_size = tp_size
-        self.dp_rank = dp_rank
 
         if kv_caches is not None:
             self.layer_names = list(kv_caches.keys())
@@ -88,13 +86,11 @@ class KVStoreLocal:
             self.kvcache_shape = None
             self.block_shape = None
 
-        # KVStore identity directory. A worker store uses its own global rank;
-        # the has-only (scheduler/controller) store reads its DP group's tp0
-        # worker records, whose global rank is dp_rank * tp_size.
-        if self.has_only_mode:
-            final_persist_dir = f"{model_name}_rank{dp_rank * tp_size}"
-        else:
-            final_persist_dir = f"{model_name}_rank{global_rank}"
+        # Cache directory is keyed by the rank the caller supplies. Workers pass
+        # their own (global) rank; the has-only scheduler store passes its DP
+        # group's tp0 rank so it reads that group's records. KVStore itself is
+        # DP-agnostic.
+        final_persist_dir = f"{model_name}_rank{rank}"
 
         if self.has_only_mode:
             pool_size_gb = 0.0
@@ -108,17 +104,17 @@ class KVStoreLocal:
         self.tensorzip = KVFlow(
             persist_dir=final_persist_dir,
             cache_size_gb=pool_size_gb,
-            rank=global_rank,
+            rank=rank,
         )
         start_profiling()
 
         logger.info(
             "KVStore initialized successfully: "
-            "model_name=%s, global_rank=%d, has_only_mode=%s, "
+            "model_name=%s, rank=%d, has_only_mode=%s, "
             "num_layers=%d, block_dim=%s, block_shape=%s, "
             "pool_size_gb=%.2f, persist_dir=%s",
             model_name,
-            self.global_rank,
+            self.rank,
             self.has_only_mode,
             len(self.layer_names),
             self.block_dim,
@@ -133,13 +129,13 @@ class KVStoreLocal:
             mgmt_register(
                 "GET",
                 "/v1/health",
-                lambda params, s=self: {"status": "ok", "rank": s.global_rank},
+                lambda params, s=self: {"status": "ok", "rank": s.rank},
             )
             mgmt_register(
                 "POST",
                 "/v1/cache/persist",
                 lambda body, s=self: {
-                    "rank": s.global_rank,
+                    "rank": s.rank,
                     "result": s.persist(int(body.get("count", 10))),
                 },
             )
@@ -147,7 +143,7 @@ class KVStoreLocal:
                 "POST",
                 "/v1/cache/evict",
                 lambda body, s=self: {
-                    "rank": s.global_rank,
+                    "rank": s.rank,
                     "result": s.evict(int(body.get("count", 10))),
                 },
             )
@@ -155,10 +151,7 @@ class KVStoreLocal:
                 "GET", "/v1/cache/metrics", lambda params, s=self: s.metrics(params)
             )
         self._mgmt_server = start_mgmt_server(
-            role=role,
-            global_rank=self.global_rank,
-            tp_size=self.tp_size,
-            dp_rank=self.dp_rank,
+            role=role, rank=self.rank, num_workers=self.tp_size
         )
 
     def put(
@@ -289,7 +282,7 @@ class KVStoreLocal:
 
     def status(self) -> dict:
         status = self.tensorzip.status()
-        status["rank"] = self.global_rank
+        status["rank"] = self.rank
         status["num_layers"] = len(self.layer_names)
         status["kvcache_shape"] = self.kvcache_shape
         return status
@@ -310,7 +303,7 @@ class KVStoreLocal:
             metrics_reset()
 
         result = metrics_read()
-        result["rank"] = self.global_rank
+        result["rank"] = self.rank
         return result
 
     def persist(self, max_count: int) -> dict:
