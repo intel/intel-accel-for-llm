@@ -14,12 +14,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AsyncLoadLayerConfig:
-    """Select the number of leading KV layers required before prefill."""
+    """Select the number of leading KV layers required before prefill.
+
+    The configured counts are attention-layer counts; mamba layers have no
+    per-layer load hook, so they are always waited for before the forward and
+    are added on top. A negative selection means "every layer" and already
+    covers the mamba layers, so it is not offset.
+    """
 
     enabled: bool
     dynamic: bool = False
     fixed_layers: int = -1
     dynamic_rules: tuple[tuple[int, Optional[int], int], ...] = ()
+    num_mamba_layers: int = 0
 
     def select(self, concurrency: int) -> int:
         """Return the layer count selected for the request concurrency.
@@ -27,13 +34,20 @@ class AsyncLoadLayerConfig:
         A return value of zero selects synchronous loading for the request.
         """
         if not self.enabled:
-            return 0
+            return self.num_mamba_layers
         if not self.dynamic:
-            return self.fixed_layers
-        for start, end, layers in self.dynamic_rules:
-            if concurrency >= start and (end is None or concurrency <= end):
-                return layers
-        raise RuntimeError(f"No async load layer rule for concurrency {concurrency}")
+            selected = self.fixed_layers
+        else:
+            selected = None
+            for start, end, layers in self.dynamic_rules:
+                if concurrency >= start and (end is None or concurrency <= end):
+                    selected = layers
+                    break
+            if selected is None:
+                raise RuntimeError(
+                    f"No async load layer rule for concurrency {concurrency}"
+                )
+        return selected if selected < 0 else selected + self.num_mamba_layers
 
 
 def _parse_dynamic_layer_map(
@@ -127,6 +141,7 @@ def build_async_load_layer_config(
     dynamic_map: str,
     num_layers: int,
     dynamic_map_configured: bool = True,
+    num_mamba_layers: int = 0,
 ) -> AsyncLoadLayerConfig:
     """Validate async-load layer settings and build the selection policy."""
     if async_enabled not in (0, 1):
@@ -146,7 +161,9 @@ def build_async_load_layer_config(
             "KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=0 disables async "
             "loading"
         )
-        return AsyncLoadLayerConfig(enabled=False)
+        return AsyncLoadLayerConfig(
+            enabled=False, num_mamba_layers=num_mamba_layers
+        )
 
     if dynamic_enabled:
         if fixed_layers != -1:
@@ -163,6 +180,7 @@ def build_async_load_layer_config(
             enabled=True,
             dynamic=True,
             dynamic_rules=rules,
+            num_mamba_layers=num_mamba_layers,
         )
 
     if dynamic_map_configured:
@@ -179,11 +197,13 @@ def build_async_load_layer_config(
     return AsyncLoadLayerConfig(
         enabled=True,
         fixed_layers=fixed_layers,
+        num_mamba_layers=num_mamba_layers,
     )
 
 
 def load_async_load_layer_config_from_env(
     num_layers: int,
+    num_mamba_layers: int = 0,
     environ: Mapping[str, str] | None = None,
 ) -> AsyncLoadLayerConfig:
     """Load async KV settings exported by ``setvars.sh``.
@@ -224,4 +244,5 @@ def load_async_load_layer_config_from_env(
         ),
         num_layers=num_layers,
         dynamic_map_configured=True,
+        num_mamba_layers=num_mamba_layers,
     )

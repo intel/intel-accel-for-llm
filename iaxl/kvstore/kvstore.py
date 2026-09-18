@@ -159,6 +159,7 @@ class KVStoreLocal:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
 
         if self.has_only_mode:
@@ -179,7 +180,7 @@ class KVStoreLocal:
         local_skip = max(0, self.skip_compression_count - base)
 
         result = self.tensorzip.put(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
             chunk_dim=self.block_dim,
             chunk_indices=block_indices,
@@ -188,8 +189,8 @@ class KVStoreLocal:
             skip_compression_count=local_skip,
         )
 
-        if self.layer_names[-1] in layer_names:
-            self.tensorzip.put_finish(self.LABEL, block_hashs)
+        if label is not None or self.layer_names[-1] in layer_names:
+            self.tensorzip.put_finish(label or self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
         return result
@@ -218,8 +219,12 @@ class KVStoreLocal:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
-
+        """Read blocks back into the bound pools; see ``put`` for the
+        naming and namespace contract. Results are keyed by layer name
+        so a caller can wait one layer at a time and overlap the rest
+        with compute."""
         if self.has_only_mode:
             raise RuntimeError(
                 "get() not available in has-only mode (kv_caches not provided)"
@@ -231,7 +236,7 @@ class KVStoreLocal:
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
         return self.tensorzip.get(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
             chunk_dim=self.block_dim,
             chunk_indices=block_indices,
@@ -257,15 +262,26 @@ class KVStoreLocal:
             wait=wait,
         )
 
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None,
+            truncate: bool = True) -> List[bool]:
+        """Presence per block hash.
+
+        ``truncate`` (default) applies prefix semantics: a cached prefix is
+        only usable up to its first hole, so nothing past one is reported.
+        Callers that scan the whole vector (e.g. a GDN snapshot at the last
+        boundary) pass ``truncate=False``. ``label`` selects the namespace.
+        """
         if not block_hashs:
             self.tensorzip.record_flush()
             return []
 
         results = self.tensorzip.has(
-            label=self.LABEL,
+            label=label or self.LABEL,
             chunk_labels=block_hashs,
         )
+        if not truncate:
+            return results
 
         mask = np.array(results, dtype=np.bool_)
         idx = np.argmin(mask)

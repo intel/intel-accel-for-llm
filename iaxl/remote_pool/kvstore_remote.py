@@ -145,7 +145,11 @@ class KVStoreRemote:
             del self._pending[job_id]
 
     # -- control path ------------------------------------------------------------
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None,
+            truncate: bool = True) -> List[bool]:
+        # label/truncate mirror KVStoreLocal's interface; the daemon's HAS
+        # carries no namespace yet.
         resp = self.rpc.call(rpc.HAS, rpc.pack_hashes(block_hashs or []))
         return [bool(b) for b in resp]
 
