@@ -56,26 +56,48 @@ def unpack_hashes(buf: bytes, off: int = 0):
     return hashes, off + n * h
 
 
-def pack_blocks(block_indices, block_hashs, layer_idx, description: str) -> bytes:
+def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: str = "") -> bytes:
     desc = description.encode()
+    lab = label.encode()
     return b"".join((
-        struct.pack("<IHH", len(block_indices), len(layer_idx), len(desc)),
+        struct.pack("<IHHH", len(block_indices), len(layer_idx), len(desc), len(lab)),
         np.asarray(block_indices, dtype=np.int32).tobytes(),
         np.asarray(layer_idx, dtype=np.int16).tobytes(),
         pack_hashes(block_hashs),
         desc,
+        lab,
     ))
 
 
 def unpack_blocks(buf: bytes):
-    n, nl, nd = struct.unpack_from("<IHH", buf)
-    off = 8
+    n, nl, nd, nlab = struct.unpack_from("<IHHH", buf)
+    off = 10
     indices = np.frombuffer(buf, np.int32, count=n, offset=off).tolist()
     off += 4 * n
     layer_idx = np.frombuffer(buf, np.int16, count=nl, offset=off).tolist()
     off += 2 * nl
     hashes, off = unpack_hashes(buf, off)
-    return indices, hashes, layer_idx, buf[off:off + nd].decode()
+    desc = buf[off:off + nd].decode()
+    off += nd
+    return indices, hashes, layer_idx, desc, buf[off:off + nlab].decode()
+
+
+def pack_has(block_hashs: List[str], label: str = "", truncate: bool = True) -> bytes:
+    lab = label.encode()
+    return b"".join((
+        struct.pack("<BH", len(lab), 1 if truncate else 0),
+        lab,
+        pack_hashes(block_hashs),
+    ))
+
+
+def unpack_has(buf: bytes):
+    nlab, truncate = struct.unpack_from("<BH", buf)
+    off = 3
+    label = buf[off:off + nlab].decode()
+    off += nlab
+    hashes, off = unpack_hashes(buf, off)
+    return hashes, label, bool(truncate)
 
 
 def pack_json(obj) -> bytes:
@@ -230,10 +252,10 @@ class KVStoreService:
         self.layer_idx = {n: i for i, n in enumerate(self.layer_names)}
 
     def _xfer(self, peer, payload, is_put):
-        indices, hashes, layer_idx, desc = unpack_blocks(payload)
+        indices, hashes, layer_idx, desc, label = unpack_blocks(payload)
         names = [self.layer_names[i] for i in layer_idx] or None
         fn = self.kvstore.put if is_put else self.kvstore.get
-        tasks = fn(indices, hashes, names, desc)
+        tasks = fn(indices, hashes, names, desc, label=label or None)
         self._next_job = job_id = (self._next_job + 1) & 0xFFFFFFFF
         self.jobs[job_id] = Job(peer, tasks, is_put, set(tasks.keys()))
         return struct.pack("<I", job_id)
@@ -245,8 +267,9 @@ class KVStoreService:
         return self._xfer(peer, payload, False)
 
     def _has(self, peer, payload):
-        hashes, _ = unpack_hashes(payload)
-        return np.asarray(self.kvstore.has(hashes), dtype=np.uint8).tobytes()
+        hashes, label, truncate = unpack_has(payload)
+        flags = self.kvstore.has(hashes, label=label or None, truncate=truncate)
+        return np.asarray(flags, dtype=np.uint8).tobytes()
 
     def _stop(self, peer, payload):
         if self.kvstore is not None:
