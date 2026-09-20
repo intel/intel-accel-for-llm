@@ -86,10 +86,7 @@ class KVStoreLocal:
             self.kvcache_shape = None
             self.block_shape = None
 
-        # Cache directory is keyed by the rank the caller supplies. Workers pass
-        # their own (global) rank; the has-only scheduler store passes its DP
-        # group's tp0 rank so it reads that group's records. KVStore itself is
-        # DP-agnostic.
+        # Cache directory keyed by the caller-supplied rank (KVStore is DP-agnostic).
         final_persist_dir = f"{model_name}_rank{rank}"
 
         if self.has_only_mode:

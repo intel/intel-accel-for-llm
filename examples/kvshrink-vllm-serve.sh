@@ -16,6 +16,8 @@ vllm serve "$MODEL" \
     --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
     --trust-remote-code \
     "${parallel_args[@]}" \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 32765 \
     --block-size "${BLOCK_SIZE:-16}" \
     --port "${PORT:-8000}" \
     --no-enable-prefix-caching \
