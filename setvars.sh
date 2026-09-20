@@ -14,6 +14,7 @@ $TOP_DIR/tools/setup_system.sh
 # ---- Build ------------------------------------------------------------------
 export DEVICE=${DEVICE:-cuda}                 # Build backend: cuda | xpu
 export IAXL_CMAKE_ARGS=${IAXL_CMAKE_ARGS:-""} # Extra cmake flags, e.g. "-DENABLE_NVTX=OFF"
+export NVIDIA_RUNTIME=${NVIDIA_RUNTIME:-}     # Set to "none" to skip the nvidia docker runtime/gpus args (e.g. on a storage-only node without GPUs)
 
 # ---- Feature switches -------------------------------------------------------
 export IAXL_KV_COMPRESSION=${IAXL_KV_COMPRESSION:-1} # Enable DEFLATE compression (0/1)
@@ -175,7 +176,11 @@ ENV_VARS=(
 
 case "$DEVICE" in
     cuda)
-        DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "all")
+        if [[ "$NVIDIA_RUNTIME" == "none" ]]; then
+            DOCKER_RUN_ARGS=()
+        else
+            DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "all")
+        fi
         ;;
     xpu)
         DOCKER_RUN_ARGS=("--device" "/dev/dri")
