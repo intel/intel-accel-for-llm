@@ -30,17 +30,9 @@ export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
-# Parallelism strategy differs by model type:
-#   - Dense models: shard a single model copy with tensor parallelism (TP_SIZE>1,
-#     DP_SIZE=1, ENABLE_EXPERT_PARALLEL=0).
-#   - MoE models: use expert parallelism + data parallelism instead of TP
-#     (TP_SIZE=1, DP_SIZE=N, ENABLE_EXPERT_PARALLEL=1). Experts are sharded
-#     across the DP*TP ranks via all-to-all; attention/KV stay per DP group.
-export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count (set 1 for MoE)
-export DP_SIZE="${DP_SIZE:-1}"            # Data-parallel group count (>1 for MoE)
-export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}" # Expert parallelism for MoE (0/1)
-# Total workers across all DP groups (one per (dp, tp) pair). CPU/QAT/DSA specs
-# are generated and indexed per global worker so each worker gets distinct cores.
+export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count
+export DP_SIZE="${DP_SIZE:-1}"            # Data-parallel group count
+# Total workers = one per (dp, tp) pair; CPU/QAT/DSA specs are indexed per worker.
 NUM_WORKERS=$((TP_SIZE * DP_SIZE))
 VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
 export VLLM_CPU_OMP_THREADS_BIND # Per-worker CPU affinity (one entry per global rank)
@@ -70,7 +62,6 @@ printf '%s\n' \
     "  MODEL=$MODEL" \
     "  TP_SIZE=$TP_SIZE" \
     "  DP_SIZE=$DP_SIZE" \
-    "  ENABLE_EXPERT_PARALLEL=$ENABLE_EXPERT_PARALLEL" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \

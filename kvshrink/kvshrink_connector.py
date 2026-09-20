@@ -111,13 +111,9 @@ class KVShrinkConnector(KVConnectorBase_V1):
         self.use_mla = self.model_config.use_mla
         self.vllm_device = vllm_config.device_config.device_type
         parallel_config = vllm_config.parallel_config
-        # This worker's data-parallel rank (which DP group, 0..DP-1). Use
-        # data_parallel_index, not data_parallel_rank: vLLM resets the latter
-        # to 0 for dense models.
+        # data_parallel_index, not data_parallel_rank (vLLM resets the latter
+        # to 0 for dense models).
         self.dp_rank = parallel_config.data_parallel_index
-        # Number of DP groups. For MoE models vLLM keeps data_parallel_size, so
-        # use it directly. For dense models vLLM resets it to 1 (same as
-        # data_parallel_rank), so fall back to the launch value from setvars.sh.
         if self.model_config.is_moe:
             self.dp_size = parallel_config.data_parallel_size
         else:
@@ -127,15 +123,12 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 "because vLLM resets data_parallel_size to 1 for dense models.",
                 self.dp_size,
             )
-        # This worker's tensor-parallel rank within its DP group (0..tp_size-1).
         self.tp_rank = (
             get_tensor_model_parallel_rank()
             if model_parallel_is_initialized()
             else 0
         )
-        # This worker's globally-unique index across all DP groups, and the total
-        # worker count (DP * TP). Used as the KVStore / CPU / port identity so
-        # different DP groups do not collide.
+        # Globally-unique worker index / total worker count: KVStore/CPU/port identity.
         self.global_rank = self.dp_rank * self.tp_size + self.tp_rank
         self.global_size = self.dp_size * self.tp_size
 
@@ -165,11 +158,8 @@ class KVShrinkConnector(KVConnectorBase_V1):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            # The has-only scheduler store reads its DP group's tp0 records, so
-            # pass that group's tp0 rank (dp_rank * tp_size). Offset the mgmt
-            # ports by DP group (runs once per scheduler process) so multiple DP
-            # schedulers on one host do not clash and each controller aggregates
-            # its own group's workers (base + dp_rank * tp_size .. + tp_size-1).
+            # Scheduler store reads its DP group's tp0; offset mgmt ports by DP
+            # group so DP schedulers on one host don't clash.
             iaxl_envs.IAXL_API_CONTROLLER_PORT += self.dp_rank
             iaxl_envs.IAXL_API_WORKER_BASE_PORT += self.dp_rank * self.tp_size
             self.kvstore: Optional[KVStore] = KVStore(
