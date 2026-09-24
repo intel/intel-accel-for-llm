@@ -56,6 +56,8 @@ __attribute__((constructor(101))) void envs_init(void) {
 
     envs.IAXL_ZIP_SRC_CAP = env_int("IAXL_ZIP_SRC_CAP", 256 * 1024);
     envs.IAXL_ZIP_DST_CAP = env_int("IAXL_ZIP_DST_CAP", 256 * 1024);
+    /* Split QAT jobs larger than this many bytes (0 = disabled). */
+    envs.IAXL_ZIP_SEGMENT = env_int("IAXL_ZIP_SEGMENT", 0);
 
     envs.IAXL_QAT_ZIP_ENABLE = env_bool("IAXL_QAT_ZIP_ENABLE", 1);
     envs.IAXL_IAA_ZIP_ENABLE = env_bool("IAXL_IAA_ZIP_ENABLE", 0);

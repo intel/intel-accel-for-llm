@@ -45,6 +45,7 @@ struct Envs {
 
     int IAXL_ZIP_SRC_CAP;
     int IAXL_ZIP_DST_CAP;
+    int IAXL_ZIP_SEGMENT;
 
     bool IAXL_QAT_ZIP_ENABLE;
     bool IAXL_IAA_ZIP_ENABLE;
