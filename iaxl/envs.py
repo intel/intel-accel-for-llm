@@ -65,6 +65,9 @@ class Envs:
                 "or set IAXL_KV_COMPRESSION=0"
             )
         self.IAXL_DSA_GD_ENABLE = _bool("IAXL_DSA_GD_ENABLE")
+        self.IAXL_DSA_V1_ENABLE = _bool("IAXL_DSA_V1_ENABLE")
+        if self.IAXL_DSA_V1_ENABLE and not self.IAXL_DSA_GD_ENABLE:
+            raise ValueError("IAXL_DSA_V1_ENABLE=1 requires IAXL_DSA_GD_ENABLE=1")
         self.IAXL_KV_DATA_SHUFFLE = _bool("IAXL_KV_DATA_SHUFFLE")
         self.IAXL_KV_LOSSY_TRUNC = max(0, _int("IAXL_KV_LOSSY_TRUNC", 0))
         self.IAXL_CACHE_DIR = _str("IAXL_CACHE_DIR", "_data/kvcache")

@@ -65,8 +65,11 @@ class SliceCopier:
             [tensor.data_ptr() for tensor in cpu_tensors], dtype=torch.int64
         )
         self._work_stream = torch.cuda.Stream(device=gpu_tensor.device)
-        backend = "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
-        self._context = Context.create(
+        if envs.IAXL_DSA_V1_ENABLE:
+            create, backend = Context.create_dsa_v1, "dsa_v1"
+        else:
+            create, backend = Context.create, "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
+        self._context = create(
             gpu_tensor, dim, direction, f"copy_slices_{backend}", self._work_stream
         )
 
