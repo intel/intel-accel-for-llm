@@ -181,6 +181,8 @@ class KVFlow:
                 tensor.base, tensor.dev_id, list(tensor.shape), tensor.element_size(),
                 chunk_dim, direction, description,
             )
+        if envs.IAXL_DSA_V1_ENABLE:
+            return Context.create_dsa_v1(tensor, chunk_dim, direction, description, work_stream=work_stream)
         return Context.create(tensor, chunk_dim, direction, description, work_stream=work_stream)
 
     @profile_func(
