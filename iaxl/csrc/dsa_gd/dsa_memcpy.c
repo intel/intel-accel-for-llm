@@ -46,6 +46,10 @@ extern "C" {
 #endif
 int dsa_memcpy(void *dest, const void *src, size_t n);
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count);
+/* Single-threaded only: returns once every batch is submitted; pair with dsa_memcpy_batch_wait. */
+int dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
+                           size_t count);
+int dsa_memcpy_batch_wait(void);
 #ifdef __cplusplus
 }
 #endif
@@ -63,6 +67,13 @@ static size_t g_max_batch = 1;
 static struct dsa_hw_desc *g_subs[DSA_MAX_WQ];
 static struct dsa_completion_record *g_comps[DSA_MAX_WQ];
 static struct dsa_completion_record *g_bcomps[DSA_MAX_WQ];
+
+/* Per-WQ slot bookkeeping; kept across calls so async batches can stay in flight. */
+struct dsa_wq_slots {
+    size_t free_slots[DSA_BATCH_DEPTH], busy_slots[DSA_BATCH_DEPTH];
+    size_t nfree, inflight;
+};
+static struct dsa_wq_slots g_slots[DSA_MAX_WQ];
 
 static inline void dsa_wait_pause(const volatile uint8_t *comp) {
 #if defined(DSA_WAIT_YIELD)
@@ -264,10 +275,15 @@ static int dsa_init(void) {
     }
 
     for (w = 0; w < num_wq; w++) {
+        size_t k;
+
         g_wq_portal[w] = portals[w];
         g_subs[w] = subs[w];
         g_comps[w] = comps[w];
         g_bcomps[w] = bcomps[w];
+        for (k = 0; k < DSA_BATCH_DEPTH; k++)
+            g_slots[w].free_slots[k] = k;
+        g_slots[w].nfree = DSA_BATCH_DEPTH;
     }
     g_num_wq = num_wq;
 
@@ -408,7 +424,31 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
     return dsa_submit(&bdesc, portal);
 }
 
-int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count) {
+/* Waits for one in-flight batch on WQ w and returns its slot to the free list. */
+static int dsa_reap_one(size_t w) {
+    struct dsa_wq_slots *s = &g_slots[w];
+    struct dsa_completion_record *bcomp = g_bcomps[w];
+    size_t k = dsa_wait_any(bcomp, s->busy_slots, s->inflight);
+    int ok = bcomp[s->busy_slots[k]].status == DSA_COMP_SUCCESS;
+
+    if (!ok)
+        fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp[s->busy_slots[k]].status);
+    s->free_slots[s->nfree++] = s->busy_slots[k];
+    s->busy_slots[k] = s->busy_slots[--s->inflight];
+    return ok;
+}
+
+static int dsa_drain(size_t w) {
+    int ok = 1;
+
+    while (g_slots[w].inflight)
+        ok = dsa_reap_one(w) && ok;
+    return ok;
+}
+
+/* Submits every batch, one WQ per thread; with wait=0 the trailing batches stay in flight. */
+static int dsa_memcpy_batch_run(void *const dest[], const void *const src[], const size_t n[],
+                                size_t count, int wait) {
     size_t per_batch, i, nbatches, nthreads;
     int ok = 1;
 
@@ -442,50 +482,52 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
 
 #pragma omp parallel num_threads(nthreads) reduction(&& : ok)
     {
-        int tid = omp_get_thread_num();
-        void *portal = g_wq_portal[tid];
-        struct dsa_completion_record *bcomp = g_bcomps[tid];
-        size_t free_slots[DSA_BATCH_DEPTH], busy_slots[DSA_BATCH_DEPTH];
-        size_t next = (size_t)tid;
-        size_t nfree = DSA_BATCH_DEPTH, inflight = 0, k;
+        size_t w = (size_t)omp_get_thread_num();
+        struct dsa_wq_slots *s = &g_slots[w];
+        size_t next;
 
-        for (k = 0; k < DSA_BATCH_DEPTH; k++)
-            free_slots[k] = k;
+        for (next = w; next < nbatches; next += nthreads) {
+            size_t slot, done = next * per_batch, cnt = count - done;
 
-        while (next < nbatches || inflight) {
-            while (nfree && next < nbatches) {
-                size_t slot = free_slots[nfree - 1];
-                size_t done = next * per_batch;
-                size_t cnt = count - done;
+            if (cnt > per_batch)
+                cnt = per_batch;
 
-                if (cnt > per_batch)
-                    cnt = per_batch;
+            while (!s->nfree)
+                ok = dsa_reap_one(w) && ok;
 
-                if (dsa_submit_batch(portal, g_subs[tid] + slot * per_batch,
-                                     g_comps[tid] + slot * per_batch, &bcomp[slot], dest, src, n,
-                                     done, cnt)) {
-                    ok = 0;
-                    next = nbatches; /* drain what is in flight, submit no more */
-                    break;
-                }
-                nfree--;
-                busy_slots[inflight++] = slot;
-                next += nthreads;
-            }
-
-            if (!inflight)
-                break;
-
-            k = dsa_wait_any(bcomp, busy_slots, inflight);
-            if (bcomp[busy_slots[k]].status != DSA_COMP_SUCCESS) {
-                fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp[busy_slots[k]].status);
+            slot = s->free_slots[s->nfree - 1];
+            if (dsa_submit_batch(g_wq_portal[w], g_subs[w] + slot * per_batch,
+                                 g_comps[w] + slot * per_batch, &g_bcomps[w][slot], dest, src, n,
+                                 done, cnt)) {
                 ok = 0;
+                break;
             }
-            free_slots[nfree++] = busy_slots[k];
-            busy_slots[k] = busy_slots[--inflight];
+            s->nfree--;
+            s->busy_slots[s->inflight++] = slot;
         }
+
+        if (wait)
+            ok = dsa_drain(w) && ok;
     }
 
+    return ok ? 0 : -1;
+}
+
+int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count) {
+    return dsa_memcpy_batch_run(dest, src, n, count, 1);
+}
+
+int dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
+                           size_t count) {
+    return dsa_memcpy_batch_run(dest, src, n, count, 0);
+}
+
+int dsa_memcpy_batch_wait(void) {
+    size_t w;
+    int ok = 1;
+
+    for (w = 0; w < g_num_wq; w++)
+        ok = dsa_drain(w) && ok;
     return ok ? 0 : -1;
 }
 
