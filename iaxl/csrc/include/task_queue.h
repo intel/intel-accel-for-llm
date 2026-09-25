@@ -12,6 +12,8 @@
 #include <thread>
 #include <pthread.h>
 
+#include "env.h"
+
 class TaskQueue {
   public:
     static constexpr int PRIORITY_HIGH = 0;
@@ -31,6 +33,7 @@ class TaskQueue {
 
         worker_ = std::thread([this]() {
             pthread_setname_np(pthread_self(), name_);
+            iaxl_apply_thread_affinity();
             worker_loop();
         });
         state_ = State::RUNNING;

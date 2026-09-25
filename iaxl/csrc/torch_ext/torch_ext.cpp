@@ -15,6 +15,10 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
+    m.attr("device_type") = IAXL_DEVICE;
+    // Size of the codec OpenMP team (QAT/IAA pollers + CPU zip workers) this process will run.
+    m.attr("codec_threads") = envs.IAXL_OMP_THREAD_NUM;
+
     py::enum_<GpuTransferDirection>(m, "GpuTransferDirection")
         .value("H2D", GpuTransferDirection::H2D)
         .value("D2H", GpuTransferDirection::D2H);
@@ -30,9 +34,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 }
                 return Context::create(tensor, chunk_dim, direction, name, gpu_work_stream);
             },
-            "Create transfer context from GPU tensor.\n"
-            "work_stream: GPU stream for memcpy (put_stream or get_stream). None = use current "
-            "stream.",
+            "Create transfer context from a tensor on the compiled inference device.\n"
+            "work_stream: GPU stream for memcpy, or None for the current stream / CPU copies.",
             py::arg("tensor"), py::arg("chunk_dim"),
             py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "gpu_xfer",
             py::arg("work_stream") = py::none())
@@ -49,7 +52,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("xfer_wait_stream",
              static_cast<bool (Context::*)(py::object)>(&Context::xfer_wait_stream),
              "Wait for stream to complete current work before starting transfers.\n"
-             "CUDA: async (returns True), XPU: sync blocking (returns False)",
+             "CUDA: async (returns True), XPU: sync blocking (returns False), CPU: no-op",
              py::arg("cur_stream"))
         .def("xfer_chunk", &Context::xfer_chunk, "Transfer single chunk (async)",
              py::arg("cpu_tensor"), py::arg("chunk_idx"), py::call_guard<py::gil_scoped_release>())
@@ -62,7 +65,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "cpu_ptrs holding the address of each chunk (keep the CPU tensors alive).",
              py::arg("chunk_indices"), py::arg("cpu_ptrs"),
              py::call_guard<py::gil_scoped_release>())
-        .def("xfer_finish", &Context::xfer_finish, "Record GPU event after all transfers (async)",
+        .def("xfer_finish", &Context::xfer_finish, "Mark completion after all transfers (async)",
              py::call_guard<py::gil_scoped_release>())
         .def("xfer_wait", &Context::xfer_wait, "Wait for raw transfers to complete",
              py::call_guard<py::gil_scoped_release>())
@@ -76,11 +79,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("cpu_tensors"), py::arg("compress") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("unzip_from_mem", &Context::unzip_from_mem,
-             "Retrieve from cache, decompress, and H2D transfer (async).\n"
+               "Retrieve from cache, decompress, and copy into the inference tensor (async).\n"
              "Call unzip_wait() + xfer_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
              py::arg("chunk_indices"), py::arg("cpu_tensors"),
              py::call_guard<py::gil_scoped_release>())
+        .def("zip_to_mem_direct", &Context::zip_to_mem_direct,
+             "CPU build only: compress the selected chunks straight from the inference tensor "
+             "into the cache (async). No scratch tensors; call zip_wait() to block.",
+             py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
+             py::arg("chunk_indices"), py::arg("compress") = true,
+             py::call_guard<py::gil_scoped_release>())
+        .def("unzip_from_mem_direct", &Context::unzip_from_mem_direct,
+             "CPU build only: decompress straight into the inference tensor (async). "
+             "Call unzip_wait() + xfer_wait() to block until done.",
+             py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
+             py::arg("chunk_indices"), py::call_guard<py::gil_scoped_release>())
         .def("zip_wait", &Context::zip_wait, "Wait for zip_to_mem to complete",
              py::call_guard<py::gil_scoped_release>())
         .def("zip_is_complete", &Context::zip_is_complete,

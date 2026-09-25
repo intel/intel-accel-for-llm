@@ -58,6 +58,9 @@ struct Envs {
     int IAXL_IAA_ZIP_INSTANCES_PER_DEVICE;
     int IAXL_IAA_ZIP_QUEUE_DEPTH;
     int IAXL_CPU_ZIP_THREADS;
+    // Threads that drive QAT/IAA instances; each poller multiplexes instances/pollers devices.
+    int IAXL_QAT_POLL_THREADS;
+    int IAXL_IAA_POLL_THREADS;
     int IAXL_OMP_THREAD_NUM;
 
     bool IAXL_KV_COMPRESSION;
@@ -68,7 +71,14 @@ struct Envs {
 
     bool IAXL_DSA_GD_ENABLE;
     bool IAXL_DSA_GD_RESET_ON_DESTROY;
+    // Host-to-host DSA memcpy for the pure-copy segments of the CPU inference path.
+    bool IAXL_DSA_MEMCPY_ENABLE;
+    // Batches smaller than this stay on memcpy: DSA submit+completion latency exceeds the copy.
+    size_t IAXL_DSA_MEMCPY_MIN_BYTES;
     const char *(*IAXL_DSA_WQS)(void);
+
+    // CPU list ("32-35,40") for every IAXL native thread; empty leaves the inherited mask.
+    const char *IAXL_CPU_AFFINITY;
 
     bool IAXL_DEBUG_LOG;
     const char *IAXL_PROFILE_MODE;
@@ -81,6 +91,11 @@ extern "C" {
 extern struct Envs envs;
 
 void envs_init(void);
+
+// Pins the calling thread to IAXL_CPU_AFFINITY. Returns the CPU count of that set, 0 when the
+// variable is unset, or -1 when the list could not be applied.
+int iaxl_apply_thread_affinity(void);
+int iaxl_affinity_cpu_count(void);
 
 #ifdef __cplusplus
 }

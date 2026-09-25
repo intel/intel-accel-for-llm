@@ -10,6 +10,7 @@
 #include "env.h"
 
 typedef struct {
+    unsigned char *in;
     unsigned char *out;
     int len;
     int ready;
@@ -44,8 +45,9 @@ int cpu_zip_init(void) {
         return -1;
 
     for (int slot = 0; slot < g_slot_count; slot++) {
+        g_slots[slot].in = malloc((size_t)g_src_cap);
         g_slots[slot].out = malloc((size_t)g_buf_cap);
-        if (!g_slots[slot].out) {
+        if (!g_slots[slot].in || !g_slots[slot].out) {
             cpu_zip_shutdown();
             return -1;
         }
@@ -127,10 +129,28 @@ int cpu_zip_wait(int slot, void **dest, int *len) {
     return 0;
 }
 
+void *cpu_zip_input_buf(int slot) {
+    if (!g_slots || slot < 0 || slot >= g_slot_count)
+        return NULL;
+    return g_slots[slot].in;
+}
+
+int cpu_zip_compress_staged(int slot, int len) {
+    return cpu_zip_compress(slot, cpu_zip_input_buf(slot), len);
+}
+
+int cpu_zip_poll(int slot) {
+    if (!g_slots || slot < 0 || slot >= g_slot_count || !g_slots[slot].ready)
+        return -1;
+    return 1;
+}
+
 void cpu_zip_shutdown(void) {
     if (g_slots) {
-        for (int slot = 0; slot < g_slot_count; slot++)
+        for (int slot = 0; slot < g_slot_count; slot++) {
+            free(g_slots[slot].in);
             free(g_slots[slot].out);
+        }
         free(g_slots);
     }
     g_slots = NULL;

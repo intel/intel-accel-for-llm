@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sched.h>
+#include <immintrin.h>
 
 #include "cpa.h"
 #include "cpa_dc.h"
@@ -26,6 +28,7 @@
 #define DEFAULT_SRC_CAP (256 * 1024)
 #define DEFAULT_DST_CAP (256 * 1024)
 #define DEFAULT_DEVICES "0"
+#define POLL_SPIN_LIMIT 512
 
 static int g_instances_per_device = DEFAULT_INSTANCES_PER_DEVICE;
 static uint32_t g_src_cap = DEFAULT_SRC_CAP;
@@ -105,10 +108,22 @@ static int submit_op(Instance *d, int si, int compress, void *src, uint32_t src_
     return (s == CPA_STATUS_SUCCESS) ? 0 : -1;
 }
 
+static int poll_op(Instance *d, int si) {
+    Slot *sl = &d->slot[si];
+    if (!sl->done)
+        icp_sal_DcPollInstance(d->inst, 0);
+    return sl->done ? 1 : 0;
+}
+
 static int wait_op(Instance *d, int si, uint32_t *produced) {
     Slot *sl = &d->slot[si];
-    while (!sl->done) {
-        icp_sal_DcPollInstance(d->inst, 0);
+    // The accelerator answers by DMA, so release the core instead of spinning on it forever;
+    // an unbounded poll loop steals a core from the inference threads sharing this CPU.
+    for (int spins = 0; !poll_op(d, si); spins++) {
+        if (spins < POLL_SPIN_LIMIT)
+            _mm_pause();
+        else
+            sched_yield();
     }
     if (sl->res.status != CPA_DC_OK)
         return -1;
@@ -322,12 +337,29 @@ static int submit_slot(int slot, int compress, void *src, int len) {
     int si = slot % g_queue_depth;
     Slot *sl = &in->slot[si];
 
-    memcpy(sl->in, src, (size_t)len);
+    if (src != sl->in)
+        memcpy(sl->in, src, (size_t)len);
     return submit_op(in, si, compress, sl->in, (uint32_t)len, sl->out, output_cap);
 }
 
 int qat_zip_compress(int slot, void *src, int len) { return submit_slot(slot, 1, src, len); }
 int qat_zip_decompress(int slot, void *src, int len) { return submit_slot(slot, 0, src, len); }
+
+void *qat_zip_input_buf(int slot) {
+    if (slot < 0 || slot >= g_inst_count * g_queue_depth)
+        return NULL;
+    return g_inst[slot / g_queue_depth].slot[slot % g_queue_depth].in;
+}
+
+int qat_zip_compress_staged(int slot, int len) {
+    return submit_slot(slot, 1, qat_zip_input_buf(slot), len);
+}
+
+int qat_zip_poll(int slot) {
+    if (slot < 0 || slot >= g_inst_count * g_queue_depth)
+        return -1;
+    return poll_op(&g_inst[slot / g_queue_depth], slot % g_queue_depth);
+}
 
 int qat_zip_wait(int slot, void **dest, int *len) {
     if (slot < 0 || slot >= g_inst_count * g_queue_depth)

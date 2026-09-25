@@ -186,10 +186,10 @@ def load_async_load_layer_config_from_env(
     num_layers: int,
     environ: Mapping[str, str] | None = None,
 ) -> AsyncLoadLayerConfig:
-    """Load async KV settings exported by ``setvars.sh``.
+    """Load async KV settings exported by the launch scripts.
 
-    No defaults are supplied here. This keeps ``setvars.sh`` as the single
-    source of runtime defaults and makes missing configuration explicit.
+    No defaults are supplied here. The launch scripts own runtime defaults,
+    and missing configuration is explicit.
     """
     source = os.environ if environ is None else environ
 
@@ -198,7 +198,7 @@ def load_async_load_layer_config_from_env(
             value = source[name]
         except KeyError as error:
             raise ValueError(
-                f"{name} must be set; source setvars.sh before starting vLLM"
+                f"{name} must be set; use a KVShrink launch script before starting vLLM"
             ) from error
         if not value:
             raise ValueError(f"{name} must not be empty")
