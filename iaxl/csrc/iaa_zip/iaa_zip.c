@@ -10,11 +10,13 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <immintrin.h>
 
 #include "qpl/qpl.h"
 
@@ -28,6 +30,7 @@
 #define BUSY_RETRY_LIMIT 1000000
 #define PAGE_FAULT_RETRY_LIMIT 8
 #define TOUCH_STRIDE 4096
+#define POLL_SPIN_LIMIT 512
 
 typedef struct {
     qpl_job *job;
@@ -338,7 +341,8 @@ static int submit_slot(int slot, int compress, void *src, int len) {
     if ((uint32_t)len > (compress ? g_src_cap : g_dst_cap))
         return -1;
 
-    memcpy(sl->in, src, (size_t)len);
+    if (src != sl->in)
+        memcpy(sl->in, src, (size_t)len);
     sl->compress = compress;
     sl->in_len = (uint32_t)len;
     prepare_job(sl);
@@ -357,6 +361,22 @@ static int submit_slot(int slot, int compress, void *src, int len) {
 int iaa_zip_compress(int slot, void *src, int len) { return submit_slot(slot, 1, src, len); }
 int iaa_zip_decompress(int slot, void *src, int len) { return submit_slot(slot, 0, src, len); }
 
+void *iaa_zip_input_buf(int slot) {
+    IaaSlot *sl = resolve_slot(slot);
+    return sl ? sl->in : NULL;
+}
+
+int iaa_zip_compress_staged(int slot, int len) {
+    return submit_slot(slot, 1, iaa_zip_input_buf(slot), len);
+}
+
+int iaa_zip_poll(int slot) {
+    IaaSlot *sl = resolve_slot(slot);
+    if (!sl || !sl->submitted)
+        return -1;
+    return qpl_check_job(sl->job) == QPL_STS_BEING_PROCESSED ? 0 : 1;
+}
+
 int iaa_zip_wait(int slot, void **dest, int *len) {
     IaaSlot *sl = resolve_slot(slot);
     if (!sl || !sl->submitted)
@@ -364,8 +384,13 @@ int iaa_zip_wait(int slot, void **dest, int *len) {
 
     qpl_status status;
     for (int attempt = 0;; attempt++) {
-        while ((status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED)
-            ;
+        // Same policy as qat_zip: the device answers by DMA, so do not pin a core on it.
+        for (int spins = 0; (status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED; spins++) {
+            if (spins < POLL_SPIN_LIMIT)
+                _mm_pause();
+            else
+                sched_yield();
+        }
         if (!is_page_fault(status) || attempt >= PAGE_FAULT_RETRY_LIMIT)
             break;
         touch_slot_pages(sl);

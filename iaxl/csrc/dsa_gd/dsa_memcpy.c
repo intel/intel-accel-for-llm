@@ -16,6 +16,7 @@
 #include <x86intrin.h>
 #include <omp.h>
 
+#include "dsa_memcpy.h"
 #include "env.h"
 #include "iaxl_common.h"
 
@@ -40,18 +41,15 @@
 #define ENQCMD_MAX_RETRIES 1000000u
 /* Batches kept in flight per WQ so the engine never idles while descriptors are refilled. */
 #define DSA_BATCH_DEPTH 8
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-int dsa_memcpy(void *dest, const void *src, size_t n);
-int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count);
-#ifdef __cplusplus
-}
-#endif
+// Entries per WQ left to the synchronous copy paths, which do not take credits: the batch
+// pipeline (serialised by g_batch_mutex) plus single dsa_memcpy() callers.
+#define DSA_SYNC_RESERVE (DSA_BATCH_DEPTH + 8)
 
 static char g_wq_name[DSA_MAX_WQ][32];
 static void *g_wq_portal[DSA_MAX_WQ];
+// A dedicated WQ silently drops a MOVDIR64B beyond its size, so async copies hold a credit.
+static int g_wq_credits[DSA_MAX_WQ];
+static unsigned int g_next_wq;
 static size_t g_num_wq;
 static pthread_mutex_t g_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -59,10 +57,15 @@ static size_t g_max_xfer = DSA_MAX_XFER;
 
 static size_t g_max_batch = 1;
 
+// Without BOF the engine aborts on the first untouched page (fresh malloc) instead of blocking.
+static uint32_t g_desc_flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+
 /* Descriptor buffers, one set of DSA_BATCH_DEPTH slots per WQ, reused by every batch call. */
 static struct dsa_hw_desc *g_subs[DSA_MAX_WQ];
 static struct dsa_completion_record *g_comps[DSA_MAX_WQ];
 static struct dsa_completion_record *g_bcomps[DSA_MAX_WQ];
+// The buffers above are shared, so batch calls from different threads take turns.
+static pthread_mutex_t g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline void dsa_wait_pause(const volatile uint8_t *comp) {
 #if defined(DSA_WAIT_YIELD)
@@ -144,14 +147,14 @@ static inline void movdir64b(struct dsa_hw_desc *desc, volatile void *reg) {
     asm volatile(".byte 0x66, 0x0f, 0x38, 0xf8, 0x02\t\n" : : "a"(reg), "d"(desc));
 }
 
-static size_t dsa_read_wq_attr(const char *attr, size_t fallback) {
+static size_t dsa_read_wq_attr(const char *wq, const char *attr, size_t fallback) {
     char path[96];
     char buf[32];
     unsigned long long val;
     int fd;
     ssize_t r;
 
-    snprintf(path, sizeof(path), "/sys/bus/dsa/devices/%s/%s", g_wq_name[0], attr);
+    snprintf(path, sizeof(path), "/sys/bus/dsa/devices/%s/%s", wq, attr);
     fd = open(path, O_RDONLY);
     if (fd < 0)
         return fallback;
@@ -227,8 +230,10 @@ static int dsa_init(void) {
         goto out;
     }
 
-    g_max_xfer = dsa_read_wq_attr("max_transfer_size", DSA_MAX_XFER);
-    g_max_batch = dsa_read_wq_attr("max_batch_size", 1);
+    g_max_xfer = dsa_read_wq_attr(g_wq_name[0], "max_transfer_size", DSA_MAX_XFER);
+    g_max_batch = dsa_read_wq_attr(g_wq_name[0], "max_batch_size", 1);
+    if (dsa_read_wq_attr(g_wq_name[0], "block_on_fault", 0))
+        g_desc_flags |= IDXD_OP_FLAG_BOF;
 
     for (w = 0; w < num_wq; w++) {
         char path[64];
@@ -264,17 +269,21 @@ static int dsa_init(void) {
     }
 
     for (w = 0; w < num_wq; w++) {
+        size_t size = dsa_read_wq_attr(g_wq_name[w], "size", 2 * DSA_SYNC_RESERVE);
+
         g_wq_portal[w] = portals[w];
         g_subs[w] = subs[w];
         g_comps[w] = comps[w];
         g_bcomps[w] = bcomps[w];
+        g_wq_credits[w] = size > DSA_SYNC_RESERVE ? (int)(size - DSA_SYNC_RESERVE) : 1;
     }
-    g_num_wq = num_wq;
+    __atomic_store_n(&g_num_wq, num_wq, __ATOMIC_RELEASE);
 
     fprintf(stderr,
             "dsa_init: mapped %zu WQ(s) from $" DSA_WQS_ENV " (first %s), "
-            "max_transfer_size=%zu, max_batch_size=%zu\n",
-            g_num_wq, g_wq_name[0], g_max_xfer, g_max_batch);
+            "max_transfer_size=%zu, max_batch_size=%zu, block_on_fault=%d\n",
+            g_num_wq, g_wq_name[0], g_max_xfer, g_max_batch,
+            (g_desc_flags & IDXD_OP_FLAG_BOF) != 0);
 
     ret = 0;
     goto out;
@@ -330,7 +339,7 @@ int dsa_memcpy(void *dest, const void *src, size_t n) {
         memset(&desc, 0, sizeof(desc));
         desc.opcode = DSA_OPCODE_MEMMOVE;
 
-        desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+        desc.flags = g_desc_flags;
         desc.completion_addr = (uint64_t)&comp;
         desc.src_addr = (uint64_t)src + done;
         desc.dst_addr = (uint64_t)dest + done;
@@ -380,7 +389,7 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
     for (j = 0; j < cnt; j++) {
         sub[j].opcode = DSA_OPCODE_MEMMOVE;
 
-        sub[j].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+        sub[j].flags = g_desc_flags;
         sub[j].completion_addr = (uint64_t)&comp[j];
         sub[j].src_addr = (uint64_t)src[first + j];
         sub[j].dst_addr = (uint64_t)dest[first + j];
@@ -399,6 +408,7 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
 
     memset(&bdesc, 0, sizeof(bdesc));
     bdesc.opcode = DSA_OPCODE_BATCH;
+    // BOF is only legal on the sub-descriptors; the batch descriptor rejects it.
     bdesc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
     bdesc.desc_list_addr = (uint64_t)sub;
     bdesc.desc_count = (uint32_t)cnt;
@@ -406,6 +416,79 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
 
     __builtin_ia32_sfence();
     return dsa_submit(&bdesc, portal);
+}
+
+static int64_t monotonic_ns(void) {
+    struct timespec now;
+    IAXL_CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "dsa: failed to read the clock");
+    return (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+int dsa_copy_submit(dsa_copy_job *job, void *dest, const void *src, size_t n) {
+    struct dsa_completion_record *comp = (struct dsa_completion_record *)job->comp;
+    struct dsa_hw_desc desc;
+    size_t num_wq = __atomic_load_n(&g_num_wq, __ATOMIC_ACQUIRE);
+
+    _Static_assert(sizeof(job->comp) == sizeof(struct dsa_completion_record),
+                   "dsa_copy_job completion record size mismatch");
+    if (num_wq == 0) {
+        if (dsa_init())
+            return -1;
+        num_wq = g_num_wq;
+    }
+    if (n == 0 || n > g_max_xfer)
+        return 1;
+
+    int wq = -1;
+    unsigned int first = __atomic_fetch_add(&g_next_wq, 1, __ATOMIC_RELAXED);
+    for (size_t k = 0; k < num_wq; k++) {
+        int w = (int)((first + k) % num_wq);
+        if (__atomic_sub_fetch(&g_wq_credits[w], 1, __ATOMIC_ACQUIRE) >= 0) {
+            wq = w;
+            break;
+        }
+        __atomic_add_fetch(&g_wq_credits[w], 1, __ATOMIC_RELEASE);
+    }
+    if (wq < 0)
+        return 1;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = DSA_OPCODE_MEMMOVE;
+    desc.flags = g_desc_flags;
+    desc.completion_addr = (uint64_t)comp;
+    desc.src_addr = (uint64_t)src;
+    desc.dst_addr = (uint64_t)dest;
+    desc.xfer_size = (uint32_t)n;
+    memset(comp, 0, sizeof(*comp));
+    job->wq = wq;
+    job->polls = 0;
+    job->start_ns = monotonic_ns();
+
+    __builtin_ia32_sfence();
+    if (dsa_submit(&desc, g_wq_portal[wq])) {
+        __atomic_add_fetch(&g_wq_credits[wq], 1, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+}
+
+int dsa_copy_poll(dsa_copy_job *job) {
+    struct dsa_completion_record *comp = (struct dsa_completion_record *)job->comp;
+    // The engine writes the record only after the copied data is globally visible.
+    const uint8_t status = __atomic_load_n(&comp->status, __ATOMIC_ACQUIRE);
+
+    if (status == DSA_COMP_NONE) {
+        if (++job->polls % DSA_TIMEOUT_CHECK_INTERVAL == 0)
+            IAXL_CHECK(monotonic_ns() - job->start_ns < DSA_COMPLETION_TIMEOUT_NS,
+                       "dsa: async copy timed out after 10 seconds");
+        return 0;
+    }
+    __atomic_add_fetch(&g_wq_credits[job->wq], 1, __ATOMIC_RELEASE);
+    if (status == DSA_COMP_SUCCESS)
+        return 1;
+    fprintf(stderr, "dsa async copy failed, status=0x%x fault_addr=0x%llx\n", status,
+            (unsigned long long)comp->fault_addr);
+    return -1;
 }
 
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count) {
@@ -440,12 +523,14 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
     per_batch = g_max_batch;
     nbatches = (count + per_batch - 1) / per_batch;
 
+    pthread_mutex_lock(&g_batch_mutex);
 #pragma omp parallel num_threads(nthreads) reduction(&& : ok)
     {
         int tid = omp_get_thread_num();
         void *portal = g_wq_portal[tid];
         struct dsa_completion_record *bcomp = g_bcomps[tid];
         size_t free_slots[DSA_BATCH_DEPTH], busy_slots[DSA_BATCH_DEPTH];
+        size_t slot_cnt[DSA_BATCH_DEPTH];
         size_t next = (size_t)tid;
         size_t nfree = DSA_BATCH_DEPTH, inflight = 0, k;
 
@@ -468,6 +553,7 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
                     next = nbatches; /* drain what is in flight, submit no more */
                     break;
                 }
+                slot_cnt[slot] = cnt;
                 nfree--;
                 busy_slots[inflight++] = slot;
                 next += nthreads;
@@ -478,13 +564,28 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
 
             k = dsa_wait_any(bcomp, busy_slots, inflight);
             if (bcomp[busy_slots[k]].status != DSA_COMP_SUCCESS) {
-                fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp[busy_slots[k]].status);
+                const size_t slot = busy_slots[k];
+                const struct dsa_completion_record *comp = g_comps[tid] + slot * per_batch;
+                unsigned int sub_status = 0;
+                size_t sub_index = 0, j;
+
+                for (j = 0; j < slot_cnt[slot] && slot_cnt[slot] > 1; j++) {
+                    if (comp[j].status != DSA_COMP_SUCCESS && comp[j].status != DSA_COMP_NONE) {
+                        sub_status = comp[j].status;
+                        sub_index = j;
+                        break;
+                    }
+                }
+                fprintf(stderr,
+                        "dsa batch failed, status=0x%x (first failed sub %zu status=0x%x)\n",
+                        bcomp[slot].status, sub_index, sub_status);
                 ok = 0;
             }
             free_slots[nfree++] = busy_slots[k];
             busy_slots[k] = busy_slots[--inflight];
         }
     }
+    pthread_mutex_unlock(&g_batch_mutex);
 
     return ok ? 0 : -1;
 }

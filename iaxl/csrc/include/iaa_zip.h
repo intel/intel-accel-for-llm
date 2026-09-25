@@ -19,6 +19,13 @@ int iaa_zip_src_cap(void);
 int iaa_zip_compress(int slot, void *src, int len);
 int iaa_zip_decompress(int slot, void *src, int len);
 
+// Slot-owned input buffer (src_cap bytes); fill it, then submit with compress_staged.
+void *iaa_zip_input_buf(int slot);
+int iaa_zip_compress_staged(int slot, int len);
+
+// Non-blocking completion check: 1 done, 0 in flight, -1 invalid slot.
+int iaa_zip_poll(int slot);
+
 int iaa_zip_wait(int slot, void **dest, int *len);
 
 void iaa_zip_shutdown(void);

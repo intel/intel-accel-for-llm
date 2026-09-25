@@ -31,6 +31,46 @@ bash benchmark/kvstore/kvstore_benchmark.sh --ranks 2 --qat --data-source mock
 
 `kvstore_benchmark.py` can still be run directly for a plain single-process run without CPU / accelerator binding.
 
+## CPU Serving
+
+`kvstore/serving_benchmark.sh` measures request throughput, TTFT and TPOT for the `raw`,
+`sw` and `qat` KVShrink arms and for vLLM's own prefix cache (`vllm`). The load comes
+from `vllm bench serve` with the client settings of `tests/vllm-benchmark.sh` (random
+dataset, shared prefix = hit rate, `--ignore-eos`, `--request-rate inf`). For every point
+it primes only the shared prefix, waits for the connector to finish writing it, runs the
+measurement, and reads vLLM's prefix-cache counters to report the hit rate achieved.
+
+It starts one CPU server per cell and arm through `examples/kvshrink-vllm-cpu-serve.sh`,
+pinned to `SERVER_CPUS` (the launcher gives the last `IAXL_CORES` of them to IAXL). All
+inputs are environment variables; lists are space separated:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL` | required | Local model directory |
+| `ARMS` | `raw sw qat vllm` | Backends to compare |
+| `INPUT_LENS` / `OUTPUT_LENS` | `8192` / `128` | Prompt and generated tokens |
+| `HIT_RATES` | `80` | Percent of each prompt shared across prompts |
+| `CONCURRENCY` | `1 4 16` | Concurrent clients per point |
+| `PROMPTS_PER_CLIENT`, `MIN_PROMPTS` | `2`, `8` | Prompts per point = max(clients x 2, 8) |
+| `SERVER_CPUS`, `IAXL_CORES`, `NUMA_NODE` | `0-31`, `2`, `0` | Server placement |
+| `BLOCK_SIZE`, `CACHE_POOL_GB`, `SEED` | `32`, `96`, `20260925` | vLLM block size, IAXL DDR cache, dataset seed |
+| `CLIENT_CPUS` | unset | Cores for `vllm bench serve`, outside `SERVER_CPUS` |
+| `SERVER` | `launch` | `external` benchmarks an already running server on `PORT` |
+| `RESULTS` | `./results/serving-<time>` | Output directory |
+
+```bash
+# All arms, one operating point per concurrency.
+MODEL=/models/Qwen3-8B CLIENT_CPUS=32-35 benchmark/kvstore/serving_benchmark.sh
+# Restore-heavy comparison of QAT and SW.
+MODEL=/models/Qwen3-8B ARMS="qat sw" INPUT_LENS="4096 8192" OUTPUT_LENS=8 HIT_RATES=100 \
+    CONCURRENCY="1 4 16" CLIENT_CPUS=32-35 benchmark/kvstore/serving_benchmark.sh
+# A GPU server started with examples/kvshrink-vllm-serve.sh, same client and metrics.
+SERVER=external PORT=8000 ARMS=qat MODEL=Qwen/Qwen3-32B benchmark/kvstore/serving_benchmark.sh
+```
+
+Results: `summary.csv` (one row per point: throughput, median/p95 TTFT and TPOT, measured
+hit rate, QAT request delta, DSA state) plus each `vllm bench serve` JSON and server log.
+
 ## Tensor Transfer
 
 Compares fragmented H2D and D2H transfer performance using CUDA, `cudaMemcpy3DBatchAsync`, Triton, and IAXL, and generates a result plot.

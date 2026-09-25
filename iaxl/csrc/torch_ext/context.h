@@ -21,6 +21,7 @@ using namespace profiler;
 
 #include "kv_xfer.h"
 #include "kv_xfer_rdma.h"
+#include "kv_zip.h"
 
 namespace kv_pool {
 class Mem;
@@ -37,6 +38,10 @@ class Context {
     static Context create(const torch::Tensor &tensor, int chunk_dim,
                           GpuTransferDirection direction = GpuTransferDirection::H2D,
                           const std::string &name = "", kv_xfer::stream_t work_stream = nullptr) {
+        TORCH_CHECK(tensor.device().type() == c10::Device(IAXL_DEVICE).type(),
+                    "IAXL was built for " IAXL_DEVICE " tensors, got ", tensor.device());
+        TORCH_CHECK(tensor.is_contiguous(), "IAXL transfer tensors must be contiguous");
+        TORCH_CHECK(chunk_dim >= 0 && chunk_dim < tensor.dim(), "Chunk dimension out of range");
         Context ctx;
         ctx.name_ = name;
         ctx.gpu_tensor_ = tensor;
@@ -52,6 +57,15 @@ class Context {
             inner_size *= tensor.size(d);
         int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
         int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
+
+        ctx.tensor_base_ = static_cast<char *>(tensor.data_ptr());
+        ctx.chunk_dim_ = chunk_dim;
+        ctx.chunk_stride_ = chunk_stride;
+        ctx.outer_dims_ = outer_dims;
+        ctx.inner_size_ = inner_size;
+        ctx.outer_block_size_ = outer_block_size;
+        ctx.element_size_ = static_cast<int>(tensor.element_size());
+        ctx.is_bf16_ = tensor.dtype() == torch::kBFloat16;
 
         ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
                                             chunk_stride, outer_dims, inner_size, outer_block_size,
@@ -110,6 +124,23 @@ class Context {
                         const std::vector<int64_t> &chunk_indices,
                         const std::vector<torch::Tensor> &cpu_tensors);
 
+    // CPU-build paths that codec straight from / into the inference tensor, no scratch buffers.
+    void zip_to_mem_direct(kv_pool::Mem &mem, const std::string &label,
+                           const std::string &tensor_key,
+                           const std::vector<std::string> &chunk_labels,
+                           const std::vector<int64_t> &chunk_indices, bool compress = true);
+
+    void unzip_from_mem_direct(kv_pool::Mem &mem, const std::string &label,
+                               const std::string &tensor_key,
+                               const std::vector<std::string> &chunk_labels,
+                               const std::vector<int64_t> &chunk_indices);
+
+    kv_zip::ChunkView chunk_view(int64_t chunk_idx) const {
+        return kv_zip::ChunkView{tensor_base_ + chunk_idx * chunk_stride_, outer_dims_,
+                                 inner_size_, outer_block_size_, element_size_, is_bf16_};
+    }
+    int64_t num_chunks() const { return gpu_tensor_.defined() ? gpu_tensor_.size(chunk_dim_) : 0; }
+
     void zip_wait();
     bool zip_is_complete();
     void unzip_wait();
@@ -140,6 +171,14 @@ class Context {
             stream_id_ = other.stream_id_;
             gpu_tensor_ = std::move(other.gpu_tensor_);
             direction_ = other.direction_;
+            tensor_base_ = other.tensor_base_;
+            chunk_dim_ = other.chunk_dim_;
+            chunk_stride_ = other.chunk_stride_;
+            outer_dims_ = other.outer_dims_;
+            inner_size_ = other.inner_size_;
+            outer_block_size_ = other.outer_block_size_;
+            element_size_ = other.element_size_;
+            is_bf16_ = other.is_bf16_;
             queue_ = other.queue_;
             event_ = other.event_;
             xfer_last_future_ = std::move(other.xfer_last_future_);
@@ -170,6 +209,14 @@ class Context {
     unsigned long long stream_id_ = 0;
     torch::Tensor gpu_tensor_;
     GpuTransferDirection direction_ = GpuTransferDirection::H2D;
+    char *tensor_base_ = nullptr;
+    int chunk_dim_ = 0;
+    int64_t chunk_stride_ = 0;
+    int64_t outer_dims_ = 0;
+    int64_t inner_size_ = 0;
+    int64_t outer_block_size_ = 0;
+    int element_size_ = 0;
+    bool is_bf16_ = false;
     TaskQueue *queue_ = nullptr;
     kv_xfer::event_t event_ = nullptr;
     std::future<void> xfer_last_future_;

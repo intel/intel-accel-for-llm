@@ -39,11 +39,12 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
     std::vector<std::string> chunk_labels;
     std::vector<int64_t> chunk_indices;
     std::vector<torch::Tensor> cpu_tensors;
+    bool direct = false;
     std::shared_ptr<std::promise<void>> promise;
 
     void execute(bool is_retry) {
-        PROFILE_SCOPE_FMT("unzip_from_mem_work(%s,retry=%d,l=<%zu,l0=%s>,i=<%zu,i0=%ld>)",
-                          ctx->name().c_str(), is_retry, chunk_labels.size(),
+        PROFILE_SCOPE_FMT("unzip_from_mem_work(%s,retry=%d,direct=%d,l=<%zu,l0=%s>,i=<%zu,i0=%ld>)",
+                          ctx->name().c_str(), is_retry, direct, chunk_labels.size(),
                           chunk_labels[0].c_str(), chunk_indices.size(), chunk_indices[0]);
 
         const size_t n = chunk_labels.size();
@@ -88,15 +89,28 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
         {
             PROFILE_SCOPE("decompress");
             METRICS_TIMER_START(metrics_decompress);
-            kv_zip_decompress_batch(data_ptrs, cpu_tensors);
-            METRICS_ADD_DECOMPRESS(metrics_decompress, metrics_sum_tensor_bytes(cpu_tensors));
+            if (direct) {
+                std::vector<kv_zip::ChunkView> views;
+                views.reserve(n);
+                uint64_t total = 0;
+                for (int64_t idx : chunk_indices) {
+                    views.push_back(ctx->chunk_view(idx));
+                    total += views.back().nbytes();
+                }
+                kv_zip_decompress_views(data_ptrs, views);
+                METRICS_ADD_DECOMPRESS(metrics_decompress, total);
+            } else {
+                kv_zip_decompress_batch(data_ptrs, cpu_tensors);
+                METRICS_ADD_DECOMPRESS(metrics_decompress, metrics_sum_tensor_bytes(cpu_tensors));
+            }
         }
 
         mem->release_deletion_guard();
 
         {
-
-            ctx->xfer_chunks_batch(chunk_indices, cpu_tensors);
+            // Direct mode already wrote the tensor; the finish marker keeps xfer_wait() valid.
+            if (!direct)
+                ctx->xfer_chunks_batch(chunk_indices, cpu_tensors);
 
             ctx->xfer_finish();
         }
@@ -104,6 +118,13 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
         promise->set_value();
     }
 };
+
+static void check_direct_supported() {
+#ifndef CPU_SUPPORT
+    TORCH_CHECK(false, "direct codec paths read/write the inference tensor from the host and "
+                       "require a DEVICE=cpu build");
+#endif
+}
 
 } // namespace
 
@@ -184,6 +205,91 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                 work->execute(false);
             } catch (...) {
                 IAXL_CHECK(false, "unzip_from_mem: unexpected asynchronous exception");
+            }
+        },
+        TaskQueue::PRIORITY_HIGH);
+}
+
+void Context::zip_to_mem_direct(kv_pool::Mem &mem, const std::string &label,
+                                const std::string &tensor_key,
+                                const std::vector<std::string> &chunk_labels,
+                                const std::vector<int64_t> &chunk_indices, bool compress) {
+    check_direct_supported();
+    PROFILE_SCOPE_FMT("zip_to_mem_direct(%s,l=<%zu,l0=%s>)", name().c_str(), chunk_labels.size(),
+                      chunk_labels[0].c_str());
+    TORCH_CHECK(chunk_indices.size() == chunk_labels.size(),
+                "zip_to_mem_direct: chunk_indices and chunk_labels must match");
+    const int64_t limit = num_chunks();
+    for (int64_t idx : chunk_indices)
+        TORCH_CHECK(idx >= 0 && idx < limit, "zip_to_mem_direct: chunk index out of range");
+
+    const size_t n = chunk_indices.size();
+    std::vector<kv_zip::ChunkView> views;
+    views.reserve(n);
+    for (int64_t idx : chunk_indices)
+        views.push_back(chunk_view(idx));
+
+    reset_async_state();
+
+    auto *cache_ptr = &mem;
+    auto chunk_labels_copy = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels);
+    auto *self = this;
+
+    zip_future_ = omp_queue().submit(
+        [=, views = std::move(views)]() {
+            PROFILE_SCOPE_FMT("zip_to_mem_direct_work(%s,l=<%zu,l0=%s>)", self->name().c_str(),
+                              chunk_labels_copy.size(), chunk_labels_copy[0].c_str());
+            try {
+                std::vector<char *> compressed_bufs(n);
+                std::vector<size_t> compressed_sizes(n);
+                std::vector<size_t> unzip_sizes(n);
+                {
+                    PROFILE_SCOPE("compress");
+                    METRICS_TIMER_START(metrics_compress);
+                    kv_zip_compress_views(views, compressed_bufs, compressed_sizes, unzip_sizes,
+                                          compress);
+                    METRICS_ADD_COMPRESS(metrics_compress, metrics_sum_sizes(unzip_sizes));
+                }
+                cache_ptr->put(chunk_labels_copy, std::move(compressed_bufs), compressed_sizes,
+                               unzip_sizes);
+            } catch (...) {
+                IAXL_CHECK(false, "zip_to_mem_direct: unexpected asynchronous exception");
+            }
+        },
+        TaskQueue::PRIORITY_LOW);
+}
+
+void Context::unzip_from_mem_direct(kv_pool::Mem &mem, const std::string &label,
+                                    const std::string &tensor_key,
+                                    const std::vector<std::string> &chunk_labels,
+                                    const std::vector<int64_t> &chunk_indices) {
+    check_direct_supported();
+    PROFILE_SCOPE_FMT("unzip_from_mem_direct %s/%s", label.c_str(), tensor_key.c_str());
+    TORCH_CHECK(chunk_indices.size() == chunk_labels.size(),
+                "unzip_from_mem_direct: chunk_indices and chunk_labels must match");
+    const int64_t limit = num_chunks();
+    for (int64_t idx : chunk_indices)
+        TORCH_CHECK(idx >= 0 && idx < limit, "unzip_from_mem_direct: chunk index out of range");
+
+    reset_async_state();
+
+    auto promise = std::make_shared<std::promise<void>>();
+    unzip_future_ = promise->get_future();
+
+    auto work = std::make_shared<UnzipFromMemWork>();
+    work->ctx = this;
+    work->mem = &mem;
+    work->chunk_labels = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels);
+    work->chunk_indices = chunk_indices;
+    work->direct = true;
+    work->promise = promise;
+
+    omp_queue().submit(
+        [work]() {
+            try {
+                work->execute(false);
+            } catch (...) {
+                IAXL_CHECK(false, "unzip_from_mem_direct: unexpected asynchronous exception");
             }
         },
         TaskQueue::PRIORITY_HIGH);
