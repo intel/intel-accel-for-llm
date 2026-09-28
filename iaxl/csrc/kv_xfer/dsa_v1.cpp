@@ -2,18 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // DSA "v1" flavour of kv_xfer::Ops (CUDA + DSA builds; IAXL_DSA_V1_ENABLE selects
-// Context::create_dsa_v1). Like rdma.cpp the GPU tensor is registered once: the first
-// context on a base address GDR-maps the whole tensor and every later copy is plain
-// address arithmetic on the cached BAR alias, instead of dsa.cpp's per-call mapping
-// lookups. Copies are queued with dsa_memcpy_batch_async and drained by copy_wait;
-// events are plain flags. The wrapped CUDA context only serves stream synchronisation.
+// Context::create_dsa_v1). Like rdma.cpp the GPU memory is registered once, up front:
+// dsa_v1_register_mem GDR-maps a whole kvcache region and every later context on a
+// tensor inside it is plain address arithmetic on the cached BAR alias, instead of
+// dsa.cpp's per-call mapping lookups. Copies are queued with dsa_memcpy_batch_async and
+// drained by copy_wait; events are plain flags. The wrapped CUDA context only serves
+// stream synchronisation.
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "env.h"
@@ -45,22 +46,31 @@ struct Reg {
 
 // Guards the registry and the single-threaded dsa_memcpy_batch_* queue state.
 std::mutex mu;
-std::unordered_map<char *, Reg> regs;
+std::map<uintptr_t, Reg> regs; // registered GPU regions keyed by base address
 
 inline XferContext *as_ctx(context_t c) { return static_cast<XferContext *>(c); }
 inline std::atomic<bool> *as_ev(event_t e) { return static_cast<std::atomic<bool> *>(e); }
 
-// GDR-maps [base, base + bytes) on first use and returns the BAR alias of base.
-char *bar_for(char *base, size_t bytes) {
-    std::lock_guard<std::mutex> lock(mu);
-    auto it = regs.find(base);
-    if (it != regs.end() && it->second.bytes >= bytes)
-        return it->second.bar;
+// BAR alias of base if [base, base + bytes) lies inside one registered region, else null.
+char *lookup_locked(uintptr_t base, size_t bytes) {
+    auto it = regs.upper_bound(base);
+    if (it == regs.begin())
+        return nullptr;
+    --it;
+    if (base + bytes > it->first + it->second.bytes)
+        return nullptr;
+    return it->second.bar + (base - it->first);
+}
+
+char *register_locked(uintptr_t base, size_t bytes) {
+    IAXL_CHECK(envs.IAXL_DSA_GD_ENABLE && !envs.IAXL_DSA_GD_RESET_ON_DESTROY,
+               "dsa_v1 needs IAXL_DSA_GD_ENABLE=1 and IAXL_DSA_GD_RESET_ON_DESTROY=0");
     void *bar = nullptr;
-    IAXL_CHECK(dsa_gd_default_gpu_bar_addr(reinterpret_cast<uint64_t>(base), bytes, &bar) == 0,
-               "dsa_v1: GDRCopy mapping of the GPU tensor failed");
+    IAXL_CHECK(dsa_gd_default_gpu_bar_addr(base, bytes, &bar) == 0,
+               "dsa_v1: GDRCopy mapping of the GPU region failed");
     regs[base] = Reg{static_cast<char *>(bar), bytes};
-    fprintf(stderr, "[kv_xfer/dsa_v1] mapped %p (%.1f MB) -> %p\n", base, bytes / 1048576.0, bar);
+    fprintf(stderr, "[kv_xfer/dsa_v1] registered 0x%lx (%.1f MB) -> %p\n", (unsigned long)base,
+            bytes / 1048576.0, bar);
     return static_cast<char *>(bar);
 }
 
@@ -156,17 +166,28 @@ const Ops &dsa_v1_ops() {
     return ops;
 }
 
+void dsa_v1_register_mem(uintptr_t base, size_t bytes) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!lookup_locked(base, bytes))
+        register_locked(base, bytes);
+}
+
 context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t chunk_stride,
                                 int64_t outer_dims, int64_t inner_size, int64_t outer_block_size,
                                 stream_t work_stream) {
-    IAXL_CHECK(envs.IAXL_DSA_GD_ENABLE && !envs.IAXL_DSA_GD_RESET_ON_DESTROY,
-               "create_dsa_v1 needs IAXL_DSA_GD_ENABLE=1 and IAXL_DSA_GD_RESET_ON_DESTROY=0");
     IAXL_CHECK(chunk_stride == inner_size && inner_size % 8 == 0,
                "create_dsa_v1: tensor must be contiguous with 8-byte aligned blocks");
     XferContext *x = new XferContext();
     x->cuda = context_create(gpu_base_ptr, device_index, chunk_stride, outer_dims, inner_size,
                              outer_block_size, work_stream);
-    x->bar = bar_for(gpu_base_ptr, static_cast<size_t>(outer_dims) * outer_block_size);
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(gpu_base_ptr);
+        const size_t bytes = static_cast<size_t>(outer_dims) * outer_block_size;
+        std::lock_guard<std::mutex> lock(mu);
+        x->bar = lookup_locked(base, bytes);
+        if (!x->bar) // not covered by dsa_v1_register_mem (e.g. SliceCopier): map the tensor itself
+            x->bar = register_locked(base, bytes);
+    }
     x->chunk_stride = chunk_stride;
     x->outer_dims = outer_dims;
     x->inner_size = inner_size;

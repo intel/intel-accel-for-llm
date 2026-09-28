@@ -54,10 +54,11 @@ bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_d
 // Blocks until every batch submitted by dsa_copy_chunks_batch has completed.
 void dsa_copy_wait(context_t ctx);
 
-// DSA v1 backend (dsa_v1.cpp), selected by Context::create_dsa_v1: the GPU tensor is
-// GDR-mapped once per base address instead of being looked up on every copy.
+// DSA v1 backend (dsa_v1.cpp), selected by Context::create_dsa_v1. Register the whole
+// kvcache once with dsa_v1_register_mem; contexts on tensors inside it only compute offsets.
 struct Ops;
 const Ops &dsa_v1_ops();
+void dsa_v1_register_mem(uintptr_t base, size_t bytes);
 context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t chunk_stride,
                                 int64_t outer_dims, int64_t inner_size, int64_t outer_block_size,
                                 stream_t work_stream);
