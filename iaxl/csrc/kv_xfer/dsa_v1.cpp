@@ -185,8 +185,13 @@ context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t ch
         const size_t bytes = static_cast<size_t>(outer_dims) * outer_block_size;
         std::lock_guard<std::mutex> lock(mu);
         x->bar = lookup_locked(base, bytes);
-        if (!x->bar) // not covered by dsa_v1_register_mem (e.g. SliceCopier): map the tensor itself
+        if (!x->bar) {
+            fprintf(stderr,
+                    "[kv_xfer/dsa_v1] warning: 0x%lx (%.1f MB) not covered by dsa_v1_register_mem, "
+                    "mapping it now\n",
+                    (unsigned long)base, bytes / 1048576.0);
             x->bar = register_locked(base, bytes);
+        }
     }
     x->chunk_stride = chunk_stride;
     x->outer_dims = outer_dims;
