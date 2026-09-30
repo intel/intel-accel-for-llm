@@ -179,10 +179,13 @@ context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t ch
         std::lock_guard<std::mutex> lock(mu);
         x->bar = lookup_locked(base, bytes);
         if (!x->bar) {
-            fprintf(stderr,
-                    "[kv_xfer/dsa_v1] warning: 0x%lx (%.1f MB) not covered by dsa_v1_register_mem, "
-                    "mapping it now\n",
-                    (unsigned long)base, bytes / 1048576.0);
+            static std::once_flag warned;
+            std::call_once(warned, [&] {
+                fprintf(stderr,
+                        "[kv_xfer/dsa_v1] warning: 0x%lx (%.1f MB) not covered by "
+                        "dsa_v1_register_mem, mapping it now (reported once)\n",
+                        (unsigned long)base, bytes / 1048576.0);
+            });
             x->bar = register_locked(base, bytes);
         }
     }
