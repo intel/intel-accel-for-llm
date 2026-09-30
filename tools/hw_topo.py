@@ -8,8 +8,9 @@ hw_topo.py - 打印 GPU / NIC 信息与 CPU NUMA / PCIe 拓扑, 分析带宽共�
 
 用法:
   python3 hw_topo.py                        # 控制台输出
-  python3 hw_topo.py --html topo.html       # 同时保存为网页
-  python3 hw_topo.py --gpu-vendor 0x10de,0x1002
+  python3 hw_topo.py --http                 # 同时启动 HTTP 服务, 浏览器打开打印的 URL 查看网页
+  python3 hw_topo.py --http --port 9000     # 指定端口(默认 8080)
+  python3 hw_topo.py --gpu-vendor 0x10de,0x8086
 
 输出内容:
   1. 系统概览: CPU / NUMA / IOMMU / 相关内核参数
@@ -552,7 +553,7 @@ def text_report(topo, sysinfo):
     acs = "root 可读" if topo.acs_readable else "需 root 才能读取"
     L.append(f" IOMMU {iommu}   内核参数 [{sysinfo['cmdline']}]   ACS 配置 {acs}")
 
-    section("GPU 列表 (编号与 nvidia-smi 一致; 链路 = 当前/最大; 完整信息见 --html)")
+    section("GPU 列表 (编号与 nvidia-smi 一致; 链路 = 当前/最大; 完整信息见 --http 网页)")
     rows = []
     for g in topo.gpus:
         sw = topo.switch_of(g)
@@ -837,13 +838,55 @@ def html_report(topo, sysinfo, text):
     return "\n".join(P)
 
 
+# ----------------------------------------------------------------- http
+def host_ip():
+    """本机对外 IP (UDP connect 不会真正发包); 失败则退回主机名"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+    except OSError:
+        return socket.gethostname()
+
+
+def serve_http(page, port):
+    import http.server
+    data = page.encode("utf-8")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        srv = http.server.ThreadingHTTPServer(("", port), Handler)
+    except OSError as e:
+        sys.exit(f"无法监听端口 {port}: {e.strerror or e} (可用 --port 换一个)")
+    print(f"\nHTTP 服务已启动, 浏览器打开:  http://{host_ip()}:{port}/"
+          f"   (本机: http://localhost:{port}/)   Ctrl+C 退出")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        srv.server_close()
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="CPU/GPU/NIC/PCIe 拓扑报告")
     ap.add_argument("--gpu-vendor", default="0x10de",
-                    help="GPU 厂商 ID, 逗号分隔, 默认 NVIDIA 0x10de (AMD 0x1002)")
-    ap.add_argument("--html", metavar="FILE", help="另存为 HTML 网页")
-    ap.add_argument("--quiet", action="store_true", help="不打印到控制台(配合 --html)")
+                    help="GPU 厂商 ID, 逗号分隔, 默认 NVIDIA 0x10de (Intel 0x8086)")
+    ap.add_argument("--http", action="store_true", help="启动 HTTP 服务, 用浏览器查看网页版报告")
+    ap.add_argument("--port", type=int, default=8080, help="HTTP 服务端口 (默认 8080)")
+    ap.add_argument("--quiet", action="store_true", help="不打印到控制台(配合 --http)")
     args = ap.parse_args()
 
     if not os.path.isdir(SYSFS):
@@ -859,10 +902,8 @@ def main():
     text = text_report(topo, sysinfo)
     if not args.quiet:
         print("\n".join(text))
-    if args.html:
-        with open(args.html, "w", encoding="utf-8") as f:
-            f.write(html_report(topo, sysinfo, text))
-        print(f"\n已保存网页: {args.html}")
+    if args.http:
+        serve_http(html_report(topo, sysinfo, text), args.port)
 
 
 if __name__ == "__main__":
