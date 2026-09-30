@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import torch
 
 from .envs import envs
+from . import torch_ext as _iqt
 from .torch_ext import Context, GpuTransferDirection
 
 __all__ = ["SliceCopier", "copy_slices"]
@@ -65,8 +66,12 @@ class SliceCopier:
             [tensor.data_ptr() for tensor in cpu_tensors], dtype=torch.int64
         )
         self._work_stream = torch.cuda.Stream(device=gpu_tensor.device)
-        backend = "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
-        self._context = Context.create(
+        if envs.IAXL_DSA_V1_ENABLE:
+            _iqt.dsa_v1_register_mem(gpu_tensor.data_ptr(), gpu_tensor.nbytes)
+            create, backend = Context.create_dsa_v1, "dsa_v1"
+        else:
+            create, backend = Context.create, "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
+        self._context = create(
             gpu_tensor, dim, direction, f"copy_slices_{backend}", self._work_stream
         )
 

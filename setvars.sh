@@ -22,6 +22,7 @@ export IAXL_QAT_ZIP_ENABLE=${IAXL_QAT_ZIP_ENABLE:-1} # Enable QAT compression wo
 export IAXL_IAA_ZIP_ENABLE=${IAXL_IAA_ZIP_ENABLE:-0} # Enable IAA (QPL) compression workers (0/1)
 export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-1} # Enable CPU compression workers (0/1)
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
+export IAXL_DSA_V1_ENABLE=${IAXL_DSA_V1_ENABLE:-1}   # DSA v1 backend: GDR-map each KV tensor once (needs IAXL_DSA_GD_ENABLE=1) (0/1)
 
 # ---- Async KV load ----------------------------------------------------------
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=${KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED:-1}      # Enable asynchronous KV loading (0/1)
@@ -68,6 +69,7 @@ printf '%s\n' \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
     "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
     "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
+    "  IAXL_DSA_V1_ENABLE=$IAXL_DSA_V1_ENABLE" \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
     "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \

@@ -37,30 +37,20 @@ class Context {
     static Context create(const torch::Tensor &tensor, int chunk_dim,
                           GpuTransferDirection direction = GpuTransferDirection::H2D,
                           const std::string &name = "", kv_xfer::stream_t work_stream = nullptr) {
-        Context ctx;
-        ctx.name_ = name;
-        ctx.gpu_tensor_ = tensor;
-        ctx.direction_ = direction;
-        ctx.event_ = ctx.ops_->event_acquire();
-        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
-
-        int64_t outer_dims = 1;
-        for (int d = 0; d < chunk_dim; d++)
-            outer_dims *= tensor.size(d);
-        int64_t inner_size = tensor.element_size();
-        for (int d = chunk_dim + 1; d < tensor.dim(); d++)
-            inner_size *= tensor.size(d);
-        int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
-        int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
-
-        ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
-                                            chunk_stride, outer_dims, inner_size, outer_block_size,
-                                            work_stream);
-        ctx.stream_id_ = ctx.ops_->context_stream_id(ctx.xctx_);
-
-        PROFILE_SCOPE_FMT("ctx_create(%s,stream=%llu)", name.c_str(), ctx.stream_id_);
-        return ctx;
+        return create_gpu(tensor, chunk_dim, direction, name, work_stream, kv_xfer::gpu_ops(),
+                          kv_xfer::context_create);
     }
+
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+    // Same geometry as create(); copies go through the DSA v1 backend (kv_xfer/dsa_v1.cpp).
+    static Context create_dsa_v1(const torch::Tensor &tensor, int chunk_dim,
+                                 GpuTransferDirection direction = GpuTransferDirection::H2D,
+                                 const std::string &name = "",
+                                 kv_xfer::stream_t work_stream = nullptr) {
+        return create_gpu(tensor, chunk_dim, direction, name, work_stream, kv_xfer::dsa_v1_ops(),
+                          kv_xfer::dsa_v1_context_create);
+    }
+#endif
 
     // Remote (RDMA) tensor: only its address and contiguous geometry are known here.
     static Context create_remote(uintptr_t base, int dev_id, const std::vector<int64_t> &shape,
@@ -159,6 +149,38 @@ class Context {
     Context &operator=(const Context &) = delete;
 
   private:
+    using MakeContext = kv_xfer::context_t (*)(char *, int, int64_t, int64_t, int64_t, int64_t,
+                                               kv_xfer::stream_t);
+
+    static Context create_gpu(const torch::Tensor &tensor, int chunk_dim,
+                              GpuTransferDirection direction, const std::string &name,
+                              kv_xfer::stream_t work_stream, const kv_xfer::Ops &ops,
+                              MakeContext make_context) {
+        Context ctx;
+        ctx.ops_ = &ops;
+        ctx.name_ = name;
+        ctx.gpu_tensor_ = tensor;
+        ctx.direction_ = direction;
+        ctx.event_ = ctx.ops_->event_acquire();
+        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
+
+        int64_t outer_dims = 1;
+        for (int d = 0; d < chunk_dim; d++)
+            outer_dims *= tensor.size(d);
+        int64_t inner_size = tensor.element_size();
+        for (int d = chunk_dim + 1; d < tensor.dim(); d++)
+            inner_size *= tensor.size(d);
+        int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
+        int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
+
+        ctx.xctx_ = make_context((char *)tensor.data_ptr(), tensor.device().index(), chunk_stride,
+                                 outer_dims, inner_size, outer_block_size, work_stream);
+        ctx.stream_id_ = ctx.ops_->context_stream_id(ctx.xctx_);
+
+        PROFILE_SCOPE_FMT("ctx_create(%s,stream=%llu)", name.c_str(), ctx.stream_id_);
+        return ctx;
+    }
+
     void check_no_pending_work() const {
         IAXL_CHECK(!xfer_last_future_.valid(), "Context destroyed before xfer_wait completed");
         IAXL_CHECK(!zip_future_.valid(), "Context destroyed before zip_wait completed");

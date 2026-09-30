@@ -36,6 +36,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("tensor"), py::arg("chunk_dim"),
             py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "gpu_xfer",
             py::arg("work_stream") = py::none())
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+        .def_static(
+            "create_dsa_v1",
+            [](const torch::Tensor &tensor, int chunk_dim, GpuTransferDirection direction,
+               const std::string &name, py::object work_stream) -> Context {
+                kv_xfer::stream_t gpu_work_stream =
+                    work_stream.is_none() ? nullptr : kv_xfer::extract_stream(work_stream);
+                return Context::create_dsa_v1(tensor, chunk_dim, direction, name, gpu_work_stream);
+            },
+            "Same as create(), but copies use the DSA v1 backend (GPU tensor GDR-mapped once).",
+            py::arg("tensor"), py::arg("chunk_dim"),
+            py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "dsa_v1_xfer",
+            py::arg("work_stream") = py::none())
+#endif
         .def_static("create_remote", &Context::create_remote,
                     "Create transfer context for a client tensor registered via rdma_register_remote.",
                     py::arg("base"), py::arg("dev_id"), py::arg("shape"), py::arg("elem_size"),
@@ -503,6 +517,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return d;
         },
         "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
+
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+    m.def("dsa_v1_register_mem", &kv_xfer::dsa_v1_register_mem,
+          "GDR-map a GPU region once for the DSA v1 backend (e.g. a whole kvcache tensor).",
+          py::arg("base"), py::arg("bytes"), py::call_guard<py::gil_scoped_release>());
+#endif
 
     m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),
           py::call_guard<py::gil_scoped_release>());
