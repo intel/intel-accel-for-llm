@@ -66,8 +66,13 @@ char *register_locked(uintptr_t base, size_t bytes) {
     IAXL_CHECK(dsa_gd_default_gpu_bar_addr(base, bytes, &bar) == 0,
                "dsa_v1: GDRCopy mapping of the GPU region failed");
     regs[base] = Reg{static_cast<char *>(bar), bytes};
-    fprintf(stderr, "[kv_xfer/dsa_v1] registered 0x%lx (%.1f MB) -> %p\n", (unsigned long)base,
-            bytes / 1048576.0, bar);
+    static std::once_flag noted;
+    std::call_once(noted, [] {
+        fprintf(stderr, "[kv_xfer/dsa_v1] registering GPU regions (IAXL_DEBUG_LOG=1 lists each)\n");
+    });
+    if (envs.IAXL_DEBUG_LOG)
+        fprintf(stderr, "[kv_xfer/dsa_v1] registered 0x%lx (%.1f MB) -> %p (%zu total)\n",
+                (unsigned long)base, bytes / 1048576.0, bar, regs.size());
     return static_cast<char *>(bar);
 }
 
@@ -179,13 +184,10 @@ context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t ch
         std::lock_guard<std::mutex> lock(mu);
         x->bar = lookup_locked(base, bytes);
         if (!x->bar) {
-            static std::once_flag warned;
-            std::call_once(warned, [&] {
-                fprintf(stderr,
-                        "[kv_xfer/dsa_v1] warning: 0x%lx (%.1f MB) not covered by "
-                        "dsa_v1_register_mem, mapping it now (reported once)\n",
-                        (unsigned long)base, bytes / 1048576.0);
-            });
+            fprintf(stderr,
+                    "[kv_xfer/dsa_v1] warning: 0x%lx (%.1f MB) not covered by dsa_v1_register_mem, "
+                    "mapping it now\n",
+                    (unsigned long)base, bytes / 1048576.0);
             x->bar = register_locked(base, bytes);
         }
     }
