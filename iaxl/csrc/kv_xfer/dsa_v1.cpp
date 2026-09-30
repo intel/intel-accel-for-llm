@@ -6,15 +6,13 @@
 // dsa_v1_register_mem GDR-maps a whole kvcache region and every later context on a
 // tensor inside it is plain address arithmetic on the cached BAR alias, instead of
 // dsa.cpp's per-call mapping lookups. Copies are queued with dsa_memcpy_batch_async and
-// drained by copy_wait; events are plain flags. The wrapped CUDA context only serves
-// stream synchronisation.
+// drained by copy_wait; the per-context event is unused. The wrapped CUDA context only
+// serves stream synchronisation.
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 #include "env.h"
@@ -49,7 +47,6 @@ std::mutex mu;
 std::map<uintptr_t, Reg> regs; // registered GPU regions keyed by base address
 
 inline XferContext *as_ctx(context_t c) { return static_cast<XferContext *>(c); }
-inline std::atomic<bool> *as_ev(event_t e) { return static_cast<std::atomic<bool> *>(e); }
 
 // BAR alias of base if [base, base + bytes) lies inside one registered region, else null.
 char *lookup_locked(uintptr_t base, size_t bytes) {
@@ -78,14 +75,13 @@ char *register_locked(uintptr_t base, size_t bytes) {
 
 namespace dsa_v1 {
 
-event_t event_acquire() { return new std::atomic<bool>(false); }
-void event_release(event_t event) { delete as_ev(event); }
-
-void event_synchronize(event_t event) {
-    auto *f = as_ev(event);
-    while (!f->load(std::memory_order_acquire))
-        std::this_thread::yield();
-}
+// Completion is already guaranteed by xfer_wait (future.get + copy_wait) and tracked by
+// Context::event_recorded_, so the per-context event carries no state here.
+event_t event_acquire() { return nullptr; }
+void event_release(event_t) {}
+void event_synchronize(event_t) {}
+void context_record_event(context_t, event_t) {}
+void context_cur_wait_event(context_t, event_t) {}
 
 void context_destroy(context_t ctx) {
     XferContext *x = as_ctx(ctx);
@@ -102,11 +98,8 @@ bool context_same_stream(context_t ctx) {
     return kv_xfer::context_same_stream(as_ctx(ctx)->cuda);
 }
 
-void context_record_event(context_t, event_t event) {
-    as_ev(event)->store(true, std::memory_order_release);
-}
-void context_cur_wait_event(context_t, event_t) {}
-// CPU-driven DMA cannot be ordered on a stream: block this worker until the GPU is done.
+// `event` is a CUDA event from wait_stream_from_py; CPU-driven DMA cannot be ordered on a
+// stream, so block this worker until the GPU reaches it.
 void context_work_wait_event(context_t, event_t event) { kv_xfer::event_synchronize(event); }
 void context_work_wait_cur(context_t ctx) { kv_xfer::context_sync_cur(as_ctx(ctx)->cuda); }
 void context_sync_cur(context_t ctx) { kv_xfer::context_sync_cur(as_ctx(ctx)->cuda); }
