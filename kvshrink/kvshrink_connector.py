@@ -81,6 +81,7 @@ class RequestMetadata:
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: RequestMetadata
     reqs_to_save: RequestMetadata
+    preempted_req_ids: set[ReqId] = field(default_factory=set)
 
 
 class KVShrinkConnector(KVConnectorBase_V1):
@@ -391,6 +392,9 @@ class KVShrinkConnector(KVConnectorBase_V1):
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
+            preempted_req_ids=set(
+                getattr(scheduler_output, "preempted_req_ids", None) or ()
+            ),
         )
         self._reqs_to_load = RequestMetadata()
         self._reqs_to_save = RequestMetadata()
@@ -437,6 +441,25 @@ class KVShrinkConnector(KVConnectorBase_V1):
             len(kv_caches),
             list(first_kv_cache.shape),
         )
+
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+        # vLLM frees a preempted request's blocks at schedule time without consulting the
+        # connector; saves still reading them or loads still writing them must finish before
+        # this step's forward can hand those blocks to another request.
+        if not isinstance(kv_connector_metadata, KVShrinkConnectorMetadata):
+            return
+        for req_id in kv_connector_metadata.preempted_req_ids:
+            for tasks in self._current_put_tasks.pop(req_id, []):
+                self._store().put_wait(tasks)
+            for pending in (
+                self._pending_load_tasks,
+                self._early_promoted_tasks,
+                self._active_promoted_tasks,
+            ):
+                tasks = pending.pop(req_id, None)
+                if tasks is not None:
+                    self._store().get_wait(get_results=tasks)
+            self._pending_load_layers.pop(req_id, None)
 
     def start_load_kv(
         self,

@@ -508,6 +508,45 @@ class CPUInferenceTests(unittest.TestCase):
                     connector._bind_cpu_affinity()
                 self.assertIn(message, str(raised.exception))
 
+    @unittest.skipUnless(importlib.util.find_spec("vllm"), "vLLM is not installed")
+    def test_connector_drains_preempted_requests(self):
+        with patch("iaxl.setup_root_logger"):
+            from kvshrink import kvshrink_connector
+
+        values = torch.arange(2 * 7 * 2 * 32 * 64).reshape(2, 7, 2, 32, 64) % 29
+        tensors = {"layer0": values.to(torch.bfloat16)}
+        with (
+            patch.object(envs, "IAXL_DDR_POOL_SIZE_GB", 0.01),
+            patch("iaxl.kvstore.kvstore.start_mgmt_server", return_value=None),
+        ):
+            store = KVStore("preempt", block_dim=1, kv_caches=tensors)
+        self.addCleanup(store.stop)
+
+        connector = object.__new__(kvshrink_connector.KVShrinkConnector)
+        connector.kvstore = store
+        preempted_put = store.put([1, 2], ["p1", "p2"])
+        running_put = store.put([3], ["r3"])
+        preempted_get = store.get([1, 2], ["p1", "p2"])
+        connector._current_put_tasks = {"preempted": [preempted_put], "running": [running_put]}
+        connector._pending_load_tasks = {}
+        connector._pending_load_layers = {}
+        connector._early_promoted_tasks = {}
+        connector._active_promoted_tasks = {"preempted": preempted_get}
+
+        metadata = kvshrink_connector.KVShrinkConnectorMetadata(
+            reqs_to_load=kvshrink_connector.RequestMetadata(),
+            reqs_to_save=kvshrink_connector.RequestMetadata(),
+            preempted_req_ids={"preempted"},
+        )
+        connector.handle_preemptions(metadata)
+
+        self.assertTrue(all(task.ctx is None for task in preempted_put.values()))
+        self.assertTrue(all(task.ctx is None for task in preempted_get.values()))
+        self.assertEqual(list(connector._current_put_tasks), ["running"])
+        self.assertEqual(connector._active_promoted_tasks, {})
+        self.assertTrue(all(task.ctx is not None for task in running_put.values()))
+        store.put_wait(running_put)
+
     @unittest.skipUnless(os.environ.get("IAXL_TEST_VLLM") == "1", "opt-in model smoke test")
     def test_vllm_cold_and_warm_inference(self):
         load_layers = os.environ.get("IAXL_TEST_ASYNC_LOAD_LAYERS", "-1")
