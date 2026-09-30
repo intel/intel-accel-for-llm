@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -226,6 +227,8 @@ size_t gpu_bar_total(uintptr_t ptr) {
     if (cudaPointerGetAttributes(&attr, reinterpret_cast<void *>(ptr)) != cudaSuccess ||
         cudaDeviceGetPCIBusId(bus, sizeof bus, attr.device) != cudaSuccess)
         return 0;
+    for (char *c = bus; *c; c++) // CUDA gives "0000:3A:00.0", sysfs names are lowercase
+        *c = tolower(*c);
     snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource", bus);
     FILE *f = fopen(path, "r");
     if (!f)
