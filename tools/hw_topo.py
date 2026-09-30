@@ -23,7 +23,9 @@ Output:
 Notes:
   * Bandwidth is the theoretical per-direction value (encoding overhead removed);
     oversubscription is computed from each device's maximum link capability.
-  * Idle GPUs drop to Gen1 to save power, so "⚠degraded" is not necessarily a fault; re-check under load.
+  * Idle GPUs drop to Gen1 to save power: a link whose speed (but not width) is below max is
+    reported as "idle-downclocked", not a fault; re-check under load. "⚠degraded" means the
+    link width is below max (check slot / riser / BIOS).
 """
 import argparse
 import datetime
@@ -113,8 +115,13 @@ class Link:
 
     @property
     def degraded(self):
-        return (self.speed and self.speed < self.max_speed) or \
-               (self.width and self.width < self.max_width)
+        """Width below max: likely a slot / riser / BIOS problem"""
+        return bool(self.width and self.width < self.max_width)
+
+    @property
+    def downclocked(self):
+        """Speed below max at full width: normal for idle GPUs saving power"""
+        return bool(self.speed and self.speed < self.max_speed) and not self.degraded
 
     @staticmethod
     def _fmt(speed, width):
@@ -129,9 +136,11 @@ class Link:
         return self._fmt(self.max_speed, self.max_width)
 
     def text(self):
-        """'Gen5x16 63.0 GB/s' or 'Gen1x16 (max Gen5x16 63.0 GB/s) ⚠degraded'"""
-        if self.degraded:
-            return f"{self.cur()} (max {self.mx()} {self.max_bw:.1f} GB/s) ⚠degraded"
+        """'Gen5x16 63.0 GB/s', 'Gen1x16 (max Gen5x16 63.0 GB/s) idle-downclocked'
+        or 'Gen5x8 (max Gen5x16 63.0 GB/s) ⚠degraded'"""
+        if self.degraded or self.downclocked:
+            note = "⚠degraded" if self.degraded else "idle-downclocked"
+            return f"{self.cur()} (max {self.mx()} {self.max_bw:.1f} GB/s) {note}"
         return f"{self.cur()} {self.max_bw:.1f} GB/s"
 
 
@@ -641,9 +650,14 @@ def text_report(topo, sysinfo):
         L.append(" [ACS] no P2P redirect on GPU downstream ports; same-switch P2P goes direct")
     else:
         L.append(" [ACS] run as root to check whether downstream-port ACS redirects P2P to the CPU (affects same-switch P2P)")
+    idle = [d.tag for d in topo.eps if d.link.downclocked]
+    if idle:
+        L.append(f" [Link] idle-downclocked (speed below max, full width): {', '.join(idle)}"
+                 " (normal for idle GPUs saving power; re-check under load)")
     degraded = [d.tag for d in topo.eps if d.link.degraded]
     if degraded:
-        L.append(f" [Link] ⚠ currently degraded: {', '.join(degraded)} (normal for idle GPUs saving power; re-check under load)")
+        L.append(f" [Link] ⚠ degraded (width below max): {', '.join(degraded)}"
+                 " (check slot / riser / BIOS PCIe settings)")
     return L
 
 
@@ -662,6 +676,7 @@ th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;white-space:nowrap} 
 .hdr{font-size:12px;font-weight:600;margin-bottom:4px} .hdr small{font-weight:400;color:#666}
 .link{font-size:11px;color:#555;padding-left:8px;border-left:3px solid #999;margin:2px 0 4px 10px}
 .link.warn{color:#c62828;border-left-color:#c62828}
+.link.idle{color:#ef6c00;border-left-color:#ef6c00}
 .sw{border:2px solid #f9a825;border-radius:6px;padding:8px;background:#fff8e1}
 .over{font-size:11px;color:#444;margin-bottom:6px} .over.warn{color:#c62828;font-weight:600}
 .ports{display:flex;flex-wrap:wrap;gap:8px}
@@ -686,7 +701,7 @@ def h(s):
 
 
 def html_link(lk):
-    cls = "link warn" if lk.degraded else "link"
+    cls = "link warn" if lk.degraded else "link idle" if lk.downclocked else "link"
     return f'<div class="{cls}">{h(lk.text())}</div>'
 
 
@@ -783,7 +798,7 @@ def html_report(topo, sysinfo, text):
              "<span class='nic'>NIC</span><span class='nic mlx'>Mellanox NIC</span>"
              "<span class='sw'>PCIe Switch</span><span class='rp'>Root Port</span>"
              "<span class='other'>Other</span> &nbsp; link labels are theoretical per-direction "
-             "bandwidth; red = currently degraded</div>")
+             "bandwidth; orange = idle-downclocked, red = degraded (width below max)</div>")
     for n in sysinfo["nodes"]:
         roots = [r for r in topo.roots if numa_of(r) == n["id"]]
         if not roots:
