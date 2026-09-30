@@ -12,11 +12,10 @@ Usage:
   python3 hw_topo.py                        # console output
   python3 hw_topo.py --http                 # also start an HTTP server; open the printed URL in a browser
   python3 hw_topo.py --http --port 9000     # choose the port (default 8080)
-  python3 hw_topo.py --gpu-vendor 0x10de,0x8086
 
 Output:
   1. System overview: CPU / NUMA / IOMMU / related kernel parameters
-  2. GPUs: index (matches nvidia-smi), PCI address, NUMA, local CPUs, link, BAR1, parent switch
+  2. GPUs (NVIDIA / Intel / AMD): index (matches nvidia-smi), PCI address, NUMA, local CPUs, link, BAR1, parent switch
   3. NICs: PCI address, netdev / RDMA devices and state, NUMA, link, parent switch
   4. Topology tree: NUMA → Root Port → PCIe Switch → GPU/NIC, with every link and uplink oversubscription
   5. GPU↔GPU / GPU↔NIC affinity matrices (PIX/PXB/PHB/NODE/SYS, same meaning as nvidia-smi topo -m)
@@ -42,6 +41,7 @@ SYSFS = "/sys/bus/pci/devices"
 BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 HB_RE = re.compile(r"^pci[0-9a-f]{4}:[0-9a-f]{2}$")
 GEN_OF = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
+GPU_VENDORS = {"0x10de", "0x8086", "0x1002"}  # NVIDIA, Intel, AMD
 MLX_VENDOR = "0x15b3"
 ACS_BITS = ["SrcValid", "TransBlk", "P2pReqRedir", "P2pCmpltRedir", "UpstreamFwd",
             "EgressCtrl", "DirectTrans"]
@@ -275,12 +275,12 @@ def nic_state(bdf):
     return "; ".join(parts) or "-"
 
 
-def discover(gpu_vendors, names):
+def discover(names):
     gpus, nics = [], []
     for bdf in sorted(os.listdir(SYSFS)):
         d = f"{SYSFS}/{bdf}"
         cls, vendor = rd(d + "/class"), rd(d + "/vendor").lower()
-        if cls.startswith("0x03") and vendor in gpu_vendors:
+        if cls.startswith("0x03") and vendor in GPU_VENDORS:
             kind = "gpu"
         elif cls.startswith("0x02") or cls.startswith("0x0c06"):
             kind = "nic"
@@ -886,8 +886,6 @@ def serve_http(page, port):
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="CPU/GPU/NIC/PCIe topology report")
-    ap.add_argument("--gpu-vendor", default="0x10de",
-                    help="GPU vendor IDs, comma separated; default NVIDIA 0x10de (Intel 0x8086)")
     ap.add_argument("--http", action="store_true", help="start an HTTP server to view the HTML report in a browser")
     ap.add_argument("--port", type=int, default=8080, help="HTTP server port (default 8080)")
     ap.add_argument("--quiet", action="store_true", help="do not print to the console (use with --http)")
@@ -896,7 +894,7 @@ def main():
     if not os.path.isdir(SYSFS):
         sys.exit("/sys/bus/pci/devices not found; this tool requires Linux.")
     names = lspci_names()
-    gpus, nics = discover({v.strip().lower() for v in args.gpu_vendor.split(",")}, names)
+    gpus, nics = discover(names)
     if not gpus and not nics:
         sys.exit("No GPU or NIC found (sysfs may be incomplete inside a VM/container).")
     enrich_nvidia_smi(gpus)
