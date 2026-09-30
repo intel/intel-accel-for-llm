@@ -81,6 +81,7 @@ class Record::Impl {
             sqlite3_close(db_);
             throw std::runtime_error(err);
         }
+        check_format_version();
 
         if (cleanup_unpersisted) {
             int changes_before = sqlite3_total_changes(db_);
@@ -101,6 +102,48 @@ class Record::Impl {
     }
 
     ~Impl() { shutdown(); }
+
+    // A cache with chunk rows but no version predates the format field. Pre-version blocks differ
+    // from version 1 only in lacking the shuffle flag, so they are adopted when shuffle is off
+    // (decoded exactly as the old build did) and refused otherwise.
+    void check_format_version() {
+        SQLITE_CHECK(sqlite3_exec(db_,
+                                  "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER)",
+                                  nullptr, nullptr, nullptr));
+        int stored = -1;
+        bool has_chunks = false;
+        sqlite3_stmt *stmt = nullptr;
+        SQLITE_CHECK(sqlite3_prepare_v2(db_, "SELECT value FROM meta WHERE key = 'format_version'",
+                                        -1, &stmt, nullptr));
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            stored = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        if (stored < 0) {
+            SQLITE_CHECK(sqlite3_prepare_v2(db_, "SELECT 1 FROM chunks LIMIT 1", -1, &stmt, nullptr));
+            has_chunks = sqlite3_step(stmt) == SQLITE_ROW;
+            sqlite3_finalize(stmt);
+        }
+        if (stored == CACHE_FORMAT_VERSION)
+            return;
+        if (stored < 0 && (!has_chunks || !envs.IAXL_KV_DATA_SHUFFLE)) {
+            if (has_chunks)
+                std::fprintf(stderr,
+                             "[Record] adopting pre-version cache at %s as format version %d "
+                             "(IAXL_KV_DATA_SHUFFLE=0)\n",
+                             sqlite_path_.c_str(), CACHE_FORMAT_VERSION);
+            std::string sql = "INSERT INTO meta (key, value) VALUES ('format_version', " +
+                              std::to_string(CACHE_FORMAT_VERSION) + ")";
+            SQLITE_CHECK(sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, nullptr));
+            return;
+        }
+        std::string err = "[Record] persisted cache at " + sqlite_path_ + " has format version " +
+                          (stored < 0 ? std::string("<none>") : std::to_string(stored)) +
+                          ", this build writes version " + std::to_string(CACHE_FORMAT_VERSION) +
+                          "; delete the cache directory or point IAXL_CACHE_DIR elsewhere";
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw std::runtime_error(err);
+    }
 
     void submit(const std::string &label, const std::vector<std::string> &chunk_labels) {
         std::lock_guard<std::mutex> lock(operation_mutex_);

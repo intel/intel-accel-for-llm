@@ -119,6 +119,107 @@ class CPUInferenceTests(unittest.TestCase):
             self.assertEqual(masks[name], [pinned], f"{name} thread not pinned: {masks}")
         self.assertNotEqual(masks["python"], [pinned], "the Python threads must keep their mask")
 
+    SHUFFLE_PERSIST_PROBE = textwrap.dedent(
+        """
+        import sys
+        import torch
+        from iaxl.envs import envs
+        from iaxl.kvflow import KVFlow
+
+        mode, directory = sys.argv[1], sys.argv[2]
+        envs.IAXL_CACHE_DIR = directory
+        flow = KVFlow("shuffle-probe", cache_size_gb=0.01)
+        tensor = (torch.arange(2 * 6 * 2 * 32 * 64) % 23).to(torch.bfloat16)
+        tensor = tensor.reshape(2, 6, 2, 32, 64)
+        original = tensor.clone()
+        labels = [f"s{i}" for i in range(6)]
+        if mode == "put":
+            flow.put_wait(flow.put("kv", {"layer0": tensor}, 1, list(range(6)), labels))
+            flow.put_finish("kv", labels)
+            flow.record_flush()
+            assert flow.persist(10)["persisted"] == 6
+        else:
+            assert flow.has("kv", labels) == [True] * 6
+            tensor.fill_(-1)
+            flow.get_wait(flow.get("kv", {"layer0": tensor}, 1, list(range(6)), labels))
+            assert flow.mem.hits_in_storage > 0
+            assert torch.equal(tensor, original), "persisted block decoded with wrong shuffle"
+        flow.stop()
+        print("PROBE-OK")
+        """
+    )
+
+    def test_persisted_blocks_decode_regardless_of_shuffle_setting(self):
+        for put_shuffle, get_shuffle in (("1", "0"), ("0", "1")):
+            with self.subTest(put=put_shuffle, get=get_shuffle):
+                with tempfile.TemporaryDirectory(prefix="iaxl-shuffle-") as directory:
+                    for mode, shuffle in (("put", put_shuffle), ("get", get_shuffle)):
+                        completed = subprocess.run(
+                            [sys.executable, "-u", "-c", self.SHUFFLE_PERSIST_PROBE, mode,
+                             directory],
+                            env={**os.environ, "IAXL_KV_DATA_SHUFFLE": shuffle},
+                            capture_output=True, text=True, timeout=300,
+                            cwd=str(Path(__file__).resolve().parents[1]),
+                        )
+                        self.assertEqual(completed.returncode, 0,
+                                         f"{mode} shuffle={shuffle}\n"
+                                         + completed.stdout + completed.stderr)
+                        self.assertIn("PROBE-OK", completed.stdout)
+
+    def _run_persist_probe(self, mode, directory, **extra_env):
+        return subprocess.run(
+            [sys.executable, "-u", "-c", self.SHUFFLE_PERSIST_PROBE, mode, directory],
+            env={**os.environ, **extra_env}, capture_output=True, text=True, timeout=300,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+
+    def test_persisted_cache_refuses_foreign_format_version(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory(prefix="iaxl-fmt-") as directory:
+            completed = self._run_persist_probe("put", directory)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            db_path = next(Path(directory).rglob("chunks.db"))
+            with sqlite3.connect(db_path) as db:
+                (version,) = db.execute(
+                    "SELECT value FROM meta WHERE key = 'format_version'").fetchone()
+                self.assertEqual(version, 1)
+                self.assertGreater(db.execute("SELECT count(*) FROM chunks").fetchone()[0], 0)
+
+            completed = self._run_persist_probe("get", directory)
+            self.assertEqual(completed.returncode, 0, "same version must reload\n"
+                             + completed.stdout + completed.stderr)
+
+            for tamper, label in (("UPDATE meta SET value = 0 WHERE key = 'format_version'",
+                                   "version 0"),
+                                  ("DROP TABLE meta", "pre-version cache")):
+                with self.subTest(tamper=label):
+                    with sqlite3.connect(db_path) as db:
+                        db.execute(tamper)
+                    completed = self._run_persist_probe("get", directory)
+                    self.assertNotEqual(completed.returncode, 0, label)
+                    self.assertIn("has format version", completed.stderr, label)
+                    self.assertIn("this build writes version 1", completed.stderr, label)
+                    with sqlite3.connect(db_path) as db:
+                        db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, "
+                                   "value INTEGER)")
+                        db.execute("INSERT OR REPLACE INTO meta VALUES ('format_version', 1)")
+
+            completed = self._run_persist_probe("get", directory)
+            self.assertEqual(completed.returncode, 0, "restored version must reload\n"
+                             + completed.stdout + completed.stderr)
+
+            with sqlite3.connect(db_path) as db:
+                db.execute("DROP TABLE meta")
+            completed = self._run_persist_probe("get", directory, IAXL_KV_DATA_SHUFFLE="0")
+            self.assertEqual(completed.returncode, 0, "unshuffled pre-version cache must load\n"
+                             + completed.stdout + completed.stderr)
+            self.assertIn("adopting pre-version cache", completed.stderr)
+            with sqlite3.connect(db_path) as db:
+                (version,) = db.execute(
+                    "SELECT value FROM meta WHERE key = 'format_version'").fetchone()
+                self.assertEqual(version, 1)
+
     def test_unpinned_scratch_is_reused(self):
         with patch.object(envs, "IAXL_SCRATCH_POOL_SIZE_GB", 1e-4):
             pool = ScratchPool((2, 16, 64), torch.bfloat16, pin_memory=False)
