@@ -9,11 +9,14 @@
 // drained by copy_wait; the per-context event is unused. The wrapped CUDA context only
 // serves stream synchronisation.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <mutex>
 #include <vector>
+
+#include <cuda_runtime.h>
 
 #include "env.h"
 #include "iaxl_common.h"
@@ -48,6 +51,27 @@ std::map<uintptr_t, Reg> regs; // registered GPU regions keyed by base address
 
 inline XferContext *as_ctx(context_t c) { return static_cast<XferContext *>(c); }
 
+// Size of the largest PCI memory aperture of the GPU owning `ptr` (what nvidia-smi reports
+// as BAR1 and GDRCopy maps into), read from sysfs; 0 if unavailable.
+size_t gpu_bar_total(uintptr_t ptr) {
+    cudaPointerAttributes attr{};
+    char bus[32], path[96];
+    if (cudaPointerGetAttributes(&attr, reinterpret_cast<void *>(ptr)) != cudaSuccess ||
+        cudaDeviceGetPCIBusId(bus, sizeof bus, attr.device) != cudaSuccess)
+        return 0;
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource", bus);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    // Only the six standard BARs: later lines are the ROM and SR-IOV VF windows.
+    unsigned long long start, end, flags, best = 0;
+    for (int i = 0; i < 6 && fscanf(f, "%llx %llx %llx", &start, &end, &flags) == 3; i++)
+        if (end > start)
+            best = std::max(best, end - start + 1);
+    fclose(f);
+    return best;
+}
+
 // BAR alias of base if [base, base + bytes) lies inside one registered region, else null.
 char *lookup_locked(uintptr_t base, size_t bytes) {
     auto it = regs.upper_bound(base);
@@ -67,8 +91,11 @@ char *register_locked(uintptr_t base, size_t bytes) {
                "dsa_v1: GDRCopy mapping of the GPU region failed");
     regs[base] = Reg{static_cast<char *>(bar), bytes};
     static std::once_flag noted;
-    std::call_once(noted, [] {
-        fprintf(stderr, "[kv_xfer/dsa_v1] registering GPU regions (IAXL_DEBUG_LOG=1 lists each)\n");
+    std::call_once(noted, [&] {
+        fprintf(stderr,
+                "[kv_xfer/dsa_v1] registering GPU regions: bar=%p (%.1f MB), GPU BAR total %.1f GB "
+                "(IAXL_DEBUG_LOG=1 lists each)\n",
+                bar, bytes / 1048576.0, gpu_bar_total(base) / 1073741824.0);
     });
     if (envs.IAXL_DEBUG_LOG)
         fprintf(stderr, "[kv_xfer/dsa_v1] registered 0x%lx (%.1f MB) -> %p (%zu total)\n",
