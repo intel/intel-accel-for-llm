@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-hw_topo.py - 打印 GPU / NIC 信息与 CPU NUMA / PCIe 拓扑, 分析带宽共享与 P2P 路径。
+hw_topo.py - Print GPU / NIC information and the CPU NUMA / PCIe topology; analyse
+bandwidth sharing and P2P paths.
 
-只依赖 Linux sysfs(可选 lspci / nvidia-smi 用于显示名称), 普通用户即可运行;
-以 root 运行时额外读取 PCIe ACS 配置, 判断同 Switch 下的 P2P 是否被重定向到 CPU。
+Depends only on Linux sysfs (lspci / nvidia-smi are optional, used for names) and runs as
+a normal user. When run as root it also reads the PCIe ACS configuration to tell whether
+P2P between devices under the same switch is redirected to the CPU.
 
-用法:
-  python3 hw_topo.py                        # 控制台输出
-  python3 hw_topo.py --http                 # 同时启动 HTTP 服务, 浏览器打开打印的 URL 查看网页
-  python3 hw_topo.py --http --port 9000     # 指定端口(默认 8080)
+Usage:
+  python3 hw_topo.py                        # console output
+  python3 hw_topo.py --http                 # also start an HTTP server; open the printed URL in a browser
+  python3 hw_topo.py --http --port 9000     # choose the port (default 8080)
   python3 hw_topo.py --gpu-vendor 0x10de,0x8086
 
-输出内容:
-  1. 系统概览: CPU / NUMA / IOMMU / 相关内核参数
-  2. GPU 列表: 编号(与 nvidia-smi 一致), PCI 地址, NUMA, 亲和 CPU, 链路, BAR1, 所属 Switch
-  3. NIC 列表: PCI 地址, 网口 / RDMA 设备及状态, NUMA, 链路, 所属 Switch
-  4. 拓扑树: NUMA → Root Port → PCIe Switch → GPU/NIC, 标注每段链路与上行超额订阅
-  5. GPU↔GPU / GPU↔NIC 亲和矩阵 (PIX/PXB/PHB/NODE/SYS, 含义同 nvidia-smi topo -m)
+Output:
+  1. System overview: CPU / NUMA / IOMMU / related kernel parameters
+  2. GPUs: index (matches nvidia-smi), PCI address, NUMA, local CPUs, link, BAR1, parent switch
+  3. NICs: PCI address, netdev / RDMA devices and state, NUMA, link, parent switch
+  4. Topology tree: NUMA → Root Port → PCIe Switch → GPU/NIC, with every link and uplink oversubscription
+  5. GPU↔GPU / GPU↔NIC affinity matrices (PIX/PXB/PHB/NODE/SYS, same meaning as nvidia-smi topo -m)
 
-说明:
-  * 带宽为每方向理论值(扣除编码开销); 超额订阅按各设备的最大链路能力计算。
-  * GPU 空闲时链路会降到 Gen1 省电, 标注为 ⚠降速 不一定是故障, 有负载时复查。
+Notes:
+  * Bandwidth is the theoretical per-direction value (encoding overhead removed);
+    oversubscription is computed from each device's maximum link capability.
+  * Idle GPUs drop to Gen1 to save power, so "⚠degraded" is not necessarily a fault; re-check under load.
 """
 import argparse
 import datetime
@@ -44,15 +47,15 @@ ACS_BITS = ["SrcValid", "TransBlk", "P2pReqRedir", "P2pCmpltRedir", "UpstreamFwd
             "EgressCtrl", "DirectTrans"]
 ACS_REDIRECT_MASK = 0b11100  # P2pReqRedir | P2pCmpltRedir | UpstreamFwd
 AFF_DESC = {
-    "PIX": "同一 PCIe Switch, 不经 CPU",
-    "PXB": "多级 PCIe Switch, 不经 CPU",
-    "PHB": "同一 Host Bridge, 经 CPU Root Complex",
-    "NODE": "同 NUMA 跨 Host Bridge, 经 CPU",
-    "SYS": "跨 NUMA, 经 UPI",
+    "PIX": "same PCIe switch, no CPU involved",
+    "PXB": "multiple PCIe switches, no CPU involved",
+    "PHB": "same host bridge, via CPU root complex",
+    "NODE": "same NUMA node, different host bridge, via CPU",
+    "SYS": "different NUMA nodes, via UPI",
 }
 
 
-# ----------------------------------------------------------------- sysfs 工具
+# ----------------------------------------------------------------- sysfs helpers
 def rd(path, default=""):
     try:
         with open(path) as f:
@@ -81,7 +84,7 @@ def run(cmd):
 
 
 def bw_per_dir(gts, width):
-    """PCIe 单方向理论带宽 GB/s"""
+    """Theoretical PCIe bandwidth per direction, GB/s"""
     if gts <= 0 or width <= 0:
         return 0.0
     if gts <= 5.0:
@@ -126,9 +129,9 @@ class Link:
         return self._fmt(self.max_speed, self.max_width)
 
     def text(self):
-        """'Gen5x16 63.0 GB/s' 或 'Gen1x16 (max Gen5x16 63.0 GB/s) ⚠降速'"""
+        """'Gen5x16 63.0 GB/s' or 'Gen1x16 (max Gen5x16 63.0 GB/s) ⚠degraded'"""
         if self.degraded:
-            return f"{self.cur()} (max {self.mx()} {self.max_bw:.1f} GB/s) ⚠降速"
+            return f"{self.cur()} (max {self.mx()} {self.max_bw:.1f} GB/s) ⚠degraded"
         return f"{self.cur()} {self.max_bw:.1f} GB/s"
 
 
@@ -141,7 +144,7 @@ def link_of(bdf):
 
 
 def chain_of(bdf):
-    """从 Root Port 到该设备的 BDF 链"""
+    """BDF chain from the Root Port down to this device"""
     real = os.path.realpath(f"{SYSFS}/{bdf}")
     return [p for p in real.split("/") if BDF_RE.match(p)]
 
@@ -173,24 +176,24 @@ def lspci_names():
     for line in run(["lspci", "-D", "-nn"]).splitlines():
         bdf, _, rest = line.partition(" ")
         rest = re.sub(r"\s*\(rev [0-9a-f]+\)", "", rest)
-        names[bdf] = rest.partition(": ")[2] or rest   # 去掉前面的 class 描述
+        names[bdf] = rest.partition(": ")[2] or rest   # strip the leading class description
     return names
 
 
 def dev_name(bdf, names, limit=60):
     s = names.get(bdf) or \
-        f"[{rd(f'{SYSFS}/{bdf}/vendor')[2:]}:{rd(f'{SYSFS}/{bdf}/device')[2:]}]"  # 无 lspci 时
+        f"[{rd(f'{SYSFS}/{bdf}/vendor')[2:]}:{rd(f'{SYSFS}/{bdf}/device')[2:]}]"  # no lspci
     return s if len(s) <= limit else s[:limit - 3] + "..."
 
 
 def short_name(s, limit=40):
-    """去掉末尾的 [vendor:device], 再截断"""
+    """Strip a trailing [vendor:device], then truncate"""
     s = re.sub(r"\s*\[[0-9a-f]{4}:[0-9a-f]{4}\]$", "", s) or s
     return s if len(s) <= limit else s[:limit - 3] + "..."
 
 
 def largest_bar(bdf):
-    """六个标准 BAR 中最大的一个(GPU 即 BAR1), 字节数"""
+    """Largest of the six standard BARs (BAR1 on GPUs), in bytes"""
     best = 0
     for i, line in enumerate(rd(f"{SYSFS}/{bdf}/resource").splitlines()):
         if i >= 6:
@@ -205,7 +208,7 @@ def largest_bar(bdf):
 
 
 def acs_ctl(bdf):
-    """ACS Control 寄存器; None=无法读取(需 root), -1=设备没有 ACS 能力"""
+    """ACS Control register; None = unreadable (needs root), -1 = device has no ACS capability"""
     try:
         with open(f"{SYSFS}/{bdf}/config", "rb") as f:
             cfg = f.read()
@@ -234,7 +237,7 @@ def fmt_size(nbytes):
     return f"{nbytes} B"
 
 
-# ----------------------------------------------------------------- 设备发现
+# ----------------------------------------------------------------- device discovery
 @dataclass
 class Dev:
     bdf: str
@@ -253,7 +256,7 @@ class Dev:
 
 
 def nic_state(bdf):
-    """网口/RDMA 端口状态摘要, 如 'ens1f0 up 100G; mlx5_0 ACTIVE 400G NDR'"""
+    """Netdev / RDMA port state summary, e.g. 'ens1f0 up 100G; mlx5_0/p1 ACTIVE 400G NDR'"""
     parts = []
     for ifn in sorted(os.listdir(f"{SYSFS}/{bdf}/net")) if os.path.isdir(f"{SYSFS}/{bdf}/net") else []:
         state = rd(f"/sys/class/net/{ifn}/operstate", "?")
@@ -302,7 +305,7 @@ def discover(gpu_vendors, names):
 
 
 def enrich_nvidia_smi(gpus):
-    """用 nvidia-smi 的编号/名称/显存补全 GPU 信息(编号与 nvidia-smi 一致)"""
+    """Fill in GPU index / name / memory from nvidia-smi (index matches nvidia-smi)"""
     out = run(["nvidia-smi", "--query-gpu=index,pci.bus_id,name,memory.total",
                "--format=csv,noheader"])
     info = {}
@@ -321,7 +324,7 @@ def enrich_nvidia_smi(gpus):
         g.info["mem"] = f"{int(m.group(1)) / 1024:.0f} GiB" if m else mem
 
 
-# ----------------------------------------------------------------- 拓扑分析
+# ----------------------------------------------------------------- topology analysis
 class Topo:
     def __init__(self, gpus, nics, names):
         self.gpus, self.nics, self.names = gpus, nics, names
@@ -346,21 +349,21 @@ class Topo:
         return self._role[bdf]
 
     def switch_of(self, dev):
-        """最近的上游 Switch(上行端口 BDF), 直连 Root Port 时为 None"""
+        """Nearest upstream switch (upstream-port BDF); None when attached directly to a Root Port"""
         return next((b for b in reversed(dev.chain[:-1]) if self.role(b) == "SW-Up"), None)
 
     def eps_under(self, bdf):
         return [d for d in self.eps if bdf in d.chain[:-1]]
 
     def down_bw(self, eps):
-        """去重多功能设备后的最大链路带宽合计"""
+        """Sum of max link bandwidth, de-duplicating multi-function devices"""
         seen = {}
         for d in eps:
             seen.setdefault(d.bdf[:-2], d.link.max_bw)
         return sum(seen.values())
 
     def acs_ports(self, dev):
-        """dev 路径上开启了 P2P 重定向的下行端口"""
+        """Downstream ports on dev's path that have P2P redirect enabled"""
         out = []
         for b in dev.chain[:-1]:
             if self.role(b) == "SW-Down":
@@ -370,7 +373,7 @@ class Topo:
         return out
 
     def affinity(self, a, b):
-        """返回 (类别, 说明), 类别同 nvidia-smi topo -m"""
+        """Return (class, reason); classes as in nvidia-smi topo -m"""
         if a.bdf == b.bdf:
             return "X", ""
         if a.numa != b.numa and a.numa >= 0 and b.numa >= 0:
@@ -381,19 +384,19 @@ class Topo:
         if k == 0:
             ha, hb = host_bridge_of(a.bdf), host_bridge_of(b.bdf)
             if ha == hb:
-                return "PHB", f"经 {ha}"
+                return "PHB", f"via {ha}"
             return "NODE", f"{ha} ↔ {hb}"
         anc = a.chain[k - 1]
         if self.role(anc) == "RootPort":
-            return "PHB", f"经 RootPort {anc}"
+            return "PHB", f"via RootPort {anc}"
         hops = (self.role(anc) == "SW-Up") + \
             sum(self.role(x) == "SW-Up" for x in a.chain[k:-1] + b.chain[k:-1])
         if hops <= 1:
             return "PIX", f"Switch {anc}"
-        return "PXB", f"{hops} 级 Switch, 汇聚于 {anc}"
+        return "PXB", f"{hops} switch levels, joined at {anc}"
 
     def groups(self, devs):
-        """按最近的 Switch(或 Root Port) 分组: [(key, [dev...])]"""
+        """Group by nearest switch (or Root Port): [(key, [dev...])]"""
         out = {}
         for d in devs:
             out.setdefault(self.switch_of(d) or d.chain[0], []).append(d)
@@ -427,9 +430,9 @@ def system_info(topo):
                 unplaced=[d for d in topo.eps if d.numa < 0])
 
 
-# ----------------------------------------------------------------- 文本报告
+# ----------------------------------------------------------------- text report
 def dw(s):
-    """终端显示宽度(中文等占两格)"""
+    """Terminal display width (CJK characters take two columns)"""
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
 
 
@@ -446,7 +449,7 @@ def table(headers, rows):
 def ep_label(topo, bdf):
     d = topo.by_bdf.get(bdf)
     if d is None:
-        return f"其他 {bdf}  {short_name(dev_name(bdf, topo.names))}"
+        return f"other {bdf}  {short_name(dev_name(bdf, topo.names))}"
     s = f"{d.tag} {bdf}  {short_name(d.name)}"
     if d.kind == "nic":
         s += f"  [{d.info['state']}]"
@@ -460,7 +463,7 @@ def acs_text(topo, port):
     if ctl is None or ctl < 0:
         return ""
     if ctl & ACS_REDIRECT_MASK:
-        return "  [ACS ⚠P2P重定向]"
+        return "  [ACS ⚠P2P-redirect]"
     return "  [ACS on]" if ctl else "  [ACS off]"
 
 
@@ -479,14 +482,14 @@ def tree_lines(topo, root, last):
         elif role == "SW-Up":
             lk = link_of(bdf)
             lines.append(f"{prefix}{conn}PCIe Switch {bdf}  "
-                         f"{short_name(dev_name(bdf, topo.names), 44)}  ── 上行 {lk.text()}")
+                         f"{short_name(dev_name(bdf, topo.names), 44)}  ── uplink {lk.text()}")
             eps = topo.eps_under(bdf)
             if eps and lk.max_bw:
                 down = topo.down_bw(eps)
                 ratio = down / lk.max_bw
-                note = "  (同时传输时各卡分摊上行带宽)" if ratio > 1.05 else ""
-                lines.append(f"{cp}│  下行 {', '.join(d.tag for d in eps)} 合计 {down:.1f} GB/s"
-                             f" → 上行超额订阅 {ratio:.1f}:1{note}")
+                note = "  (shared under concurrent traffic)" if ratio > 1.05 else ""
+                lines.append(f"{cp}│  downstream {', '.join(d.tag for d in eps)} total {down:.1f} GB/s"
+                             f" → uplink oversubscribed {ratio:.1f}:1{note}")
             used, empty, others = [], [], []
             for p in kids:
                 pk = children_of(p)
@@ -498,10 +501,10 @@ def tree_lines(topo, root, last):
                     others.extend(pk)
             tail = []
             if others:
-                tail.append("其他 ×%d: %s" % (len(others), ", ".join(
+                tail.append("other ×%d: %s" % (len(others), ", ".join(
                     f"{o[5:]} ({short_name(dev_name(o, topo.names), 36)})" for o in others)))
             if empty:
-                tail.append(f"空端口 ×{len(empty)}: {', '.join(e[5:] for e in empty)}")
+                tail.append(f"empty ports ×{len(empty)}: {', '.join(e[5:] for e in empty)}")
             for i, p in enumerate(used):
                 rec(p, cp, i == len(used) - 1 and not tail)
             for i, t in enumerate(tail):
@@ -538,84 +541,84 @@ def text_report(topo, sysinfo):
     def section(t):
         L.extend(["", bar, f" {t}", bar])
 
-    section("系统概览")
-    L.append(f" 主机 {sysinfo['host']}   内核 {sysinfo['kernel']}   "
+    section("System overview")
+    L.append(f" Host {sysinfo['host']}   Kernel {sysinfo['kernel']}   "
              f"{datetime.datetime.now():%Y-%m-%d %H:%M}")
     L.append(f" CPU  {sysinfo['cpu']}  × {sysinfo['sockets']} socket, "
-             f"{len(sysinfo['nodes'])} NUMA 节点")
+             f"{len(sysinfo['nodes'])} NUMA nodes")
     for n in sysinfo["nodes"]:
-        L.append(f" NUMA {n['id']}: CPU {n['cpus']:<20} 内存 {n['mem_gb']:.0f} GB   "
+        L.append(f" NUMA {n['id']}: CPU {n['cpus']:<20} Memory {n['mem_gb']:.0f} GB   "
                  f"GPU: {', '.join(g.tag for g in n['gpus']) or '-'}   "
                  f"NIC: {', '.join(x.tag for x in n['nics']) or '-'}")
     if sysinfo["unplaced"]:
-        L.append(f" NUMA 未知: {', '.join(d.tag for d in sysinfo['unplaced'])}")
-    iommu = f"开启 ({sysinfo['iommu_groups']} groups)" if sysinfo["iommu_groups"] else "关闭"
-    acs = "root 可读" if topo.acs_readable else "需 root 才能读取"
-    L.append(f" IOMMU {iommu}   内核参数 [{sysinfo['cmdline']}]   ACS 配置 {acs}")
+        L.append(f" NUMA unknown: {', '.join(d.tag for d in sysinfo['unplaced'])}")
+    iommu = f"on ({sysinfo['iommu_groups']} groups)" if sysinfo["iommu_groups"] else "off"
+    acs = "readable" if topo.acs_readable else "needs root to read"
+    L.append(f" IOMMU {iommu}   Kernel args [{sysinfo['cmdline']}]   ACS config {acs}")
 
-    section("GPU 列表 (编号与 nvidia-smi 一致; 链路 = 当前/最大; 完整信息见 --http 网页)")
+    section("GPUs (index matches nvidia-smi; Link = current/max; see the --http page for full details)")
     rows = []
     for g in topo.gpus:
         sw = topo.switch_of(g)
         rows.append([g.tag, g.bdf, g.name[:34], g.numa, g.cpus,
                      f"{g.link.cur()}/{g.link.mx()}", fmt_size(g.info["bar1"]),
                      g.info.get("mem", "-"), f"SW {sw[5:]}" if sw else f"RP {g.chain[0][5:]}"])
-    L += table(["GPU", "PCI 地址", "名称 [vendor:dev]", "NUMA", "亲和 CPU", "链路", "BAR1",
-                "显存", "上游"], rows) if rows else [" (未发现 GPU)"]
+    L += table(["GPU", "PCI addr", "Name [vendor:dev]", "NUMA", "Local CPUs", "Link", "BAR1",
+                "Memory", "Upstream"], rows) if rows else [" (no GPU found)"]
 
-    section("NIC 列表")
+    section("NICs")
     rows = []
     for x in topo.nics:
         sw = topo.switch_of(x)
         rows.append([x.tag + ("*" if x.info["mlx"] else ""), x.bdf, x.name[:40],
                      x.info["state"], x.numa, f"{x.link.cur()}/{x.link.mx()}",
                      f"SW {sw[5:]}" if sw else f"RP {x.chain[0][5:]}"])
-    L += table(["NIC", "PCI 地址", "名称 [vendor:dev]", "网口/RDMA 状态", "NUMA", "链路", "上游"],
-               rows) if rows else [" (未发现 NIC)"]
+    L += table(["NIC", "PCI addr", "Name [vendor:dev]", "Netdev/RDMA state", "NUMA", "Link", "Upstream"],
+               rows) if rows else [" (no NIC found)"]
     if any(x.info["mlx"] for x in topo.nics):
-        L.append(" * = Mellanox/NVIDIA 网卡 (支持 GPUDirect RDMA)")
+        L.append(" * = Mellanox/NVIDIA NIC (supports GPUDirect RDMA)")
 
-    section("拓扑树 (NUMA → Root Port → PCIe Switch → 设备; 带宽为每方向理论值)")
+    section("Topology tree (NUMA → Root Port → PCIe Switch → device; bandwidth = theoretical per direction)")
     for n in sysinfo["nodes"] + [dict(id=-1, cpus="?")]:
         roots = [r for r in topo.roots if numa_of(r) == n["id"]]
         if not roots:
             continue
-        L.append(f" NUMA {n['id'] if n['id'] >= 0 else '未知'}  CPU {n['cpus']}")
+        L.append(f" NUMA {n['id'] if n['id'] >= 0 else 'unknown'}  CPU {n['cpus']}")
         for i, r in enumerate(roots):
             L += [" " + s for s in tree_lines(topo, r, i == len(roots) - 1)]
         L.append("")
 
-    section("GPU ↔ GPU 亲和矩阵 (同 nvidia-smi topo -m)")
+    section("GPU ↔ GPU affinity matrix (same as nvidia-smi topo -m)")
     if len(topo.gpus) > 1:
         L += matrix_lines(topo.gpus, topo.gpus, topo)
     else:
-        L.append(" (GPU 少于 2 个)")
+        L.append(" (fewer than 2 GPUs)")
     L.append("")
     for k, v in AFF_DESC.items():
         L.append(f"   {k:<5} {v}")
 
     if topo.gpus and topo.nics:
-        section("GPU ↔ NIC 亲和矩阵 (GPUDirect RDMA 首选 PIX/PXB)")
+        section("GPU ↔ NIC affinity matrix (prefer PIX/PXB for GPUDirect RDMA)")
         L += matrix_lines(topo.gpus, topo.nics, topo)
         L.append("")
         for x in topo.nics:
             order = list(AFF_DESC)
             cls = min((topo.affinity(g, x)[0] for g in topo.gpus), key=order.index)
             same = [g.tag for g in topo.gpus if topo.affinity(g, x)[0] == cls]
-            L.append(f"   {x.tag} ({x.name[:32]}): 最近 GPU {', '.join(same)} [{cls}]")
+            L.append(f"   {x.tag} ({x.name[:32]}): nearest GPU {', '.join(same)} [{cls}]")
 
-    section("带宽共享与 P2P 路径小结")
-    L.append(" [共享上行] 同一 Switch 下的设备共用一条到 CPU 的链路:")
+    section("Bandwidth sharing and P2P path summary")
+    L.append(" [Shared uplink] devices under the same switch share one link to the CPU:")
     for key, members in topo.groups(topo.eps):
         if topo.role(key) != "SW-Up":
-            L.append(f"   {', '.join(d.tag for d in members)}: 直连 RootPort {key}, 独占上行")
+            L.append(f"   {', '.join(d.tag for d in members)}: directly on RootPort {key}, dedicated uplink")
             continue
         up = link_of(key)
         down = topo.down_bw(members)
         ratio = down / up.max_bw if up.max_bw else 0
-        flag = "  ⚠ 超额订阅" if ratio > 1.05 else ""
+        flag = "  ⚠ oversubscribed" if ratio > 1.05 else ""
         L.append(f"   Switch {key} (NUMA {numa_of(key)}): {', '.join(d.tag for d in members)}"
-                 f"  上行 {up.mx()} {up.max_bw:.1f} GB/s, 下行合计 {down:.1f} GB/s"
+                 f"  uplink {up.mx()} {up.max_bw:.1f} GB/s, downstream {down:.1f} GB/s"
                  f" → {ratio:.1f}:1{flag}")
     if len(topo.gpus) > 1:
         L.append(" [GPU P2P]")
@@ -623,28 +626,28 @@ def text_report(topo, sysinfo):
         names = {key: chr(ord("A") + i) for i, (key, _) in enumerate(ggroups)}
         for key, members in ggroups:
             where = f"Switch {key}" if topo.role(key) == "SW-Up" else f"RootPort {key}"
-            L.append(f"   组 {names[key]} = {{{', '.join(g.tag for g in members)}}}"
+            L.append(f"   Group {names[key]} = {{{', '.join(g.tag for g in members)}}}"
                      f"  @ {where}, NUMA {members[0].numa}")
-        L.append("   组内 P2P 走 Switch 内部 (PIX), 不占用上行链路也不经过 CPU;")
-        L.append("   同 NUMA 不同组 (NODE/PHB) 经 CPU Root Complex 转发, 受上行链路与 CPU 限制;")
-        L.append("   跨 NUMA (SYS) 还要跨 UPI, 带宽最低、延迟最高。")
+        L.append("   Intra-group P2P stays inside the switch (PIX): no uplink or CPU involved;")
+        L.append("   same NUMA, different group (NODE/PHB): forwarded by the CPU root complex, bounded by uplink and CPU;")
+        L.append("   cross-NUMA (SYS): also crosses UPI, lowest bandwidth and highest latency.")
     redirect = {p for g in topo.gpus for p in topo.acs_ports(g)}
     if redirect:
         bits = {n for p in redirect for i, n in enumerate(ACS_BITS) if acs_ctl(p) >> i & 1}
-        L.append(f" [ACS] ⚠ 下行端口 {', '.join(sorted(p[5:] for p in redirect))} 开启了 P2P 重定向"
-                 f" ({'+'.join(n for n in ACS_BITS if n in bits)}):")
-        L.append("       同 Switch 的 GPU P2P 也会绕行 CPU/IOMMU, 可用 tools/disable-acs.sh 关闭")
+        L.append(f" [ACS] ⚠ P2P redirect ({'+'.join(n for n in ACS_BITS if n in bits)}) enabled on downstream ports:")
+        L.append(f"       {', '.join(sorted(p[5:] for p in redirect))}")
+        L.append("       same-switch GPU P2P is routed through the CPU/IOMMU; disable with tools/disable-acs.sh")
     elif topo.acs_readable:
-        L.append(" [ACS] GPU 所在下行端口均未开启 P2P 重定向, 同 Switch P2P 可直通")
+        L.append(" [ACS] no P2P redirect on GPU downstream ports; same-switch P2P goes direct")
     else:
-        L.append(" [ACS] 以 root 运行可检查下行端口 ACS 是否把 P2P 重定向到 CPU (影响同 Switch P2P)")
+        L.append(" [ACS] run as root to check whether downstream-port ACS redirects P2P to the CPU (affects same-switch P2P)")
     degraded = [d.tag for d in topo.eps if d.link.degraded]
     if degraded:
-        L.append(f" [链路] ⚠ 当前降速: {', '.join(degraded)} (GPU 空闲省电属正常, 有负载时复查)")
+        L.append(f" [Link] ⚠ currently degraded: {', '.join(degraded)} (normal for idle GPUs saving power; re-check under load)")
     return L
 
 
-# ----------------------------------------------------------------- HTML 报告
+# ----------------------------------------------------------------- HTML report
 CSS = """
 body{font-family:system-ui,"Segoe UI",Helvetica,Arial,sans-serif;margin:20px;color:#222;background:#fafafa}
 h1{font-size:20px;margin-bottom:4px} .sub{color:#666;font-size:13px}
@@ -695,12 +698,12 @@ def html_ep(topo, bdf):
     body = f"<b>{h(d.tag)}</b> <span class='mono'>{h(d.bdf)}</span><br>{h(d.name)}"
     if d.kind == "gpu":
         body += f"<br>BAR1 {h(fmt_size(d.info['bar1']))}" + \
-            (f" · 显存 {h(d.info['mem'])}" if d.info.get("mem") else "")
+            (f" · Mem {h(d.info['mem'])}" if d.info.get("mem") else "")
     else:
         body += f"<br>{h(d.info['state'])}"
     acs = topo.acs_ports(d)
     if acs:
-        body += '<span class="badge">ACS 重定向</span>'
+        body += '<span class="badge">ACS redirect</span>'
     return f'<div class="{cls}">{body}</div>'
 
 
@@ -718,9 +721,9 @@ def html_node(topo, bdf):
         if eps and lk.max_bw:
             down = topo.down_bw(eps)
             ratio = down / lk.max_bw
-            over = (f'<div class="over{" warn" if ratio > 1.05 else ""}">上行 {h(lk.mx())} '
-                    f'{lk.max_bw:.1f} GB/s · 下行 {h(", ".join(d.tag for d in eps))} 合计 '
-                    f'{down:.1f} GB/s → 超额订阅 {ratio:.1f}:1</div>')
+            over = (f'<div class="over{" warn" if ratio > 1.05 else ""}">uplink {h(lk.mx())} '
+                    f'{lk.max_bw:.1f} GB/s · downstream {h(", ".join(d.tag for d in eps))} total '
+                    f'{down:.1f} GB/s → oversubscription {ratio:.1f}:1</div>')
         ports, empty, others = "", [], []
         for p in kids:
             pk = children_of(p)
@@ -734,10 +737,10 @@ def html_node(topo, bdf):
             else:
                 others.extend(pk)
         if others:
-            ports += '<div class="port"><div class="port-hdr">其他设备</div>' + "".join(
+            ports += '<div class="port"><div class="port-hdr">Other devices</div>' + "".join(
                 html_ep(topo, o) for o in others) + "</div>"
         if empty:
-            ports += (f'<div class="port"><div class="port-hdr">空端口 ×{len(empty)}</div>'
+            ports += (f'<div class="port"><div class="port-hdr">Empty ports ×{len(empty)}</div>'
                       f'<div class="ep other">{h(", ".join(e[5:] for e in empty))}</div></div>')
         return (f'{html_link(lk)}<div class="sw"><div class="hdr">PCIe Switch '
                 f'<span class="mono">{h(bdf)}</span> <small>{h(dev_name(bdf, topo.names))}'
@@ -768,79 +771,80 @@ def html_matrix(rows, cols, topo):
 
 
 def html_report(topo, sysinfo, text):
-    P = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>拓扑 {h(sysinfo['host'])}"
+    P = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Topology {h(sysinfo['host'])}"
          f"</title><style>{CSS}</style></head><body>"]
-    P.append(f"<h1>CPU / GPU / NIC / PCIe 拓扑 — {h(sysinfo['host'])}</h1>")
+    P.append(f"<h1>CPU / GPU / NIC / PCIe topology — {h(sysinfo['host'])}</h1>")
     P.append(f"<div class='sub'>{h(sysinfo['cpu'])} × {sysinfo['sockets']} socket · "
-             f"内核 {h(sysinfo['kernel'])} · {datetime.datetime.now():%Y-%m-%d %H:%M} · "
-             f"IOMMU {'开启 (%d groups)' % sysinfo['iommu_groups'] if sysinfo['iommu_groups'] else '关闭'}"
-             f" · 内核参数 [{h(sysinfo['cmdline'])}]</div>")
+             f"Kernel {h(sysinfo['kernel'])} · {datetime.datetime.now():%Y-%m-%d %H:%M} · "
+             f"IOMMU {'on (%d groups)' % sysinfo['iommu_groups'] if sysinfo['iommu_groups'] else 'off'}"
+             f" · Kernel args [{h(sysinfo['cmdline'])}]</div>")
 
-    P.append("<h2>拓扑图</h2><div class='legend'><span class='gpu'>GPU</span>"
+    P.append("<h2>Topology</h2><div class='legend'><span class='gpu'>GPU</span>"
              "<span class='nic'>NIC</span><span class='nic mlx'>Mellanox NIC</span>"
              "<span class='sw'>PCIe Switch</span><span class='rp'>Root Port</span>"
-             "<span class='other'>其他</span> &nbsp; 链路标注为每方向理论带宽, 红色 = 当前降速</div>")
+             "<span class='other'>Other</span> &nbsp; link labels are theoretical per-direction "
+             "bandwidth; red = currently degraded</div>")
     for n in sysinfo["nodes"]:
         roots = [r for r in topo.roots if numa_of(r) == n["id"]]
         if not roots:
             continue
         P.append(f"<div class='numa'><div class='numa-hdr'>NUMA {n['id']} · CPU {h(n['cpus'])} · "
-                 f"内存 {n['mem_gb']:.0f} GB</div><div class='row'>")
+                 f"Memory {n['mem_gb']:.0f} GB</div><div class='row'>")
         P += [html_node(topo, r) for r in roots]
         P.append("</div></div>")
     roots = [r for r in topo.roots if numa_of(r) < 0]
     if roots:
-        P.append("<div class='numa'><div class='numa-hdr'>NUMA 未知</div><div class='row'>")
+        P.append("<div class='numa'><div class='numa-hdr'>NUMA unknown</div><div class='row'>")
         P += [html_node(topo, r) for r in roots]
         P.append("</div></div>")
 
-    P.append("<h2>GPU 列表</h2>")
+    P.append("<h2>GPUs</h2>")
     rows = []
     for g in topo.gpus:
         sw = topo.switch_of(g)
         rows.append([g.tag, g.bdf, g.name, g.numa, g.cpus,
                      f"{g.link.cur()} / {g.link.mx()}", f"{g.link.max_bw:.1f}",
                      fmt_size(g.info["bar1"]), g.info.get("mem", "-"),
-                     sw or "直连", g.chain[0], g.info["driver"]])
-    P.append(html_table(["GPU", "PCI 地址", "名称 [vendor:dev]", "NUMA", "亲和 CPU",
-                         "链路 当前/最大", "GB/s", "BAR1", "显存", "Switch", "RootPort", "驱动"],
-                        rows) if rows else "<p>未发现 GPU</p>")
+                     sw or "direct", g.chain[0], g.info["driver"]])
+    P.append(html_table(["GPU", "PCI addr", "Name [vendor:dev]", "NUMA", "Local CPUs",
+                         "Link cur / max", "GB/s", "BAR1", "Memory", "Switch", "RootPort", "Driver"],
+                        rows) if rows else "<p>No GPU found</p>")
 
-    P.append("<h2>NIC 列表</h2>")
+    P.append("<h2>NICs</h2>")
     rows = []
     for x in topo.nics:
         sw = topo.switch_of(x)
         rows.append([x.tag, x.bdf, x.name + (" (Mellanox)" if x.info["mlx"] else ""),
                      x.info["state"], x.numa, f"{x.link.cur()} / {x.link.mx()}",
-                     f"{x.link.max_bw:.1f}", sw or "直连", x.chain[0], x.info["driver"]])
-    P.append(html_table(["NIC", "PCI 地址", "名称 [vendor:dev]", "网口/RDMA 状态", "NUMA",
-                         "链路 当前/最大", "GB/s", "Switch", "RootPort", "驱动"], rows)
-             if rows else "<p>未发现 NIC</p>")
+                     f"{x.link.max_bw:.1f}", sw or "direct", x.chain[0], x.info["driver"]])
+    P.append(html_table(["NIC", "PCI addr", "Name [vendor:dev]", "Netdev/RDMA state", "NUMA",
+                         "Link cur / max", "GB/s", "Switch", "RootPort", "Driver"], rows)
+             if rows else "<p>No NIC found</p>")
 
-    P.append("<h2>GPU ↔ GPU 亲和矩阵</h2>")
+    P.append("<h2>GPU ↔ GPU affinity matrix</h2>")
     if len(topo.gpus) > 1:
         P.append(html_matrix(topo.gpus, topo.gpus, topo))
     P.append("<div class='legend'>" + "".join(
         f"<span class='m-{k}'>{k}: {h(v)}</span>" for k, v in AFF_DESC.items()) + "</div>")
     if topo.gpus and topo.nics:
-        P.append("<h2>GPU ↔ NIC 亲和矩阵 (GPUDirect RDMA 首选 PIX/PXB)</h2>")
+        P.append("<h2>GPU ↔ NIC affinity matrix (prefer PIX/PXB for GPUDirect RDMA)</h2>")
         P.append(html_matrix(topo.gpus, topo.nics, topo))
 
-    P.append("<h2>带宽共享与 P2P 路径小结</h2><ul>")
-    start = text.index(next(s for s in text if s.startswith(" [共享上行]")))
+    P.append("<h2>Bandwidth sharing and P2P path summary</h2><ul>")
+    start = text.index(next(s for s in text if s.startswith(" [Shared uplink]")))
     for line in text[start:]:
         if line.strip():
             P.append(f"<li{' style=font-weight:600' if line.startswith(' [') else ''}>"
                      f"{h(line.strip())}</li>")
     P.append("</ul>")
-    P.append("<details><summary>完整文本报告</summary><pre>" + h("\n".join(text)) +
+    P.append("<details><summary>Full text report</summary><pre>" + h("\n".join(text)) +
              "</pre></details></body></html>")
     return "\n".join(P)
 
 
 # ----------------------------------------------------------------- http
 def host_ip():
-    """本机对外 IP (UDP connect 不会真正发包); 失败则退回主机名"""
+    """Outward-facing IP of this host (UDP connect sends nothing); falls back to the hostname"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
@@ -868,9 +872,9 @@ def serve_http(page, port):
     try:
         srv = http.server.ThreadingHTTPServer(("", port), Handler)
     except OSError as e:
-        sys.exit(f"无法监听端口 {port}: {e.strerror or e} (可用 --port 换一个)")
-    print(f"\nHTTP 服务已启动, 浏览器打开:  http://{host_ip()}:{port}/"
-          f"   (本机: http://localhost:{port}/)   Ctrl+C 退出")
+        sys.exit(f"Cannot listen on port {port}: {e.strerror or e} (try another --port)")
+    print(f"\nHTTP server started, open in a browser:  http://{host_ip()}:{port}/"
+          f"   (local: http://localhost:{port}/)   Ctrl+C to stop")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -881,20 +885,20 @@ def serve_http(page, port):
 
 # ----------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser(description="CPU/GPU/NIC/PCIe 拓扑报告")
+    ap = argparse.ArgumentParser(description="CPU/GPU/NIC/PCIe topology report")
     ap.add_argument("--gpu-vendor", default="0x10de",
-                    help="GPU 厂商 ID, 逗号分隔, 默认 NVIDIA 0x10de (Intel 0x8086)")
-    ap.add_argument("--http", action="store_true", help="启动 HTTP 服务, 用浏览器查看网页版报告")
-    ap.add_argument("--port", type=int, default=8080, help="HTTP 服务端口 (默认 8080)")
-    ap.add_argument("--quiet", action="store_true", help="不打印到控制台(配合 --http)")
+                    help="GPU vendor IDs, comma separated; default NVIDIA 0x10de (Intel 0x8086)")
+    ap.add_argument("--http", action="store_true", help="start an HTTP server to view the HTML report in a browser")
+    ap.add_argument("--port", type=int, default=8080, help="HTTP server port (default 8080)")
+    ap.add_argument("--quiet", action="store_true", help="do not print to the console (use with --http)")
     args = ap.parse_args()
 
     if not os.path.isdir(SYSFS):
-        sys.exit("找不到 /sys/bus/pci/devices, 需要在 Linux 上运行。")
+        sys.exit("/sys/bus/pci/devices not found; this tool requires Linux.")
     names = lspci_names()
     gpus, nics = discover({v.strip().lower() for v in args.gpu_vendor.split(",")}, names)
     if not gpus and not nics:
-        sys.exit("未发现 GPU 或 NIC (虚拟机/容器中 sysfs 可能不完整)。")
+        sys.exit("No GPU or NIC found (sysfs may be incomplete inside a VM/container).")
     enrich_nvidia_smi(gpus)
     topo = Topo(gpus, nics, names)
     sysinfo = system_info(topo)
