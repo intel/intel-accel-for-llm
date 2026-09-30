@@ -766,9 +766,11 @@ def text_report(topo, sysinfo):
         for n in sysinfo["nodes"]:
             acc = [a for a in n["accels"] if a.ondie]
             if acc:
-                by_kind = "; ".join(", ".join(a.tag for a in acc if a.kind == k)
-                                    for k in ACCEL_KINDS if any(a.kind == k for a in acc))
-                L.append(f"   NUMA {n['id']} (GPU: {', '.join(g.tag for g in n['gpus']) or '-'}): {by_kind}")
+                L.append(f"   NUMA {n['id']} (GPU: {', '.join(g.tag for g in n['gpus']) or '-'})")
+                for k in ACCEL_KINDS:
+                    tags = [a.tag for a in acc if a.kind == k]
+                    if tags:
+                        L.append(f"     {k.upper()}: {', '.join(tags)}")
     return L
 
 
@@ -799,7 +801,8 @@ th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;white-space:nowrap} 
 .mlx{background:#90caf9} .other{background:#eeeeee;border:1px solid #9e9e9e;color:#555}
 .qat{background:#e1bee7;border:1px solid #6a1b9a} .dsa{background:#ffe0b2;border:1px solid #e65100}
 .iaa{background:#f8bbd0;border:1px solid #ad1457}
-.ondie{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px} .ondie .ep{margin-top:0}
+.ondie{margin-bottom:10px} .ondie-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+.ondie-row .hdr{min-width:250px;margin:0;line-height:1.35} .ondie .ep{margin-top:0}
 .badge{display:inline-block;padding:0 6px;border-radius:10px;font-size:11px;color:#fff;background:#c62828;margin-left:4px}
 td.m{text-align:center;font-weight:600}
 .m-X{background:#e0e0e0} .m-PIX{background:#a5d6a7} .m-PXB{background:#c5e1a5}
@@ -834,6 +837,15 @@ def html_ep(topo, bdf):
     if acs:
         body += '<span class="badge">ACS redirect</span>'
     return f'<div class="{cls}">{body}</div>'
+
+
+def html_ondie_row(kind, devs):
+    """'on-die QAT ×4 / Intel QAT 4xxx [8086:4944]' header followed by one compact chip per device"""
+    names = " / ".join(dict.fromkeys(d.name for d in devs))
+    chips = "".join(f'<div class="ep {d.kind}"><b>{h(d.tag)}</b> <span class="mono">{h(d.bdf)}</span>'
+                    f'<br>{h(d.info["state"])}</div>' for d in devs)
+    return (f'<div class="ondie-row"><div class="hdr">on-die {kind.upper()} ×{len(devs)}'
+            f'<br><small>{h(names)} · no PCIe link</small></div>{chips}</div>')
 
 
 def html_node(topo, bdf):
@@ -923,8 +935,9 @@ def html_report(topo, sysinfo, text):
                else "NUMA unknown")
         P.append(f"<div class='numa'><div class='numa-hdr'>{hdr}</div>")
         if ondie:
-            P.append("<div class='ondie'><span class='hdr'>On-die accelerators (no PCIe link)</span>" +
-                     "".join(html_ep(topo, a.bdf) for a in ondie) + "</div>")
+            P.append("<div class='ondie'>" + "".join(
+                html_ondie_row(k, [a for a in ondie if a.kind == k])
+                for k in ACCEL_KINDS if any(a.kind == k for a in ondie)) + "</div>")
         P.append("<div class='row'>")
         P += [html_node(topo, r) for r in roots]
         P.append("</div></div>")
@@ -970,9 +983,12 @@ def html_report(topo, sysinfo, text):
     P.append("<h2>Bandwidth sharing and P2P path summary</h2><ul>")
     start = text.index(next(s for s in text if s.startswith(" [Shared uplink]")))
     for line in text[start:]:
-        if line.strip():
-            P.append(f"<li{' style=font-weight:600' if line.startswith(' [') else ''}>"
-                     f"{h(line.strip())}</li>")
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        style = " style=font-weight:600" if line.startswith(" [") else \
+            f" style=margin-left:{(indent - 3) * 12}px" if indent > 3 else ""
+        P.append(f"<li{style}>{h(line.strip())}</li>")
     P.append("</ul>")
     P.append("<details><summary>Full text report</summary><pre>" + h("\n".join(text)) +
              "</pre></details></body></html>")
