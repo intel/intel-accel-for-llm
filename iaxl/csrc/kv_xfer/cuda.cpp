@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -216,6 +217,27 @@ void context_work_wait_cur(context_t ctx) {
 }
 
 void context_sync_cur(context_t ctx) { gpu_stream_synchronize(as_ctx(ctx)->cur_stream); }
+
+// Size of the largest PCI memory aperture of the GPU owning `ptr` (what nvidia-smi reports
+// as BAR1 and GDRCopy maps into), read from sysfs; 0 if unavailable.
+size_t gpu_bar_total(uintptr_t ptr) {
+    cudaPointerAttributes attr{};
+    char bus[32], path[96];
+    if (cudaPointerGetAttributes(&attr, reinterpret_cast<void *>(ptr)) != cudaSuccess ||
+        cudaDeviceGetPCIBusId(bus, sizeof bus, attr.device) != cudaSuccess)
+        return 0;
+    snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/resource", bus);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    // Only the six standard BARs: later lines are the ROM and SR-IOV VF windows.
+    unsigned long long start, end, flags, best = 0;
+    for (int i = 0; i < 6 && fscanf(f, "%llx %llx %llx", &start, &end, &flags) == 3; i++)
+        if (end > start)
+            best = std::max(best, end - start + 1);
+    fclose(f);
+    return best;
+}
 
 void copy_chunk(context_t ctx, char *cpu_base, int64_t chunk_index, bool h2d) {
     XferContext *x = as_ctx(ctx);

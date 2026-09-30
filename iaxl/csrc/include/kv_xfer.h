@@ -45,6 +45,9 @@ void context_sync_cur(context_t ctx);
 
 #if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
 
+// Largest PCI BAR of the GPU owning `ptr` (nvidia-smi's "BAR1 Total"); 0 if unknown. cuda.cpp.
+size_t gpu_bar_total(uintptr_t ptr);
+
 void dsa_context_reset();
 
 bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
