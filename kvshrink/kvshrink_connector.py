@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
-from iaxl import KVStore, generate_block_hashs, setup_root_logger
+from iaxl import KVStore, generate_block_hashs, setup_root_logger, torch_ext
 from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
@@ -176,10 +176,65 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
     def _bind_cpu_affinity(self) -> None:
         if self.vllm_device == "cpu":
+            # vLLM owns the inference threads' placement here; IAXL pins its own native threads
+            # through IAXL_CPU_AFFINITY. Only check that the two sets do not collide.
+            iaxl_cpus = os.getenv("IAXL_CPU_AFFINITY", "")
+            omp_bind = envs.VLLM_CPU_OMP_THREADS_BIND
+            codec_threads = torch_ext.codec_threads
+            if not iaxl_cpus:
+                # Measured: a second codec thread floating over the GEMM cores halves request
+                # throughput and triples decode TPOT; one thread costs ~15% restore throughput.
+                if codec_threads > 1:
+                    raise ValueError(
+                        f"IAXL runs {codec_threads} codec threads but IAXL_CPU_AFFINITY is "
+                        "unset, so they would share cores with inference. Pin IAXL to CPUs "
+                        "outside VLLM_CPU_OMP_THREADS_BIND (one core per codec thread) or use "
+                        "a single poller."
+                    )
+                logger.warning(
+                    "IAXL_CPU_AFFINITY is unset: the codec poller and transfer threads will "
+                    "share cores with inference; set it to a disjoint CPU list for CPU serving"
+                )
+                return
+            if not omp_bind or omp_bind in ("all", "auto", "nobind"):
+                return
+            specs = omp_bind.split("|")
+            if len(specs) <= self.global_rank:
+                return
+            overlap = self._parse_cpu_list(specs[self.global_rank]) & self._parse_cpu_list(
+                iaxl_cpus
+            )
+            if overlap and codec_threads > 1:
+                raise ValueError(
+                    f"IAXL_CPU_AFFINITY={iaxl_cpus} overlaps rank {self.global_rank} inference "
+                    f"CPUs on {sorted(overlap)} while running {codec_threads} codec threads; "
+                    "give IAXL a disjoint CPU set or use a single poller."
+                )
+            if overlap:
+                logger.warning(
+                    "IAXL_CPU_AFFINITY=%s overlaps rank %d inference CPUs on %s",
+                    iaxl_cpus, self.global_rank, sorted(overlap),
+                )
             return
         bind_cpu_affinity(
             self.global_rank, self.global_size, envs.VLLM_CPU_OMP_THREADS_BIND
         )
+
+    @staticmethod
+    def _parse_cpu_list(spec: str) -> set[int]:
+        cpu_ids: set[int] = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start, end = map(int, part.split("-", maxsplit=1))
+                if start > end:
+                    raise ValueError(f"Invalid CPU range: {part}")
+                cpu_ids.update(range(start, end + 1))
+            else:
+                cpu_ids.add(int(part))
+        return cpu_ids
 
     def _bind_intel_accel(self) -> None:
         bind_intel_accel(self.global_rank)
@@ -358,7 +413,16 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 break
 
         first_kv_cache = next(iter(kv_caches.values()))
-        block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
+        if self.use_mla:
+            block_dim = 0
+        elif self.vllm_device == "cpu":
+            # vLLM <= 0.11 hands the CPU backend a [2, num_blocks, heads, block, head_dim]
+            # tensor with a leading key/value axis, so blocks live on axis 1.  From 0.23 the
+            # CPU attention backend uses an HND layout that folds key and value into the last
+            # dimension, leaving [num_blocks, heads, block, 2 * head_dim] with blocks on axis 0.
+            block_dim = 1 if first_kv_cache.ndim == 5 and first_kv_cache.shape[0] == 2 else 0
+        else:
+            block_dim = 0 if first_kv_cache.shape[1] == 2 else 1
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(

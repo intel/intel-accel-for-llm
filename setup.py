@@ -68,6 +68,7 @@ class CMakeBuild(build_ext):
             "cmake",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+            f"-DPython_EXECUTABLE={sys.executable}",
         ]
 
         torch_cmake_prefix = torch.utils.cmake_prefix_path
@@ -76,10 +77,10 @@ class CMakeBuild(build_ext):
         cmake_prefix_paths = [torch_cmake_prefix, pybind11_cmake_dir]
         cmake_args.append(f"-DCMAKE_PREFIX_PATH={';'.join(cmake_prefix_paths)}")
 
-        if DEVICE in ("cuda", "xpu"):
+        if DEVICE in ("cuda", "xpu", "cpu"):
             cmake_args.append(f"-DDEVICE={DEVICE}")
         else:
-            raise RuntimeError("DEVICE must be one of cuda or xpu.")
+            raise RuntimeError("DEVICE must be one of cuda, xpu or cpu.")
 
         cmake_args.append(f"-DIAXL_PROJECT_VERSION={VERSION}")
 

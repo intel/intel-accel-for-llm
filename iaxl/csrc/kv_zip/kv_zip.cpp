@@ -59,6 +59,14 @@ static const ZipOps &ops(ZipBackend backend) { return kZipOps[static_cast<int>(b
 // Returned by get_next once a backend has nothing left to claim.
 static constexpr size_t kNoTask = static_cast<size_t>(-1);
 
+static void pin_codec_thread() {
+    static thread_local bool pinned = false;
+    if (!pinned) {
+        pinned = true;
+        iaxl_apply_thread_affinity();
+    }
+}
+
 static void ensure_zip_init() {
     static std::once_flag flag;
     std::call_once(flag, [] {
@@ -83,10 +91,11 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
     IAXL_CHECK(iaa_workers == 0 || iaa_workers <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
                "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
     IAXL_CHECK(worker_count == envs.IAXL_OMP_THREAD_NUM,
-               "kv_zip: compression workers do not match OMP_NUM_THREADS");
+               "kv_zip: compression workers do not match the configured OpenMP team");
 
 #pragma omp parallel num_threads(worker_count)
     {
+        pin_codec_thread();
         const int t = omp_get_thread_num();
         ZipBackend backend = ZipBackend::CPU;
         int first = qat_workers + iaa_workers;

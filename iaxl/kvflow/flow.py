@@ -29,11 +29,14 @@ debug_enabled = envs.IAXL_DEBUG
 stream_sync_on_get = envs.IAXL_CACHE_STREAM_SYNC_ON_GET
 
 
-def get_accelerator_device() -> str:
-    if cuda_available():
-        return "cuda"
-    elif torch.xpu.is_available():
-        return "xpu"
+def get_accelerator_device() -> Optional[str]:
+    device_type = _iqt.device_type
+    if device_type == "cpu":
+        return device_type
+    if device_type == "cuda":
+        return device_type if cuda_available() else None
+    if getattr(torch, device_type).is_available():
+        return device_type
     return None
 
 
@@ -55,6 +58,8 @@ class KVFlow:
 
         self.enable_compression = envs.IAXL_KV_COMPRESSION
         base_dir = envs.IAXL_CACHE_DIR
+        if _iqt.device_type == "cpu":
+            base_dir = os.path.join(base_dir, "cpu")
         compression_subdir = "compressed" if self.enable_compression else "raw"
         self.persist_dir = os.path.join(base_dir, compression_subdir, persist_dir)
         os.makedirs(self.persist_dir, exist_ok=True)
@@ -84,10 +89,11 @@ class KVFlow:
         self.device_type = get_accelerator_device()
         if self.device_type is None and not envs.IAXL_RDMA_ENABLE:
             raise RuntimeError(
-                "No accelerator available, KVFlow requires GPU support (CUDA or XPU)"
+                f"No {_iqt.device_type} device available for this IAXL build. "
+                "Build with DEVICE=cpu for CPU inference."
             )
 
-        logger.info("Using accelerator: %s", self.device_type)
+        logger.info("Using inference device: %s", self.device_type)
 
         self._streams_initialized = False
         self.cur_stream = None
@@ -130,21 +136,28 @@ class KVFlow:
             self.get_stream = torch.cuda.Stream()
             self.put_stream_ctx = lambda: torch.cuda.stream(self.put_stream)
             self.get_stream_ctx = lambda: torch.cuda.stream(self.get_stream)
-        else:
+        elif self.device_type == "xpu":
             self.cur_stream = torch.xpu.current_stream()
             self.put_stream = torch.xpu.Stream()
             self.get_stream = torch.xpu.Stream()
             self.put_stream_ctx = lambda: torch.xpu.stream(self.put_stream)
             self.get_stream_ctx = lambda: torch.xpu.stream(self.get_stream)
         self._streams_initialized = True
-        logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
+        logger.info("Transfer backend initialized (device=%s)", self.device_type)
 
     def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
         if self.chunk_pool is None:
-            self.chunk_pool = ScratchPool(block_shape, dtype, pin_memory=self.device_type is not None)
+            self.chunk_pool = ScratchPool(
+                block_shape, dtype, pin_memory=self.device_type not in (None, "cpu")
+            )
             if envs.IAXL_RDMA_ENABLE:
                 pool = self.chunk_pool.pool
                 _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
+
+    def _codec_in_place(self, chunk_dim: int) -> bool:
+        # Axis-0 blocks of a CPU tensor are contiguous, so the codec can read and write them
+        # directly, as long as it does not rewrite its input (shuffle / lossy truncation).
+        return self.device_type == "cpu" and chunk_dim == 0 and not _iqt.codec_rewrites_input
 
     def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
         if isinstance(tensor, RemoteTensor):
@@ -187,13 +200,13 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
-                f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
+            assert isinstance(tensor, RemoteTensor) or tensor.device.type == self.device_type, (
+                f"Tensor '{tensor_key}' must be on the compiled {self.device_type} device"
             )
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert tensor.is_contiguous(), "all tensors must be contiguous"
             assert tensor.shape == first_t.shape, "all tensors must have the same shape"
             assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
@@ -203,12 +216,17 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
-        self._ensure_pool(chunk_shape, first_t.dtype)
+        in_place = self._codec_in_place(chunk_dim)
+        if not in_place:
+            self._ensure_pool(chunk_shape, first_t.dtype)
 
         for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
-            cpu_tensors = self.chunk_pool.allocate(
-                num_chunks, chunk_shape, tensor.dtype
-            )
+            if in_place:
+                cpu_tensors = [tensor[i] for i in chunk_indices]
+            else:
+                cpu_tensors = self.chunk_pool.allocate(
+                    num_chunks, chunk_shape, tensor.dtype
+                )
 
             ctx = self._create_ctx(
                 tensor,
@@ -221,7 +239,8 @@ class KVFlow:
                 if self.device_type is not None:
                     ctx.xfer_wait_cur_stream(sync_cur_stream=True)
                 first_tensor = False
-            ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
+            if not in_place:
+                ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
             ctx.xfer_finish()
 
             compress = tensor_index >= skip_compression_count
@@ -231,7 +250,7 @@ class KVFlow:
 
             results[tensor_key] = Task(
                 ctx=ctx,
-                cpu_tensors=cpu_tensors,
+                cpu_tensors=None if in_place else cpu_tensors,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
@@ -267,9 +286,9 @@ class KVFlow:
             result.ctx.zip_wait()
             result.ctx = None
 
-            assert result.cpu_tensors is not None
-            self.chunk_pool.release(result.cpu_tensors)
-            result.cpu_tensors = None
+            if result.cpu_tensors is not None:
+                self.chunk_pool.release(result.cpu_tensors)
+                result.cpu_tensors = None
 
         return True
 
@@ -298,13 +317,13 @@ class KVFlow:
         first_t = next(iter(tensors.values()))
         assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
         for tensor_key, tensor in tensors.items():
-            assert tensor.is_cuda or tensor.is_xpu or isinstance(tensor, RemoteTensor), (
-                f"Tensor '{tensor_key}' must be on GPU device (CUDA or XPU)"
+            assert isinstance(tensor, RemoteTensor) or tensor.device.type == self.device_type, (
+                f"Tensor '{tensor_key}' must be on the compiled {self.device_type} device"
             )
             assert tensor.device == first_t.device, (
                 "all tensors must be on the same device"
             )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
+            assert tensor.is_contiguous(), "all tensors must be contiguous"
             assert tensor.shape == first_t.shape, "all tensors must have the same shape"
             assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
@@ -313,13 +332,18 @@ class KVFlow:
         chunk_shape = list(first_t.shape)
         del chunk_shape[chunk_dim]
         chunk_shape = tuple(chunk_shape)
-        self._ensure_pool(chunk_shape, first_t.dtype)
+        in_place = self._codec_in_place(chunk_dim)
+        if not in_place:
+            self._ensure_pool(chunk_shape, first_t.dtype)
 
         first_tensor = True
         for tensor_key, tensor in tensors.items():
-            cpu_tensors = self.chunk_pool.allocate(
-                num_chunks, chunk_shape, tensor.dtype
-            )
+            if in_place:
+                cpu_tensors = [tensor[i] for i in chunk_indices]
+            else:
+                cpu_tensors = self.chunk_pool.allocate(
+                    num_chunks, chunk_shape, tensor.dtype
+                )
 
             ctx = self._create_ctx(
                 tensor,
@@ -338,7 +362,7 @@ class KVFlow:
 
             results[tensor_key] = Task(
                 ctx=ctx,
-                cpu_tensors=cpu_tensors,
+                cpu_tensors=None if in_place else cpu_tensors,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
