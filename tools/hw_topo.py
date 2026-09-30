@@ -9,9 +9,9 @@ a normal user. When run as root it also reads the PCIe ACS configuration to tell
 P2P between devices under the same switch is redirected to the CPU.
 
 Usage:
-  python3 hw_topo.py                        # console output
-  python3 hw_topo.py --http                 # also start an HTTP server; open the printed URL in a browser
-  python3 hw_topo.py --http --port 9000     # choose the port (default 8080)
+  python3 hw_topo.py                        # console report + HTTP server; open the printed URL in a browser
+  python3 hw_topo.py --port 9000            # choose the HTTP port (default 8080)
+  python3 hw_topo.py --no-http              # console report only, exit immediately
 
 Output:
   1. System overview: CPU / NUMA / IOMMU / related kernel parameters
@@ -556,7 +556,7 @@ def text_report(topo, sysinfo):
     acs = "readable" if topo.acs_readable else "needs root to read"
     L.append(f" IOMMU {iommu}   Kernel args [{sysinfo['cmdline']}]   ACS config {acs}")
 
-    section("GPUs (index matches nvidia-smi; Link = current/max; see the --http page for full details)")
+    section("GPUs (index matches nvidia-smi; Link = current/max; see the HTML page for full details)")
     rows = []
     for g in topo.gpus:
         sw = topo.switch_of(g)
@@ -886,9 +886,9 @@ def serve_http(page, port):
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="CPU/GPU/NIC/PCIe topology report")
-    ap.add_argument("--http", action="store_true", help="start an HTTP server to view the HTML report in a browser")
+    ap.add_argument("--no-http", action="store_true", help="do not start the HTTP server for the HTML report")
     ap.add_argument("--port", type=int, default=8080, help="HTTP server port (default 8080)")
-    ap.add_argument("--quiet", action="store_true", help="do not print to the console (use with --http)")
+    ap.add_argument("--quiet", action="store_true", help="do not print the report to the console")
     args = ap.parse_args()
 
     if not os.path.isdir(SYSFS):
@@ -904,7 +904,7 @@ def main():
     text = text_report(topo, sysinfo)
     if not args.quiet:
         print("\n".join(text))
-    if args.http:
+    if not args.no_http:
         serve_http(html_report(topo, sysinfo, text), args.port)
 
 
