@@ -17,8 +17,10 @@ Output:
   1. System overview: CPU / NUMA / IOMMU / related kernel parameters
   2. GPUs (NVIDIA / Intel / AMD): index (matches nvidia-smi), PCI address, NUMA, local CPUs, link, BAR1, parent switch
   3. NICs: PCI address, netdev / RDMA devices and state, NUMA, link, parent switch
-  4. Topology tree: NUMA → Root Port → PCIe Switch → GPU/NIC, with every link and uplink oversubscription
-  5. GPU↔GPU / GPU↔NIC affinity matrices (PIX/PXB/PHB/NODE/SYS, same meaning as nvidia-smi topo -m)
+  4. Accelerators: Intel QAT / DSA / IAA (on-die or add-in card), NUMA, driver, WQ / VF state
+  5. Topology tree: NUMA → on-die accelerators, Root Port → PCIe Switch → GPU/NIC, with every link and
+     uplink oversubscription
+  6. GPU↔GPU / GPU↔NIC affinity matrices (PIX/PXB/PHB/NODE/SYS, same meaning as nvidia-smi topo -m)
 
 Notes:
   * Bandwidth is the theoretical per-direction value (encoding overhead removed);
@@ -26,6 +28,8 @@ Notes:
   * Idle GPUs drop to Gen1 to save power: a link whose speed (but not width) is below max is
     reported as "idle-downclocked", not a fault; re-check under load. "⚠degraded" means the
     link width is below max (check slot / riser / BIOS).
+  * DSA / IAA tags are the idxd device names (dsa0, iax1 → /dev/dsa/wqN.M); QAT index follows
+    sorted PCI order, the same as tools/auto_config.sh.
 """
 import argparse
 import datetime
@@ -45,6 +49,14 @@ HB_RE = re.compile(r"^pci[0-9a-f]{4}:[0-9a-f]{2}$")
 GEN_OF = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
 GPU_VENDORS = {"0x10de", "0x8086", "0x1002"}  # NVIDIA, Intel, AMD
 MLX_VENDOR = "0x15b3"
+INTEL = "0x8086"
+ACCEL_KINDS = ("qat", "dsa", "iaa")
+# PF device IDs: QAT dh895xcc/c3xxx/c6xx/200xx/d15xx/4xxx/420xx; DSA/IAA SPR, GNR-D, DMR
+QAT_IDS = {"0x0435", "0x19e2", "0x37c8", "0x18ee", "0x6f54", "0x4940", "0x4942", "0x4944", "0x4946"}
+QAT_DRV_RE = re.compile(r"qat|4xxx|420xx|c6xx|c3xxx|200xx|dh895xcc|d15xx")  # as in tools/auto_config.sh
+DSA_IDS = {"0x0b25", "0x11fb", "0x1216"}
+IAA_IDS = {"0x0cfe", "0x1212", "0x1217"}
+IDXD_BUS = "/sys/bus/dsa/devices"
 ACS_BITS = ["SrcValid", "TransBlk", "P2pReqRedir", "P2pCmpltRedir", "UpstreamFwd",
             "EgressCtrl", "DirectTrans"]
 ACS_REDIRECT_MASK = 0b11100  # P2pReqRedir | P2pCmpltRedir | UpstreamFwd
@@ -250,7 +262,7 @@ def fmt_size(nbytes):
 @dataclass
 class Dev:
     bdf: str
-    kind: str                     # gpu / nic
+    kind: str                     # gpu / nic / qat / dsa / iaa
     idx: int = -1
     name: str = ""
     chain: list = field(default_factory=list)
@@ -261,7 +273,12 @@ class Dev:
 
     @property
     def tag(self):
-        return f"{self.kind.upper()}{self.idx}"
+        return self.info.get("tag") or f"{self.kind.upper()}{self.idx}"
+
+    @property
+    def ondie(self):
+        """Root Complex integrated endpoint (no Root Port above it): no PCIe link or switch"""
+        return len(self.chain) <= 1
 
 
 def nic_state(bdf):
@@ -284,33 +301,80 @@ def nic_state(bdf):
     return "; ".join(parts) or "-"
 
 
+def idxd_devices():
+    """{PCI BDF: (idxd name, state)} from /sys/bus/dsa, e.g. 'dsa0', 'enabled, WQ 4/16 enabled (4 user), 4 engines'"""
+    out = {}
+    for n in sorted(os.listdir(IDXD_BUS)) if os.path.isdir(IDXD_BUS) else []:
+        if not re.match(r"(dsa|iax)\d+$", n):
+            continue
+        d = f"{IDXD_BUS}/{n}"
+        bdf = os.path.basename(os.path.realpath(d + "/.."))
+        wqs = [x for x in os.listdir(d) if re.match(r"wq\d+\.\d+$", x)]
+        enabled = [w for w in wqs if rd(f"{d}/{w}/state") == "enabled"]
+        user = sum(rd(f"{d}/{w}/type") == "user" for w in enabled)
+        engines = sum(x.startswith("engine") for x in os.listdir(d))
+        out[bdf] = (n, f"{rd(d + '/state', '?')}, WQ {len(enabled)}/{len(wqs)} enabled ({user} user), "
+                       f"{engines} engines")
+    return out
+
+
+def qat_state(bdf):
+    """'up, sym;dc, VFs 0/16' (qat/state and cfg_services exist only with the in-tree driver)"""
+    d = f"{SYSFS}/{bdf}"
+    parts = [s for s in (rd(d + "/qat/state"), rd(d + "/qat/cfg_services")) if s]
+    total_vfs = parse_int(rd(d + "/sriov_totalvfs"))
+    if total_vfs:
+        parts.append(f"VFs {parse_int(rd(d + '/sriov_numvfs'))}/{total_vfs}")
+    return ", ".join(parts) or "-"
+
+
 def discover(names):
-    gpus, nics = [], []
+    gpus, nics, accels = [], [], []
+    idxd = idxd_devices()
     for bdf in sorted(os.listdir(SYSFS)):
         d = f"{SYSFS}/{bdf}"
-        cls, vendor = rd(d + "/class"), rd(d + "/vendor").lower()
+        cls, vendor, device = rd(d + "/class"), rd(d + "/vendor").lower(), rd(d + "/device").lower()
+        driver = os.path.basename(os.readlink(d + "/driver")) if os.path.islink(d + "/driver") else "-"
+        idxd_name = idxd.get(bdf, ("",))[0]
         if cls.startswith("0x03") and vendor in GPU_VENDORS:
             kind = "gpu"
         elif cls.startswith("0x02") or cls.startswith("0x0c06"):
             kind = "nic"
+        elif cls.startswith("0x0b40") and vendor == INTEL and not os.path.islink(d + "/physfn") \
+                and (device in QAT_IDS or QAT_DRV_RE.search(driver)):
+            kind = "qat"
+        elif cls.startswith("0x0880") and vendor == INTEL and (idxd_name or device in DSA_IDS | IAA_IDS):
+            kind = "dsa" if idxd_name.startswith("dsa") or (not idxd_name and device in DSA_IDS) else "iaa"
         else:
             continue
         dev = Dev(bdf, kind, name=dev_name(bdf, names), chain=chain_of(bdf), numa=numa_of(bdf),
                   cpus=rd(d + "/local_cpulist"), link=link_of(bdf))
-        dev.info["ids"] = f"{vendor[2:]}:{rd(d + '/device')[2:]}"
-        dev.info["driver"] = os.path.basename(os.readlink(d + "/driver")) \
-            if os.path.islink(d + "/driver") else "-"
+        dev.info["ids"] = f"{vendor[2:]}:{device[2:]}"
+        dev.info["driver"] = driver
         if kind == "gpu":
             dev.info["bar1"] = largest_bar(bdf)
-        else:
+            gpus.append(dev)
+        elif kind == "nic":
             dev.info["mlx"] = vendor == MLX_VENDOR
             dev.info["state"] = nic_state(bdf)
-        (gpus if kind == "gpu" else nics).append(dev)
+            nics.append(dev)
+        else:
+            family = f" {driver}" if kind == "qat" and driver != "-" else ""
+            dev.name = f"Intel {kind.upper()}{family} [{dev.info['ids']}]"   # lspci has no name for these
+            if kind == "qat":
+                dev.info["state"] = qat_state(bdf)
+            else:
+                dev.info["tag"], dev.info["state"] = idxd.get(bdf, ("", "idxd driver not bound"))
+            accels.append(dev)
     for i, g in enumerate(gpus):
         g.idx = i
     for i, n in enumerate(nics):
         n.idx = i
-    return gpus, nics
+    accels.sort(key=lambda a: (ACCEL_KINDS.index(a.kind), a.bdf))
+    for kind in ACCEL_KINDS:
+        for i, a in enumerate(a for a in accels if a.kind == kind):
+            a.idx = i
+    return gpus, nics, accels
 
 
 def enrich_nvidia_smi(gpus):
@@ -335,10 +399,11 @@ def enrich_nvidia_smi(gpus):
 
 # ----------------------------------------------------------------- topology analysis
 class Topo:
-    def __init__(self, gpus, nics, names):
-        self.gpus, self.nics, self.names = gpus, nics, names
-        self.eps = gpus + nics
-        self.by_bdf = {d.bdf: d for d in self.eps}
+    def __init__(self, gpus, nics, accels, names):
+        self.gpus, self.nics, self.accels, self.names = gpus, nics, accels, names
+        self.ondie = [a for a in accels if a.ondie]
+        self.eps = gpus + nics + [a for a in accels if not a.ondie]   # add-in cards join the PCIe tree
+        self.by_bdf = {d.bdf: d for d in self.eps + self.ondie}
         self._role = {}
         roots = {d.chain[0] for d in self.eps if d.chain}
         self.roots = sorted(roots, key=lambda r: (numa_of(r), r))
@@ -411,6 +476,19 @@ class Topo:
             out.setdefault(self.switch_of(d) or d.chain[0], []).append(d)
         return sorted(out.items(), key=lambda kv: (kv[1][0].numa, kv[0]))
 
+    def location(self, dev):
+        """'on-die' / 'SW 36:00.0' / 'RP d5:02.0'"""
+        if dev.ondie:
+            return "on-die"
+        sw = self.switch_of(dev)
+        return f"SW {sw[5:]}" if sw else f"RP {dev.chain[0][5:]}"
+
+
+def accel_summary(accels):
+    """'QAT×4 DSA×4 IAA×4' or '-'"""
+    counts = [(k, sum(a.kind == k for a in accels)) for k in ACCEL_KINDS]
+    return " ".join(f"{k.upper()}×{c}" for k, c in counts if c) or "-"
+
 
 def system_info(topo):
     cpu, sockets = "", set()
@@ -429,14 +507,15 @@ def system_info(topo):
                        if "MemTotal" in l), 0)
         nodes.append(dict(id=nid, cpus=rd(f"{base}/{n}/cpulist"), mem_gb=mem_kb / 1048576,
                           gpus=[g for g in topo.gpus if g.numa == nid],
-                          nics=[x for x in topo.nics if x.numa == nid]))
+                          nics=[x for x in topo.nics if x.numa == nid],
+                          accels=[a for a in topo.accels if a.numa == nid]))
     groups = "/sys/kernel/iommu_groups"
     tokens = [t for t in rd("/proc/cmdline").split() if "iommu" in t or "acs" in t.lower()]
     return dict(host=socket.gethostname(), kernel=os.uname().release, cpu=cpu or "?",
                 sockets=len(sockets) or 1, nodes=nodes,
                 iommu_groups=len(os.listdir(groups)) if os.path.isdir(groups) else 0,
                 cmdline=" ".join(tokens) or "-",
-                unplaced=[d for d in topo.eps if d.numa < 0])
+                unplaced=[d for d in topo.eps + topo.ondie if d.numa < 0])
 
 
 # ----------------------------------------------------------------- text report
@@ -460,9 +539,22 @@ def ep_label(topo, bdf):
     if d is None:
         return f"other {bdf}  {short_name(dev_name(bdf, topo.names))}"
     s = f"{d.tag} {bdf}  {short_name(d.name)}"
-    if d.kind == "nic":
+    if d.kind != "gpu":
         s += f"  [{d.info['state']}]"
     return s
+
+
+def ondie_lines(accels, last):
+    """One tree line per accelerator kind: '├─ on-die QAT ×4: QAT0 01:00.0, QAT1 06:00.0, ...'"""
+    kinds = [(k, [a for a in accels if a.kind == k]) for k in ACCEL_KINDS]
+    kinds = [(k, devs) for k, devs in kinds if devs]
+    out = []
+    for i, (k, devs) in enumerate(kinds):
+        end = last and i == len(kinds) - 1
+        t = f"on-die {k.upper()} ×{len(devs)}: " + ", ".join(f"{d.tag} {d.bdf[5:]}" for d in devs)
+        out.extend(textwrap.wrap(t, 100, initial_indent="└─ " if end else "├─ ",
+                                 subsequent_indent="   " if end else "│  "))
+    return out
 
 
 def acs_text(topo, port):
@@ -558,7 +650,8 @@ def text_report(topo, sysinfo):
     for n in sysinfo["nodes"]:
         L.append(f" NUMA {n['id']}: CPU {n['cpus']:<20} Memory {n['mem_gb']:.0f} GB   "
                  f"GPU: {', '.join(g.tag for g in n['gpus']) or '-'}   "
-                 f"NIC: {', '.join(x.tag for x in n['nics']) or '-'}")
+                 f"NIC: {', '.join(x.tag for x in n['nics']) or '-'}   "
+                 f"Accel: {accel_summary(n['accels'])}")
     if sysinfo["unplaced"]:
         L.append(f" NUMA unknown: {', '.join(d.tag for d in sysinfo['unplaced'])}")
     iommu = f"on ({sysinfo['iommu_groups']} groups)" if sysinfo["iommu_groups"] else "off"
@@ -587,12 +680,21 @@ def text_report(topo, sysinfo):
     if any(x.info["mlx"] for x in topo.nics):
         L.append(" * = Mellanox/NVIDIA NIC (supports GPUDirect RDMA)")
 
+    section("Accelerators (Intel QAT / DSA / IAA; on-die = Root Complex integrated, no PCIe link; "
+            "DSA/IAA tags = idxd names)")
+    rows = [[a.tag, a.bdf, a.name, a.numa, a.info["driver"], topo.location(a), a.info["state"]]
+            for a in topo.accels]
+    L += table(["Accel", "PCI addr", "Name [vendor:dev]", "NUMA", "Driver", "Location", "State"],
+               rows) if rows else [" (no QAT / DSA / IAA found)"]
+
     section("Topology tree (NUMA → Root Port → PCIe Switch → device; bandwidth = theoretical per direction)")
     for n in sysinfo["nodes"] + [dict(id=-1, cpus="?")]:
         roots = [r for r in topo.roots if numa_of(r) == n["id"]]
-        if not roots:
+        ondie = [a for a in topo.ondie if a.numa == n["id"]]
+        if not roots and not ondie:
             continue
         L.append(f" NUMA {n['id'] if n['id'] >= 0 else 'unknown'}  CPU {n['cpus']}")
+        L += [" " + s for s in ondie_lines(ondie, last=not roots)]
         for i, r in enumerate(roots):
             L += [" " + s for s in tree_lines(topo, r, i == len(roots) - 1)]
         L.append("")
@@ -658,6 +760,15 @@ def text_report(topo, sysinfo):
     if degraded:
         L.append(f" [Link] ⚠ degraded (width below max): {', '.join(degraded)}"
                  " (check slot / riser / BIOS PCIe settings)")
+    if topo.ondie:
+        L.append(" [Accel] on-die QAT / DSA / IAA have no PCIe link; use the ones on the GPU's NUMA node"
+                 " (tools/auto_config.sh does this):")
+        for n in sysinfo["nodes"]:
+            acc = [a for a in n["accels"] if a.ondie]
+            if acc:
+                by_kind = "; ".join(", ".join(a.tag for a in acc if a.kind == k)
+                                    for k in ACCEL_KINDS if any(a.kind == k for a in acc))
+                L.append(f"   NUMA {n['id']} (GPU: {', '.join(g.tag for g in n['gpus']) or '-'}): {by_kind}")
     return L
 
 
@@ -686,6 +797,9 @@ th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;white-space:nowrap} 
 .ep b{font-size:13px}
 .gpu{background:#c8e6c9;border:1px solid #2e7d32} .nic{background:#bbdefb;border:1px solid #1565c0}
 .mlx{background:#90caf9} .other{background:#eeeeee;border:1px solid #9e9e9e;color:#555}
+.qat{background:#e1bee7;border:1px solid #6a1b9a} .dsa{background:#ffe0b2;border:1px solid #e65100}
+.iaa{background:#f8bbd0;border:1px solid #ad1457}
+.ondie{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:10px} .ondie .ep{margin-top:0}
 .badge{display:inline-block;padding:0 6px;border-radius:10px;font-size:11px;color:#fff;background:#c62828;margin-left:4px}
 td.m{text-align:center;font-weight:600}
 .m-X{background:#e0e0e0} .m-PIX{background:#a5d6a7} .m-PXB{background:#c5e1a5}
@@ -796,20 +910,22 @@ def html_report(topo, sysinfo, text):
 
     P.append("<h2>Topology</h2><div class='legend'><span class='gpu'>GPU</span>"
              "<span class='nic'>NIC</span><span class='nic mlx'>Mellanox NIC</span>"
+             "<span class='qat'>QAT</span><span class='dsa'>DSA</span><span class='iaa'>IAA</span>"
              "<span class='sw'>PCIe Switch</span><span class='rp'>Root Port</span>"
              "<span class='other'>Other</span> &nbsp; link labels are theoretical per-direction "
              "bandwidth; orange = idle-downclocked, red = degraded (width below max)</div>")
-    for n in sysinfo["nodes"]:
+    for n in sysinfo["nodes"] + [dict(id=-1)]:
         roots = [r for r in topo.roots if numa_of(r) == n["id"]]
-        if not roots:
+        ondie = [a for a in topo.ondie if a.numa == n["id"]]
+        if not roots and not ondie:
             continue
-        P.append(f"<div class='numa'><div class='numa-hdr'>NUMA {n['id']} · CPU {h(n['cpus'])} · "
-                 f"Memory {n['mem_gb']:.0f} GB</div><div class='row'>")
-        P += [html_node(topo, r) for r in roots]
-        P.append("</div></div>")
-    roots = [r for r in topo.roots if numa_of(r) < 0]
-    if roots:
-        P.append("<div class='numa'><div class='numa-hdr'>NUMA unknown</div><div class='row'>")
+        hdr = (f"NUMA {n['id']} · CPU {h(n['cpus'])} · Memory {n['mem_gb']:.0f} GB" if n["id"] >= 0
+               else "NUMA unknown")
+        P.append(f"<div class='numa'><div class='numa-hdr'>{hdr}</div>")
+        if ondie:
+            P.append("<div class='ondie'><span class='hdr'>On-die accelerators (no PCIe link)</span>" +
+                     "".join(html_ep(topo, a.bdf) for a in ondie) + "</div>")
+        P.append("<div class='row'>")
         P += [html_node(topo, r) for r in roots]
         P.append("</div></div>")
 
@@ -835,6 +951,12 @@ def html_report(topo, sysinfo, text):
     P.append(html_table(["NIC", "PCI addr", "Name [vendor:dev]", "Netdev/RDMA state", "NUMA",
                          "Link cur / max", "GB/s", "Switch", "RootPort", "Driver"], rows)
              if rows else "<p>No NIC found</p>")
+
+    P.append("<h2>Accelerators (Intel QAT / DSA / IAA)</h2>")
+    rows = [[a.tag, a.bdf, a.name, a.numa, a.info["driver"], topo.location(a), a.info["state"]]
+            for a in topo.accels]
+    P.append(html_table(["Accel", "PCI addr", "Name [vendor:dev]", "NUMA", "Driver", "Location", "State"],
+                        rows) if rows else "<p>No QAT / DSA / IAA found</p>")
 
     P.append("<h2>GPU ↔ GPU affinity matrix</h2>")
     if len(topo.gpus) > 1:
@@ -909,11 +1031,11 @@ def main():
     if not os.path.isdir(SYSFS):
         sys.exit("/sys/bus/pci/devices not found; this tool requires Linux.")
     names = lspci_names()
-    gpus, nics = discover(names)
-    if not gpus and not nics:
-        sys.exit("No GPU or NIC found (sysfs may be incomplete inside a VM/container).")
+    gpus, nics, accels = discover(names)
+    if not gpus and not nics and not accels:
+        sys.exit("No GPU, NIC or accelerator found (sysfs may be incomplete inside a VM/container).")
     enrich_nvidia_smi(gpus)
-    topo = Topo(gpus, nics, names)
+    topo = Topo(gpus, nics, accels, names)
     sysinfo = system_info(topo)
 
     text = text_report(topo, sysinfo)
