@@ -570,6 +570,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dsa_v1_register_mem", &kv_xfer::dsa_v1_register_mem,
           "GDR-map a GPU region once for the DSA v1 backend (e.g. a whole kvcache tensor).",
           py::arg("base"), py::arg("bytes"), py::call_guard<py::gil_scoped_release>());
+    m.def("dsa_v1_set_cuda_ratio", &kv_xfer::dsa_v1_set_cuda_ratio,
+          "Fraction [0, 1] of each DSA v1 batch copied by the GPU copy engine instead of DSA,\n"
+          "so both run in parallel. Default 0 = DSA only.",
+          py::arg("ratio"));
 #endif
 
 #ifndef CPU_SUPPORT // RDMA (remote_pool) runs on NIXL, which DEVICE=cpu builds do not link

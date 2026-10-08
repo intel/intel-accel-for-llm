@@ -62,6 +62,9 @@ void dsa_copy_wait(context_t ctx);
 struct Ops;
 const Ops &dsa_v1_ops();
 void dsa_v1_register_mem(uintptr_t base, size_t bytes);
+// Fraction [0, 1] of each batch's chunks copied by the GPU copy engine (cuda.cpp) instead of
+// DSA, so both engines run in parallel; default 0 = DSA only.
+void dsa_v1_set_cuda_ratio(double ratio);
 context_t dsa_v1_context_create(char *gpu_base_ptr, int device_index, int64_t chunk_stride,
                                 int64_t outer_dims, int64_t inner_size, int64_t outer_block_size,
                                 stream_t work_stream);

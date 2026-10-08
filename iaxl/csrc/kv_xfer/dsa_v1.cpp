@@ -6,9 +6,11 @@
 // dsa_v1_register_mem GDR-maps a whole kvcache region and every later context on a
 // tensor inside it is plain address arithmetic on the cached BAR alias, instead of
 // dsa.cpp's per-call mapping lookups. Copies are queued with dsa_memcpy_batch_async and
-// drained by copy_wait; the per-context event is unused. The wrapped CUDA context only
-// serves stream synchronisation.
+// drained by copy_wait. A dsa_v1_set_cuda_ratio share of every batch is issued instead on
+// the wrapped CUDA context's work stream, so the GPU copy engine runs alongside DSA; the
+// per-context event is a CUDA event on that stream and covers only this share.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -32,7 +34,7 @@ namespace kv_xfer {
 namespace {
 
 struct XferContext {
-    context_t cuda; // CUDA backend context, used only for stream synchronisation
+    context_t cuda; // CUDA backend context: stream sync, events and the CE share of copies
     char *bar;      // BAR-mapped CPU alias of the tensor base
     int64_t chunk_stride, outer_dims, inner_size, outer_block_size;
 };
@@ -83,13 +85,19 @@ char *register_locked(uintptr_t base, size_t bytes) {
 
 namespace dsa_v1 {
 
-// Completion is already guaranteed by xfer_wait (future.get + copy_wait) and tracked by
-// Context::event_recorded_, so the per-context event carries no state here.
-event_t event_acquire() { return nullptr; }
-void event_release(event_t) {}
-void event_synchronize(event_t) {}
-void context_record_event(context_t, event_t) {}
-void context_cur_wait_event(context_t, event_t) {}
+std::atomic<double> cuda_ratio{0.0};
+
+// The per-context event is a CUDA event recorded on the work stream, i.e. it covers the
+// CE share; xfer_wait drains the DSA share through copy_wait before synchronising it.
+event_t event_acquire() { return kv_xfer::event_acquire(); }
+void event_release(event_t event) { kv_xfer::event_release(event); }
+void event_synchronize(event_t event) { kv_xfer::event_synchronize(event); }
+void context_record_event(context_t ctx, event_t event) {
+    kv_xfer::context_record_event(as_ctx(ctx)->cuda, event);
+}
+void context_cur_wait_event(context_t ctx, event_t event) {
+    kv_xfer::context_cur_wait_event(as_ctx(ctx)->cuda, event);
+}
 
 void context_destroy(context_t ctx) {
     XferContext *x = as_ctx(ctx);
@@ -107,7 +115,8 @@ bool context_same_stream(context_t ctx) {
 }
 
 // `event` is a CUDA event from wait_stream_from_py; CPU-driven DMA cannot be ordered on a
-// stream, so block this worker until the GPU reaches it.
+// stream, so block this worker until the GPU reaches it. The CE share is issued on
+// work_stream only after this returns, so it is ordered as well.
 void context_work_wait_event(context_t, event_t event) { kv_xfer::event_synchronize(event); }
 void context_work_wait_cur(context_t ctx) { kv_xfer::context_sync_cur(as_ctx(ctx)->cuda); }
 void context_sync_cur(context_t ctx) { kv_xfer::context_sync_cur(as_ctx(ctx)->cuda); }
@@ -117,14 +126,23 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
     XferContext *x = as_ctx(ctx);
     const size_t n = chunk_indices.size();
     IAXL_CHECK(n == cpu_ptrs.size(), "dsa_v1: chunk_indices and cpu_ptrs length mismatch");
-    const size_t count = n * static_cast<size_t>(x->outer_dims);
+
+    // Leading chunks go to the copy engine first: the async CUDA call returns at once, so the
+    // GPU is already copying while this thread feeds the DSA queue below.
+    const size_t n_cuda = static_cast<size_t>(n * cuda_ratio.load(std::memory_order_relaxed));
+    if (n_cuda > 0)
+        kv_xfer::copy_chunks_batch(
+            x->cuda, std::vector<int64_t>(chunk_indices.begin(), chunk_indices.begin() + n_cuda),
+            std::vector<char *>(cpu_ptrs.begin(), cpu_ptrs.begin() + n_cuda), h2d);
+
+    const size_t count = (n - n_cuda) * static_cast<size_t>(x->outer_dims);
     if (count == 0)
         return;
 
     std::vector<void *> dest(count);
     std::vector<const void *> src(count);
     std::vector<size_t> nbytes(count, static_cast<size_t>(x->inner_size));
-    for (size_t i = 0, k = 0; i < n; i++) {
+    for (size_t i = n_cuda, k = 0; i < n; i++) {
         char *gpu_chunk = x->bar + chunk_indices[i] * x->chunk_stride;
         for (int64_t o = 0; o < x->outer_dims; o++, k++) {
             char *gpu = gpu_chunk + o * x->outer_block_size;
@@ -136,8 +154,10 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
 
     static std::once_flag noted;
     std::call_once(noted, [&] {
-        fprintf(stderr, "[kv_xfer] copy_chunks_batch: using DSA v1 backend (%ld B x %ld per block)\n",
-                x->inner_size, x->outer_dims);
+        fprintf(stderr,
+                "[kv_xfer] copy_chunks_batch: using DSA v1 backend (%ld B x %ld per block, "
+                "cuda_ratio=%.2f)\n",
+                x->inner_size, x->outer_dims, cuda_ratio.load(std::memory_order_relaxed));
     });
 
     std::lock_guard<std::mutex> lock(mu);
@@ -165,6 +185,11 @@ const Ops &dsa_v1_ops() {
                          dsa_v1::context_cur_wait_event, dsa_v1::context_work_wait_cur,
                          dsa_v1::context_sync_cur,      dsa_v1::copy_wait};
     return ops;
+}
+
+void dsa_v1_set_cuda_ratio(double ratio) {
+    IAXL_CHECK(ratio >= 0.0 && ratio <= 1.0, "dsa_v1_set_cuda_ratio: ratio must be in [0, 1]");
+    dsa_v1::cuda_ratio.store(ratio, std::memory_order_relaxed);
 }
 
 void dsa_v1_register_mem(uintptr_t base, size_t bytes) {

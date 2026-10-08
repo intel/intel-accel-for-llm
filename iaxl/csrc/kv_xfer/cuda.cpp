@@ -278,8 +278,9 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
                 inner_size / 1024.0, chunk_indices.size());
     });
 #if defined(DSA_SUPPORT)
-
-    if (dsa_copy_chunks_batch(gpu_base_ptr, chunk_stride, outer_dims, inner_size, outer_block_size,
+    // With DSA v1 the DSA share is issued by dsa_v1.cpp; this call then only drives the GPU CE.
+    if (!envs.IAXL_DSA_V1_ENABLE &&
+        dsa_copy_chunks_batch(gpu_base_ptr, chunk_stride, outer_dims, inner_size, outer_block_size,
                               h2d, chunk_indices, cpu_ptrs)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
