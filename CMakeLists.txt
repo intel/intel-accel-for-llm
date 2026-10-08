@@ -85,14 +85,42 @@ else()
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/xpu.cpp")
 endif()
 
-set(QAT_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqat_s.so" "${IAXL_LIB_DIR}/libusdm_drv_s.so")
-add_custom_command(
-    OUTPUT ${QAT_USERSPACE_LIBS}
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
-    COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} qat-userspace
-    COMMENT "Building Intel QAT user-space libraries"
-    VERBATIM)
-add_custom_target(qat_userspace_libs DEPENDS ${QAT_USERSPACE_LIBS})
+# IAXL_QATLIB (optional): oot (default when unset/empty) = build the out-of-tree
+# QAT20 package into _lib, intree = system qatlib for the in-tree kernel driver.
+if(NOT DEFINED IAXL_QATLIB)
+    set(IAXL_QATLIB "$ENV{IAXL_QATLIB}")
+endif()
+if(NOT IAXL_QATLIB)
+    set(IAXL_QATLIB "oot")
+endif()
+
+if(IAXL_QATLIB STREQUAL "intree")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(QATLIB QUIET qatlib)
+    if(NOT QATLIB_FOUND)
+        message(FATAL_ERROR "IAXL_QATLIB=intree but qatlib was not found by pkg-config")
+    endif()
+    find_library(QAT_LIBRARY qat HINTS "${QATLIB_LIBDIR}" REQUIRED)
+    find_library(USDM_LIBRARY usdm HINTS "${QATLIB_LIBDIR}" REQUIRED)
+    set(QAT_INCLUDE_DIR "${QATLIB_INCLUDEDIR}/qat")
+    set(QAT_LINK_LIBS ${QAT_LIBRARY} ${USDM_LIBRARY})
+    add_custom_target(qat_userspace_libs)
+    message(STATUS "QAT user space: in-tree qatlib ${QATLIB_VERSION} (${QAT_LIBRARY})")
+elseif(IAXL_QATLIB STREQUAL "oot")
+    set(QAT_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqat_s.so" "${IAXL_LIB_DIR}/libusdm_drv_s.so")
+    add_custom_command(
+        OUTPUT ${QAT_USERSPACE_LIBS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
+        COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} IAXL_QATLIB=oot qat-userspace
+        COMMENT "Building Intel QAT user-space libraries"
+        VERBATIM)
+    add_custom_target(qat_userspace_libs DEPENDS ${QAT_USERSPACE_LIBS})
+    set(QAT_INCLUDE_DIR "${IAXL_CSRC_DIR}/qat_zip/include")
+    set(QAT_LINK_LIBS qat_s usdm_drv_s)
+    message(STATUS "QAT user space: out-of-tree QAT20 package (${IAXL_LIB_DIR})")
+else()
+    message(FATAL_ERROR "IAXL_QATLIB=${IAXL_QATLIB}; expected oot or intree")
+endif()
 
 set(QPL_PREFIX "${CMAKE_SOURCE_DIR}/_build/qpl/install")
 set(QPL_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqpl.so")
@@ -119,10 +147,10 @@ target_include_directories(
     torch_ext
     PRIVATE "${PYTORCH_PATH}/include" "${PYTORCH_PATH}/include/torch/csrc/api/include"
             "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
-            "${IAXL_CSRC_DIR}/qat_zip/include" "${QPL_PREFIX}/include")
+            "${QAT_INCLUDE_DIR}" "${QPL_PREFIX}/include")
 target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
 find_package(ZLIB REQUIRED)
-target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s qpl ZLIB::ZLIB dl)
+target_link_libraries(torch_ext PRIVATE torch torch_python ${QAT_LINK_LIBS} qpl ZLIB::ZLIB dl)
 
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS $ENV{NIXL_INCLUDE_DIR} PATHS /usr/local/include NO_DEFAULT_PATH)
 find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib/x86_64-linux-gnu NO_DEFAULT_PATH)

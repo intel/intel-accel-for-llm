@@ -14,6 +14,7 @@ $TOP_DIR/tools/setup_system.sh
 # ---- Build ------------------------------------------------------------------
 export DEVICE=${DEVICE:-cuda}                 # Build backend: cuda | xpu
 export IAXL_CMAKE_ARGS=${IAXL_CMAKE_ARGS:-""} # Extra cmake flags, e.g. "-DENABLE_NVTX=OFF"
+# export IAXL_QATLIB=intree                   # Optional: link system qatlib (in-tree driver); unset = out-of-tree QAT20 package
 export NVIDIA_RUNTIME=${NVIDIA_RUNTIME:-}     # Set to "none" to skip the nvidia docker runtime/gpus args (e.g. on a storage-only node without GPUs)
 
 # ---- Feature switches -------------------------------------------------------
@@ -176,6 +177,7 @@ ENV_VARS=(
     MODEL
     TP_SIZE
     DEVICE
+    IAXL_QATLIB
 )
 
 case "$DEVICE" in

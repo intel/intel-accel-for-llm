@@ -16,7 +16,9 @@ sudo ./tools/setup_kernel_cmdline.sh
 sudo reboot
 ```
 
-2. 重启后，下载并安装 QAT 驱动：
+2. 重启后，安装 QAT 驱动，以下两种方式**任选其一**。
+
+   **Out-of-tree 驱动包**（默认）：
 
 ```bash
 wget -q https://downloadmirror.intel.com/843052/QAT20.L.1.2.30-00078.tar.gz
@@ -26,12 +28,26 @@ make -j$(nproc)
 sudo make install
 ```
 
-可以使用以下命令停止或启动 QAT 服务：
+可以使用以下命令停止或启动 out-of-tree QAT 服务：
 
 ```bash
 adf_ctl down
 adf_ctl up
 ```
+
+   **In-tree 驱动 + qatlib**（内核 `qat_4xxx` 模块，VF 绑定到 `vfio-pci`）：
+
+```bash
+sudo apt install qatlib-service libqat-dev libusdm-dev   # 或从 https://github.com/intel/qatlib 源码构建
+printf 'POLICY=0\nServicesEnabled=dc\n' | sudo tee /etc/sysconfig/qat
+sudo systemctl enable qat
+sudo systemctl restart qat
+export IAXL_QATLIB=intree   # 在 source setvars.sh / 构建之前设置
+```
+
+`POLICY=0` 为每个进程从每个 QAT 设备各分配一个 VF，`IAXL_QAT_DEVICES` / `KVSHRINK_QAT_DEVICES` 按此编号；若为 `POLICY=1`，每个进程只能看到设备 `0`。
+
+设置 `IAXL_QATLIB=intree` 后，构建会链接 `pkg-config qatlib` 找到的系统 `libqat` / `libusdm`，而不再下载并构建 out-of-tree 驱动包到 `_lib`。在容器内构建时，容器中需要安装 qatlib 开发包，运行时还需从宿主机挂载 `/run/qat`。
 
 3. 安装 GDRCopy 驱动并配置 DSA：
 
@@ -50,6 +66,7 @@ sudo ./tools/install_gdr_driver.sh
 | `TP_SIZE` | `2` | 必须配置；Tensor Parallel worker 数量，CPU、QAT 和 DSA 资源将据此自动配置 |
 | `IAXL_KV_COMPRESSION` | `1` | 启用 DEFLATE 压缩（`0`/`1`） |
 | `IAXL_QAT_ZIP_ENABLE` | `1` | 启用 QAT 压缩 worker（`0`/`1`） |
+| `IAXL_QATLIB` | 未设置（`oot`） | 可选。构建所用的 QAT 用户态库：`oot`（构建到 `_lib` 的 out-of-tree 驱动包，未设置时使用）或 `intree`（in-tree 驱动对应的系统 qatlib） |
 | `IAXL_IAA_ZIP_ENABLE` | `0` | 通过 Intel QPL 启用 Intel IAA 压缩 worker（`0`/`1`）。可与 `IAXL_QAT_ZIP_ENABLE` 同时开启：IAA 最多只能解码 4 KB 的 DEFLATE 历史窗口，而 QAT gen4 固定使用 32 KB，因此每个数据块都会记录 IAA 能否解码，解压时 IAA 只领取这些块 |
 | `IAXL_CPU_ZIP_ENABLE` | `1` | 启用 CPU 压缩 worker（`0`/`1`） |
 | `IAXL_DSA_GD_ENABLE` | `0` | 启用 Intel DSA + GDRCopy 传输（`0`/`1`） |

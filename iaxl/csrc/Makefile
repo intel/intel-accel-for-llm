@@ -13,7 +13,23 @@ INCDIR   := include
 LIBDIR   := ../../_lib
 QATBUILD := ../../_build/qat
 QATURL   := https://downloadmirror.intel.com/921047/QAT20.L.1.2.30-00178.tar.gz
+# IAXL_QATLIB (optional): oot (default when unset/empty) = build the out-of-tree
+# QAT20 package into _lib, intree = system qatlib for the in-tree kernel driver.
+QATMODE  := $(or $(strip $(IAXL_QATLIB)),oot)
+ifeq ($(QATMODE),intree)
+ifeq ($(shell pkg-config --exists qatlib 2>/dev/null && echo 1),)
+$(error IAXL_QATLIB=intree but qatlib was not found by pkg-config)
+endif
+QATLIBS  :=
+QATCFLAGS:= -I$(shell pkg-config --variable=includedir qatlib)/qat
+QATLDLIBS:= $(shell pkg-config --libs-only-L libqat libusdm) -lqat -lusdm
+else ifeq ($(QATMODE),oot)
 QATLIBS  := $(LIBDIR)/libqat_s.so $(LIBDIR)/libusdm_drv_s.so
+QATCFLAGS:=
+QATLDLIBS:= $(QATLIBS)
+else
+$(error IAXL_QATLIB must be oot or intree)
+endif
 QPLBUILD := ../../_build/qpl
 QPLREPO  := https://github.com/intel/qpl.git
 QPLTAG   := v1.9.0
@@ -32,7 +48,8 @@ ARGS     ?=
 
 
 qat_zip_SRCS   := qat_zip/qat_zip.c common/envs.c
-qat_zip_LDLIBS := $(QATLIBS)
+qat_zip_CFLAGS := $(QATCFLAGS)
+qat_zip_LDLIBS := $(QATLDLIBS)
 qat_zip_DEPS   := $(QATLIBS)
 
 
