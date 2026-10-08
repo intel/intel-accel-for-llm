@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Sequence
+import logging
+import math
 
 import torch
 
@@ -11,6 +13,7 @@ from .torch_ext import Context, GpuTransferDirection
 
 __all__ = ["SliceCopier", "copy_slices"]
 
+logger = logging.getLogger(__name__)
 
 class SliceCopier:
     """Reusable IAXL copy between one GPU tensor and CPU tensor slices."""
@@ -69,6 +72,24 @@ class SliceCopier:
         if envs.IAXL_DSA_V1_ENABLE:
             _iqt.dsa_v1_register_mem(gpu_tensor.data_ptr(), gpu_tensor.nbytes)
             create, backend = Context.create_dsa_v1, "dsa_v1"
+            """
+            _CUDA_SPLIT_MIN_CHUNK_BYTES = 64 * 1024
+            chunk_bytes = math.prod(slice_shape) * gpu_tensor.element_size()
+            cuda_ratio = (
+                0.5 if chunk_bytes >= _CUDA_SPLIT_MIN_CHUNK_BYTES else 0.0
+            )
+            # Process-wide on the C++ side: the most recently constructed copier wins.
+            _iqt.dsa_v1_set_cuda_ratio(cuda_ratio)
+            logger.info(
+                "SliceCopier(%s): chunk=%.1f KB x %d -> cuda_ratio=%.2f (dsa=%.0f%%, cuda=%.0f%%)",
+                direction.name,
+                chunk_bytes / 1024,
+                len(indices),
+                cuda_ratio,
+                (1 - cuda_ratio) * 100,
+                cuda_ratio * 100,
+            )
+            """
         else:
             create, backend = Context.create, "dsa" if envs.IAXL_DSA_GD_ENABLE else "cuda"
         self._context = create(
