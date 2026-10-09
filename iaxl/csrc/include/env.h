@@ -70,6 +70,9 @@ struct Envs {
     bool IAXL_DSA_GD_RESET_ON_DESTROY;
     const char *(*IAXL_DSA_WQS)(void);
 
+    // CPU list ("32-35,40") for every IAXL native thread; empty leaves the inherited mask.
+    const char *IAXL_CPU_AFFINITY;
+
     bool IAXL_DEBUG_LOG;
     const char *IAXL_PROFILE_MODE;
 };
@@ -81,6 +84,11 @@ extern "C" {
 extern struct Envs envs;
 
 void envs_init(void);
+
+// Pins the calling thread to IAXL_CPU_AFFINITY. Returns the CPU count of that set, 0 when the
+// variable is unset, or -1 when the list could not be applied.
+int iaxl_apply_thread_affinity(void);
+int iaxl_affinity_cpu_count(void);
 
 #ifdef __cplusplus
 }

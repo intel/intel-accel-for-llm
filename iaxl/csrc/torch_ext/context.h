@@ -37,6 +37,10 @@ class Context {
     static Context create(const torch::Tensor &tensor, int chunk_dim,
                           GpuTransferDirection direction = GpuTransferDirection::H2D,
                           const std::string &name = "", kv_xfer::stream_t work_stream = nullptr) {
+        TORCH_CHECK(tensor.device().type() == c10::Device(IAXL_DEVICE).type(),
+                    "IAXL was built for " IAXL_DEVICE " tensors, got ", tensor.device());
+        TORCH_CHECK(tensor.is_contiguous(), "IAXL transfer tensors must be contiguous");
+        TORCH_CHECK(chunk_dim >= 0 && chunk_dim < tensor.dim(), "Chunk dimension out of range");
         Context ctx;
         ctx.name_ = name;
         ctx.gpu_tensor_ = tensor;

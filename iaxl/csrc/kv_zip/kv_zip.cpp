@@ -32,8 +32,12 @@
 
 #define OMP_SCHEDULE dynamic
 
-// Top bit of the header's payload length field, set when IAA produced the stream.
+// Header word 0 is the payload length with two flag bits: IAA produced the stream (it cannot be
+// decoded by QAT/CPU), and the block was byte-plane shuffled before compression. GET must obey
+// these rather than the current environment so a persisted cache survives a config change.
 #define KV_ZIP_IAA_FLAG (1u << 31)
+#define KV_ZIP_SHUFFLE_FLAG (1u << 30)
+#define KV_ZIP_LEN_MASK (~(KV_ZIP_IAA_FLAG | KV_ZIP_SHUFFLE_FLAG))
 
 namespace kv_zip {
 
@@ -59,6 +63,14 @@ static const ZipOps &ops(ZipBackend backend) { return kZipOps[static_cast<int>(b
 // Returned by get_next once a backend has nothing left to claim.
 static constexpr size_t kNoTask = static_cast<size_t>(-1);
 
+static void pin_codec_thread() {
+    static thread_local bool pinned = false;
+    if (!pinned) {
+        pinned = true;
+        iaxl_apply_thread_affinity();
+    }
+}
+
 static void ensure_zip_init() {
     static std::once_flag flag;
     std::call_once(flag, [] {
@@ -83,10 +95,11 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
     IAXL_CHECK(iaa_workers == 0 || iaa_workers <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
                "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
     IAXL_CHECK(worker_count == envs.IAXL_OMP_THREAD_NUM,
-               "kv_zip: compression workers do not match OMP_NUM_THREADS");
+               "kv_zip: compression workers do not match the configured OpenMP team");
 
 #pragma omp parallel num_threads(worker_count)
     {
+        pin_codec_thread();
         const int t = omp_get_thread_num();
         ZipBackend backend = ZipBackend::CPU;
         int first = qat_workers + iaa_workers;
@@ -134,6 +147,15 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
     }
 }
 
+static void pack_header(char *buf, uint32_t payload_len, ZipBackend backend, size_t orig_size,
+                        bool shuffled) {
+    IAXL_CHECK((payload_len & ~KV_ZIP_LEN_MASK) == 0, "kv_zip: payload length overflows header");
+    reinterpret_cast<uint32_t *>(buf)[0] = payload_len |
+                                           (backend == ZipBackend::IAA ? KV_ZIP_IAA_FLAG : 0u) |
+                                           (shuffled ? KV_ZIP_SHUFFLE_FLAG : 0u);
+    reinterpret_cast<int *>(buf)[1] = static_cast<int>(orig_size);
+}
+
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
                            std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
                            bool compress) {
@@ -174,10 +196,10 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     auto pack = [&](size_t i, ZipBackend backend, const void *payload, int payload_len) {
         char *buf = static_cast<char *>(malloc(sizeof(int) * 2 + payload_len));
         IAXL_CHECK(buf != nullptr, "kv_zip: cache buffer allocation failed");
-        reinterpret_cast<uint32_t *>(buf)[0] =
-            static_cast<uint32_t>(payload_len) |
-            (backend == ZipBackend::IAA ? KV_ZIP_IAA_FLAG : 0u);
-        reinterpret_cast<int *>(buf)[1] = static_cast<int>(orig_sizes[i]);
+        // data_shuffle() only transforms bf16 blocks, so this is what prep actually applied.
+        const bool shuffled =
+            data_shuffle_enabled() && tensors[i].dtype() == torch::kBFloat16;
+        pack_header(buf, static_cast<uint32_t>(payload_len), backend, orig_sizes[i], shuffled);
         memcpy(buf + sizeof(int) * 2, payload, payload_len);
         out_bufs[i] = buf;
         out_sizes[i] = sizeof(int) * 2 + payload_len;
@@ -223,7 +245,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         if (header[1] == 0)
             continue;
         const uint32_t encoded = static_cast<uint32_t>(header[0]);
-        IAXL_CHECK((encoded & ~KV_ZIP_IAA_FLAG) != 0,
+        IAXL_CHECK((encoded & KV_ZIP_LEN_MASK) != 0,
                    "kv_zip: invalid compressed payload length");
         ((encoded & KV_ZIP_IAA_FLAG) ? iaa_items : other_items).push_back(i);
     }
@@ -249,7 +271,10 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
                    "kv_zip: decompressed size does not match tensor byte size");
         char *dst = static_cast<char *>(t.data_ptr());
         memcpy(dst, out, nb);
-        data_shuffle(dst, nb, t.dtype() == torch::kBFloat16, data_shuffle_enabled());
+        // The header, not the environment, says whether the payload was shuffled.
+        const bool shuffled =
+            reinterpret_cast<const uint32_t *>(data_ptrs[i])[0] & KV_ZIP_SHUFFLE_FLAG;
+        data_shuffle(dst, nb, t.dtype() == torch::kBFloat16, shuffled);
     };
 
     std::atomic<size_t> iaa_next{0}, other_next{0};
@@ -264,7 +289,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         [&](ZipBackend backend, int slot, size_t i) {
             const uint32_t encoded = reinterpret_cast<const uint32_t *>(data_ptrs[i])[0];
             const char *payload = data_ptrs[i] + sizeof(int) * 2;
-            const int payload_len = static_cast<int>(encoded & ~KV_ZIP_IAA_FLAG);
+            const int payload_len = static_cast<int>(encoded & KV_ZIP_LEN_MASK);
             const int status =
                 ops(backend).decompress(slot, const_cast<char *>(payload), payload_len);
             IAXL_CHECK(status == 0, "kv_zip: zip decompress failed");

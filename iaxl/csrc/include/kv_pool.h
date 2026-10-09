@@ -19,6 +19,11 @@ namespace kv_pool {
 
 inline constexpr char LABEL_SEP = ':';
 
+// Layout of the persisted chunk files (header flags, payload encoding). Bump whenever a block
+// written by the previous version would decode differently; Record refuses to open a mismatch.
+//   1: header word 0 carries the IAA flag (bit 31) and the byte-plane shuffle flag (bit 30).
+inline constexpr int CACHE_FORMAT_VERSION = 1;
+
 [[noreturn]] inline void invalid_label(std::string_view value) {
     std::fprintf(stderr, "Invalid KV cache label: %.*s\n", static_cast<int>(value.size()),
                  value.data());
