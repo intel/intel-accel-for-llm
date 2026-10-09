@@ -5,6 +5,7 @@ caches or RPC (see rpc.py). `rdma_xfer_cpp` offers the same surface on top of
 the C++ agent embedded in `iaxl.torch_ext` (daemon rank processes)."""
 
 import json
+import logging
 import os
 import subprocess
 import time
@@ -21,16 +22,49 @@ def netdev_of_ip(ip: str) -> str:
     raise RuntimeError(f"no network interface owns {ip}")
 
 
-def configure_ucx_env(local_ip: str | None) -> str | None:
-    """Force UCX onto the RDMA NIC owning `local_ip`. Must run before `import nixl`."""
-    if not local_ip:
+def _select_rank_ip(local_ip: str | None, ips: str | None, rank: int | None) -> str | None:
+    """Pick this rank's local RDMA IP. `ips` is a comma list (index = rank, wrapping
+    with modulo); when absent fall back to the single `local_ip`."""
+    if rank is None:
+        return local_ip
+    if not ips:
+        return local_ip
+    lst = [s.strip() for s in ips.split(",")]
+    if not all(lst):
+        raise ValueError("per-rank NIC IP list must not contain empty entries")
+    return lst[rank % len(lst)]
+
+
+def configure_ucx_env(local_ip: str | None, rank: int | None = None,
+                      ips: str | None = None) -> str | None:
+    """Force UCX onto the RDMA NIC owning this rank's IP. Must run before `import nixl`.
+
+    Per-rank NIC binding selects ips[rank % len] and overrides UCX_NET_DEVICES.
+    The IP is resolved on this host, so interface names may differ across nodes.
+    Scheduler agents (rank=None) retain the single-IP configuration."""
+    per_rank = rank is not None and bool((ips or "").strip())
+    ip = _select_rank_ip(local_ip, ips, rank)
+    if not ip:
         return None
-    nic = netdev_of_ip(local_ip)
+    nic = netdev_of_ip(ip)
     ib_dir = f"/sys/class/net/{nic}/device/infiniband"
     if not os.path.isdir(ib_dir):
-        raise RuntimeError(f"{nic} ({local_ip}) is not an RDMA-capable NIC")
+        raise RuntimeError(f"{nic} ({ip}) is not an RDMA-capable NIC")
     ibdev = sorted(os.listdir(ib_dir))[0]
-    os.environ.setdefault("UCX_NET_DEVICES", f"{ibdev}:1")
+    if per_rank:
+        # Explicit per-rank binding: override any inherited multi-device value and pin
+        # this rank to one port (rendezvous multi-rail is meaningless for a single NIC).
+        prev = os.environ.get("UCX_NET_DEVICES")
+        if prev and prev != f"{ibdev}:1":
+            logging.getLogger(__name__).warning(
+                "rank %s: overriding UCX_NET_DEVICES=%s -> %s:1 (per-rank NIC binding)",
+                rank, prev, ibdev)
+        os.environ["UCX_NET_DEVICES"] = f"{ibdev}:1"
+        os.environ["UCX_MAX_RNDV_RAILS"] = "1"
+        logging.getLogger(__name__).info(
+            "rank %s: per-rank RDMA NIC %s (%s, %s)", rank, ibdev, nic, ip)
+    else:
+        os.environ.setdefault("UCX_NET_DEVICES", f"{ibdev}:1")
     os.environ.setdefault("UCX_TLS", "rc,cuda_copy,cuda_ipc")
     return ibdev
 
@@ -43,8 +77,9 @@ class rdma_xfer:
     """One NIXL agent (Python bindings). `listen_port` is the metadata listener
     port; None lets the OS pick one (connect-only agent)."""
 
-    def __init__(self, name: str, listen_port: int | None = None, local_ip: str | None = None):
-        self.ibdev = configure_ucx_env(local_ip)  # must precede `import nixl`
+    def __init__(self, name: str, listen_port: int | None = None, local_ip: str | None = None,
+                 rank: int | None = None, ips: str | None = None):
+        self.ibdev = configure_ucx_env(local_ip, rank=rank, ips=ips)  # must precede `import nixl`
         from nixl._api import nixl_agent, nixl_agent_config
 
         # The listen (comm) thread also drives fetch_remote_metadata /

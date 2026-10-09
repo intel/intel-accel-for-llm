@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 def serve_rank(rank: int, tp_size: int, ip: str, port: int):
     from iaxl import setup_root_logger
+    from iaxl.envs import envs
     from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
     from . import rpc
     from .nixl_impl import configure_ucx_env, rdma_xfer_cpp
@@ -31,7 +32,7 @@ def serve_rank(rank: int, tp_size: int, ip: str, port: int):
     setup_root_logger()
     bind_cpu_affinity(rank, tp_size, os.getenv("VLLM_CPU_OMP_THREADS_BIND"))
     bind_intel_accel(rank)
-    configure_ucx_env(ip)
+    configure_ucx_env(ip, rank=rank, ips=envs.IAXL_RDMA_DAEMON_NIC_IPS or None)
     xfer = rdma_xfer_cpp(f"daemon{rank}", port)
     logger.info("daemon rank %d listening on %s:%d", rank, ip, port)
     rpc.serve(xfer, rpc.KVStoreService(xfer, "worker", rank=rank, tp_size=tp_size))

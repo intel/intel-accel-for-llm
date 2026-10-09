@@ -65,7 +65,12 @@ class KVStoreRemote:
             name, self.peer = f"client{rank}", f"daemon{rank}"
             port = rank_port(port, rank)
 
-        self.xfer = rdma_xfer(name, local_ip=envs.IAXL_RDMA_CLIENT_IP or None)
+        self.xfer = rdma_xfer(
+            name,
+            local_ip=envs.IAXL_RDMA_CLIENT_IP or None,
+            rank=None if self.has_only_mode else rank,
+            ips=envs.IAXL_RDMA_CLIENT_NIC_IPS or None,
+        )
         self.rpc = RpcChannel(self.xfer, self.peer, self._on_done)
         if kv_caches is not None:
             for t in kv_caches.values():  # rkeys ride along with our metadata

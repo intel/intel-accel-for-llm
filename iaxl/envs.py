@@ -78,6 +78,8 @@ class Envs:
         self.IAXL_RDMA_ENABLE = _bool("IAXL_RDMA_ENABLE")
         self.IAXL_RDMA_DAEMON_IP = _str("IAXL_RDMA_DAEMON_IP", "")
         self.IAXL_RDMA_CLIENT_IP = _str("IAXL_RDMA_CLIENT_IP", "")
+        self.IAXL_RDMA_DAEMON_NIC_IPS = _str("IAXL_RDMA_DAEMON_NIC_IPS", _str("IAXL_RDMA_DAEMON_IPS", ""))
+        self.IAXL_RDMA_CLIENT_NIC_IPS = _str("IAXL_RDMA_CLIENT_NIC_IPS", _str("IAXL_RDMA_CLIENT_IPS", ""))
         self.IAXL_RDMA_DAEMON_PORT = _int("IAXL_RDMA_DAEMON_PORT", 5555)
         self.IAXL_RDMA_TP_SIZE = _int("IAXL_RDMA_TP_SIZE", 1)
 

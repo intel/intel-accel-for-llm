@@ -144,3 +144,7 @@ curl -X POST http://localhost:18700/v1/cache/evict \
 	-H 'Content-Type: application/json' \
 	-d '{"count":999999}'
 ```
+
+## 跨节点 KV Cache 复用
+
+remote_pool 支持将 KV Cache 存储在独立的 daemon 节点，并通过 RDMA 与 vLLM client 节点传输和复用。部署拓扑、两侧构建与启动、逐 rank 网口配置及运维步骤见[跨节点 KV Cache 使用文档](doc/usage/remote-pool-kvstore.zh-CN.md)。

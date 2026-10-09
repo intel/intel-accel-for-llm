@@ -146,3 +146,7 @@ curl -X POST http://localhost:18700/v1/cache/evict \
 	-H 'Content-Type: application/json' \
 	-d '{"count":999999}'
 ```
+
+## Cross-Node KV Cache Reuse
+
+remote_pool supports storing KV Cache on a separate daemon node and transferring or reusing it with vLLM client nodes over RDMA. See the [cross-node KV Cache guide](doc/usage/remote-pool-kvstore.en.md) for the topology, build and startup steps, per-rank NIC configuration, and operations.

@@ -156,6 +156,8 @@ export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP requ
 export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon instead of local KVStore (0/1)
 export IAXL_RDMA_DAEMON_IP=${IAXL_RDMA_DAEMON_IP:-}           # Daemon RDMA NIC IP (metadata + UCX device selection)
 export IAXL_RDMA_CLIENT_IP=${IAXL_RDMA_CLIENT_IP:-}           # Client RDMA NIC IP (UCX device selection)
+export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Optional per-rank daemon NIC IPs
+export IAXL_RDMA_CLIENT_NIC_IPS=${IAXL_RDMA_CLIENT_NIC_IPS:-} # Optional per-rank client NIC IPs
 export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
 export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
 
@@ -178,6 +180,13 @@ ENV_VARS=(
     TP_SIZE
     DEVICE
     IAXL_QATLIB
+    IAXL_RDMA_ENABLE
+    IAXL_RDMA_DAEMON_IP
+    IAXL_RDMA_CLIENT_IP
+    IAXL_RDMA_DAEMON_NIC_IPS
+    IAXL_RDMA_CLIENT_NIC_IPS
+    IAXL_RDMA_DAEMON_PORT
+    IAXL_RDMA_TP_SIZE
 )
 
 case "$DEVICE" in
