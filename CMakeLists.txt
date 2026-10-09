@@ -55,10 +55,6 @@ if(NOT PYTORCH_RESULT EQUAL 0)
 endif()
 
 set(IAXL_CSRC_DIR "${CMAKE_SOURCE_DIR}/iaxl/csrc")
-set(IAXL_LIB_DIR
-    "${CMAKE_SOURCE_DIR}/_lib"
-    CACHE PATH "QAT library directory")
-
 execute_process(
     COMMAND git rev-parse HEAD
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -103,38 +99,30 @@ if(IAXL_QATLIB STREQUAL "intree")
     find_library(QAT_LIBRARY qat HINTS "${QATLIB_LIBDIR}" REQUIRED)
     find_library(USDM_LIBRARY usdm HINTS "${QATLIB_LIBDIR}" REQUIRED)
     set(QAT_INCLUDE_DIR "${QATLIB_INCLUDEDIR}/qat")
-    set(QAT_LINK_LIBS ${QAT_LIBRARY} ${USDM_LIBRARY})
-    add_custom_target(qat_userspace_libs)
+    set(QAT_INCLUDE_DIRS "${QAT_INCLUDE_DIR}")
+    set(QAT_LINK_LIBS "${QAT_LIBRARY}" "${USDM_LIBRARY}")
     message(STATUS "QAT user space: in-tree qatlib ${QATLIB_VERSION} (${QAT_LIBRARY})")
 elseif(IAXL_QATLIB STREQUAL "oot")
-    set(QAT_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqat_s.so" "${IAXL_LIB_DIR}/libusdm_drv_s.so")
-    add_custom_command(
-        OUTPUT ${QAT_USERSPACE_LIBS}
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
-        COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} IAXL_QATLIB=oot qat-userspace
-        COMMENT "Building Intel QAT user-space libraries"
-        VERBATIM)
-    add_custom_target(qat_userspace_libs DEPENDS ${QAT_USERSPACE_LIBS})
-    set(QAT_INCLUDE_DIR "${IAXL_CSRC_DIR}/qat_zip/include")
-    set(QAT_LINK_LIBS qat_s usdm_drv_s)
-    message(STATUS "QAT user space: out-of-tree QAT20 package (${IAXL_LIB_DIR})")
+    find_path(QAT_INCLUDE_DIR cpa.h PATHS /usr/local/include/qat NO_DEFAULT_PATH)
+    find_library(QAT_LIBRARY qat_s PATHS /usr/local/lib NO_DEFAULT_PATH)
+    find_library(USDM_LIBRARY usdm_drv_s PATHS /usr/local/lib NO_DEFAULT_PATH)
+    if(NOT QAT_INCLUDE_DIR OR NOT QAT_LIBRARY OR NOT USDM_LIBRARY)
+        message(FATAL_ERROR "QAT OOT development files not found under /usr/local; use the IAXL dev image")
+    endif()
+    set(QAT_INCLUDE_DIRS "${QAT_INCLUDE_DIR}" "${QAT_INCLUDE_DIR}/dc")
+    set(QAT_LINK_LIBS "${QAT_LIBRARY}" "${USDM_LIBRARY}")
+    message(STATUS "QAT user space: preinstalled out-of-tree QAT20 package")
 else()
     message(FATAL_ERROR "IAXL_QATLIB=${IAXL_QATLIB}; expected oot or intree")
 endif()
 
-set(QPL_PREFIX "${CMAKE_SOURCE_DIR}/_build/qpl/install")
-set(QPL_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqpl.so" "${QPL_PREFIX}/include/qpl/qpl.h")
-add_custom_command(
-    OUTPUT ${QPL_USERSPACE_LIBS}
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
-    COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} qpl-userspace
-    COMMENT "Building Intel QPL (IAA) user-space library"
-    VERBATIM)
-add_custom_target(qpl_userspace_libs DEPENDS ${QPL_USERSPACE_LIBS})
+find_path(QPL_INCLUDE_DIR qpl/qpl.h PATHS /usr/local/include NO_DEFAULT_PATH)
+find_library(QPL_LIBRARY qpl PATHS /usr/local/lib NO_DEFAULT_PATH)
+if(NOT QPL_INCLUDE_DIR OR NOT QPL_LIBRARY)
+    message(FATAL_ERROR "QPL development files not found under /usr/local; use the IAXL dev image")
+endif()
 
 pybind11_add_module(torch_ext ${IAXL_SRCS})
-add_dependencies(torch_ext qat_userspace_libs qpl_userspace_libs)
-
 target_compile_definitions(
     torch_ext
     PRIVATE TORCH_EXTENSION_NAME=torch_ext _GLIBCXX_USE_CXX11_ABI=${CXX11_ABI}
@@ -147,10 +135,12 @@ target_include_directories(
     torch_ext
     PRIVATE "${PYTORCH_PATH}/include" "${PYTORCH_PATH}/include/torch/csrc/api/include"
             "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
-            "${QAT_INCLUDE_DIR}" "${QPL_PREFIX}/include")
-target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
+            ${QAT_INCLUDE_DIRS} "${QPL_INCLUDE_DIR}")
+target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib")
 find_package(ZLIB REQUIRED)
-target_link_libraries(torch_ext PRIVATE torch torch_python ${QAT_LINK_LIBS} qpl ZLIB::ZLIB dl)
+target_link_libraries(
+    torch_ext PRIVATE torch torch_python ${QAT_LINK_LIBS} "${QPL_LIBRARY}"
+                      ZLIB::ZLIB dl)
 
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS $ENV{NIXL_INCLUDE_DIR} PATHS /usr/local/include NO_DEFAULT_PATH)
 find_library(NIXL_LIBRARY nixl HINTS $ENV{NIXL_LIB_DIR} PATHS /usr/local/lib/x86_64-linux-gnu NO_DEFAULT_PATH)
@@ -206,5 +196,5 @@ endif()
 set_target_properties(
     torch_ext
     PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/iaxl"
-               BUILD_RPATH "${IAXL_LIB_DIR}:${NIXL_LIB_DIR}"
-               INSTALL_RPATH "${IAXL_LIB_DIR}:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib:${NIXL_LIB_DIR}")
+               BUILD_RPATH "/usr/local/lib:${NIXL_LIB_DIR}"
+               INSTALL_RPATH "/usr/local/lib:$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib:${NIXL_LIB_DIR}")

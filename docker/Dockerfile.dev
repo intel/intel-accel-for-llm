@@ -63,3 +63,27 @@ RUN echo "install idxd-config" \
     && make install \
     && rm -rf /idxd-config
 
+# Build and install QAT/QPL once in the image so source builds need no network access.
+RUN set -eux; \
+    mkdir -p /tmp/iaxl-build-deps/qat; \
+    tar xf /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz -C /tmp/iaxl-build-deps/qat; \
+    cd /tmp/iaxl-build-deps/qat; \
+    install -d /usr/local/include/qat; \
+    cp -a quickassist/include/. /usr/local/include/qat/; \
+    cp -a quickassist/lookaside/access_layer/include/. /usr/local/include/qat/; \
+    install -m 644 quickassist/utilities/libusdm_drv/qae_mem.h /usr/local/include/qat/qae_mem.h; \
+    export KERNEL_SOURCE_ROOT="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"; \
+    test -n "$KERNEL_SOURCE_ROOT"; \
+    ./configure; \
+    sed -i 's/^ALL_TARGETS *= *.*/ALL_TARGETS = lac_user/g' quickassist/Makefile; \
+    make -j"$(nproc)" quickassist-all; \
+    cp -a build/*.so /usr/local/lib/; \
+    cmake -S /opt/iaxl-build-deps/qpl -B /tmp/iaxl-build-deps/qpl-build \
+        -DCMAKE_BUILD_TYPE=Release -DQPL_LIBRARY_TYPE=SHARED \
+        -DQPL_BUILD_TESTS=OFF -DQPL_BUILD_EXAMPLES=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local; \
+    cmake --build /tmp/iaxl-build-deps/qpl-build -j"$(nproc)"; \
+    cmake --install /tmp/iaxl-build-deps/qpl-build; \
+    ldconfig; \
+    rm -rf /tmp/iaxl-build-deps
+
