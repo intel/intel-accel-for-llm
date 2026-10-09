@@ -14,7 +14,7 @@ import torch
 
 from ..envs import envs
 from . import rpc
-from .nixl_impl import rdma_xfer
+from .nixl_impl import parse_nic_ips, rdma_xfer
 from .rpc import RpcChannel, rank_port
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,9 @@ class KVStoreRemote:
         if kv_caches is not None and block_dim is None:
             raise ValueError("block_dim is required when kv_caches is provided")
 
-        ip = daemon_ip or envs.IAXL_RDMA_DAEMON_IP
+        ip = daemon_ip or parse_nic_ips(envs.IAXL_RDMA_DAEMON_NIC_IPS, "IAXL_RDMA_DAEMON_NIC_IPS")[0]
         port = daemon_port or envs.IAXL_RDMA_DAEMON_PORT
-        if not ip:
-            raise ValueError("daemon_ip (IAXL_RDMA_DAEMON_IP) is required")
+        client_ips = parse_nic_ips(envs.IAXL_RDMA_CLIENT_NIC_IPS, "IAXL_RDMA_CLIENT_NIC_IPS")
 
         self.kv_caches = kv_caches
         self.block_dim = block_dim
@@ -65,12 +64,7 @@ class KVStoreRemote:
             name, self.peer = f"client{rank}", f"daemon{rank}"
             port = rank_port(port, rank)
 
-        self.xfer = rdma_xfer(
-            name,
-            local_ip=envs.IAXL_RDMA_CLIENT_IP or None,
-            rank=None if self.has_only_mode else rank,
-            ips=envs.IAXL_RDMA_CLIENT_NIC_IPS or None,
-        )
+        self.xfer = rdma_xfer(name, client_ips, rank=None if self.has_only_mode else rank)
         self.rpc = RpcChannel(self.xfer, self.peer, self._on_done)
         if kv_caches is not None:
             for t in kv_caches.values():  # rkeys ride along with our metadata

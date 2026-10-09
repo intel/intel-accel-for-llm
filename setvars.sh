@@ -154,17 +154,15 @@ export IAXL_API_TIMEOUT=${IAXL_API_TIMEOUT:-60}                      # HTTP requ
 
 # ---- Remote pool (KVStore daemon over RDMA/NIXL) ----------------------------
 export IAXL_RDMA_ENABLE=${IAXL_RDMA_ENABLE:-0}                # Use remote KVStore daemon instead of local KVStore (0/1)
-export IAXL_RDMA_DAEMON_IP=${IAXL_RDMA_DAEMON_IP:-}           # Daemon RDMA NIC IP (metadata + UCX device selection)
-export IAXL_RDMA_CLIENT_IP=${IAXL_RDMA_CLIENT_IP:-}           # Client RDMA NIC IP (UCX device selection)
-export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Optional per-rank daemon NIC IPs
-export IAXL_RDMA_CLIENT_NIC_IPS=${IAXL_RDMA_CLIENT_NIC_IPS:-} # Optional per-rank client NIC IPs
+export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Daemon RDMA NIC IPs per rank (a single IP is allowed); first is also the control-plane IP (required)
+export IAXL_RDMA_CLIENT_NIC_IPS=${IAXL_RDMA_CLIENT_NIC_IPS:-} # Client RDMA NIC IPs per rank (a single IP is allowed); first is also the scheduler IP (required on client)
 export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
 export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
 
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}
-if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_IP" ]]; then
-    export no_proxy="$no_proxy,$IAXL_RDMA_DAEMON_IP"
+if env_truthy "$IAXL_RDMA_ENABLE" && [[ -n "$IAXL_RDMA_DAEMON_NIC_IPS" ]]; then
+    export no_proxy="$no_proxy,$IAXL_RDMA_DAEMON_NIC_IPS"
 fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
@@ -180,13 +178,6 @@ ENV_VARS=(
     TP_SIZE
     DEVICE
     IAXL_QATLIB
-    IAXL_RDMA_ENABLE
-    IAXL_RDMA_DAEMON_IP
-    IAXL_RDMA_CLIENT_IP
-    IAXL_RDMA_DAEMON_NIC_IPS
-    IAXL_RDMA_CLIENT_NIC_IPS
-    IAXL_RDMA_DAEMON_PORT
-    IAXL_RDMA_TP_SIZE
 )
 
 case "$DEVICE" in

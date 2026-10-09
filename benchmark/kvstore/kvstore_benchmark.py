@@ -39,7 +39,8 @@ DEFAULT_KV_CACHE_SHAPE = (2, 1024, 16, 4, 128)
 
 
 if iaxl_envs.IAXL_RDMA_ENABLE:
-    DEFAULT_METRICS_URL = f"http://{iaxl_envs.IAXL_RDMA_DAEMON_IP}:18800/v1/cache/metrics"
+    DEFAULT_METRICS_URL = (
+        f"http://{iaxl_envs.IAXL_RDMA_DAEMON_NIC_IPS.split(',')[0].strip()}:18800/v1/cache/metrics")
 else:
     DEFAULT_METRICS_URL = "http://127.0.0.1:18800/v1/cache/metrics"
 DEFAULT_KV_DATA_DIR = "/_data/kvstore_benchmark"

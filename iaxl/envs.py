@@ -76,10 +76,9 @@ class Envs:
         self.IAXL_API_WORKER_BASE_PORT = _int("IAXL_API_WORKER_BASE_PORT", 18800)
 
         self.IAXL_RDMA_ENABLE = _bool("IAXL_RDMA_ENABLE")
-        self.IAXL_RDMA_DAEMON_IP = _str("IAXL_RDMA_DAEMON_IP", "")
-        self.IAXL_RDMA_CLIENT_IP = _str("IAXL_RDMA_CLIENT_IP", "")
-        self.IAXL_RDMA_DAEMON_NIC_IPS = _str("IAXL_RDMA_DAEMON_NIC_IPS", _str("IAXL_RDMA_DAEMON_IPS", ""))
-        self.IAXL_RDMA_CLIENT_NIC_IPS = _str("IAXL_RDMA_CLIENT_NIC_IPS", _str("IAXL_RDMA_CLIENT_IPS", ""))
+        # Comma lists (a single IP is allowed): rank r uses entry r % len; entry 0 is also the control-plane IP.
+        self.IAXL_RDMA_DAEMON_NIC_IPS = _str("IAXL_RDMA_DAEMON_NIC_IPS", "")
+        self.IAXL_RDMA_CLIENT_NIC_IPS = _str("IAXL_RDMA_CLIENT_NIC_IPS", "")
         self.IAXL_RDMA_DAEMON_PORT = _int("IAXL_RDMA_DAEMON_PORT", 5555)
         self.IAXL_RDMA_TP_SIZE = _int("IAXL_RDMA_TP_SIZE", 1)
 

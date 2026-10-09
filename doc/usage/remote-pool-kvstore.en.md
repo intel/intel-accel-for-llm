@@ -14,7 +14,7 @@ The examples below use a TP=4 setup:
 
 - **Daemon node** (no GPU): `10.10.10.10`, an IP address on its RDMA NIC
 - **Client node** (vLLM, TP=4): `10.10.10.11`, an IP address on its RDMA NIC
-- **Default single-NIC setup:** control, RPC, and RDMA data traffic use the RDMA NIC associated with the IP above. Per-rank NIC selection is described in section 3.3.
+- **NIC configuration:** both nodes select RDMA NICs with required IP lists (`IAXL_RDMA_DAEMON_NIC_IPS` / `IAXL_RDMA_CLIENT_NIC_IPS`). Each rank selects its data-plane NIC from the list; the first IP, which carries RDMA data transfers, is also used for the control plane. A list with only one IP is a single-NIC setup; see section 3.3 for multiple NICs.
 
 Port allocation (`IAXL_RDMA_DAEMON_PORT` defaults to `5555`; `rank_port(port, r) = port + 1 + r`):
 
@@ -41,7 +41,7 @@ Use `http://10.10.10.10:18700/v1/cache/*` as the management entry point.
 
 Build and start each node from the same code revision. The daemon node has no GPU, so you must set `NVIDIA_RUNTIME=none` when running `start.sh` on the host to omit the NVIDIA container runtime and GPU arguments. On the client node, run `start.sh` normally. This variable only controls the host-side Docker arguments; it is not passed into the container and does not affect image building.
 
-`start.sh` passes `MODEL`, `TP_SIZE`, and the remote-pool connection variables listed in `setvars.sh` into the container. These are runtime settings, not image-build inputs. To keep configuration consistent across both nodes, the examples below set them in the container shell opened by `start.sh`. Configure compression and resource settings there as well, before starting the service. If the client uses a local model directory outside the repository, set `MODEL` on the host before running `start.sh` so the script mounts that directory into the container; for a model ID or a path already available in the container, set it inside the container. Run the steps from the repository root on each node.
+`start.sh` passes `MODEL`, `TP_SIZE`, and the variables listed in `setvars.sh` into the container. These are runtime settings, not image-build inputs. To keep configuration consistent across both nodes, the examples below set them in the container shell opened by `start.sh`. Configure compression and resource settings there as well, before starting the service. If the client uses a local model directory outside the repository, set `MODEL` on the host before running `start.sh` so the script mounts that directory into the container; for a model ID or a path already available in the container, set it inside the container. Run the steps from the repository root on each node.
 
 ### 2.1 Environment Variables and Parameters
 
@@ -49,7 +49,7 @@ The daemon startup script is [`examples/kvshrink-daemon.sh`](../../examples/kvsh
 
 | Parameter | Environment variable / default | Description |
 | --- | --- | --- |
-| `--ip` | `IAXL_RDMA_DAEMON_IP` | Local RDMA NIC IP and NIXL listen address (each rank process listens on its own port) |
+| `--nic-ips` | `IAXL_RDMA_DAEMON_NIC_IPS` | Comma-separated list of local RDMA NIC IPs (required; may be a single IP). The first IP is also the control-plane address; rank `r` uses the IP at index `r % list_length` for its data plane. |
 | `--port` | `IAXL_RDMA_DAEMON_PORT` (default `5555`) | Scheduler port; rank `r` uses `port + 1 + r` |
 | `--tp-size` | `IAXL_RDMA_TP_SIZE` (default `$TP_SIZE`) | Number of rank processes to spawn; **must match** vLLM's `tensor_parallel_size` |
 
@@ -58,8 +58,7 @@ Key environment variables (parsed in `iaxl/envs.py` and `setvars.sh`):
 | Variable | Recommended value / default | Purpose |
 | --- | --- | --- |
 | `IAXL_RDMA_ENABLE` | `1` (required) | Enables the remote_pool path. The daemon refuses to start when set to `0`. |
-| `IAXL_RDMA_DAEMON_IP` | `10.10.10.10` | Daemon listen address and the client's connection target; selects the default data-plane NIC when no per-rank list is configured. |
-| `IAXL_RDMA_DAEMON_NIC_IPS` | Unset | List of local RDMA NIC IPs for daemon workers. Selects each rank's local NIC without changing the listen address or ports. |
+| `IAXL_RDMA_DAEMON_NIC_IPS` | `10.10.10.10` (required) | Local RDMA NIC IPs on the daemon; required, and may be a single IP. The first IP is also the control-plane address (client connection target, scheduler NIC, and management REST entry point); rank `r` uses the NIC of the IP at index `r % list_length`. |
 | `IAXL_RDMA_DAEMON_PORT` | `5555` | Scheduler listen port; rank `r` listens on `5555 + 1 + r`. |
 | `IAXL_RDMA_TP_SIZE` | `4` | Number of ranks in the TP group. **Must match on client and daemon**; checked during `register_kv_caches`. |
 | `VLLM_CPU_OMP_THREADS_BIND` | `cpu_auto_detect $TP_SIZE` | `setvars.sh` creates a `|`-separated list; each daemon rank uses its segment for CPU affinity. |
@@ -79,7 +78,7 @@ NVIDIA_RUNTIME=none ./start.sh
 
 # ---- Run the following commands in the container shell opened by start.sh ----
 export IAXL_RDMA_ENABLE=1
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # Single NIC; see section 3.3 for multiple NICs
 export IAXL_RDMA_DAEMON_PORT=5555
 export IAXL_RDMA_TP_SIZE=4
 export TP_SIZE=4
@@ -89,12 +88,11 @@ export IAXL_KV_COMPRESSION=1
 export IAXL_QAT_ZIP_ENABLE=1
 export KVSHRINK_QAT_DEVICES="0|1|4|5"
 export IAXL_SCRATCH_POOL_SIZE_GB=16
-# Optional: export IAXL_DDR_POOL_SIZE_GB=32
 
 ./examples/kvshrink-daemon.sh
 ```
 
-Startup logs show the listen address for the scheduler and each of the four rank processes. If any child process exits, the launcher terminates the others and exits as well.
+Startup logs show the RDMA NIC selected by the scheduler and each of the four rank processes (`RDMA NIC ...`) and their listen addresses. If any child process exits, the launcher terminates the others and exits as well.
 
 ### 2.3 Tuning Recommendations
 
@@ -115,10 +113,9 @@ When `IAXL_RDMA_ENABLE=1`, `kvshrink_connector` transparently uses `iaxl.remote_
 | Variable | Value | Purpose |
 | --- | --- | --- |
 | `IAXL_RDMA_ENABLE` | `1` | Selects `KVStoreRemote`. |
-| `IAXL_RDMA_DAEMON_IP` | `10.10.10.10` | Daemon connection target. |
+| `IAXL_RDMA_DAEMON_NIC_IPS` | `10.10.10.10` (required; may be a single IP) | Same value as on the daemon; the client uses only the first IP as its connection target. |
 | `IAXL_RDMA_DAEMON_PORT` | `5555` | Must match the daemon; the scheduler connects to `5555`, and worker `r` to `5555 + 1 + r`. |
-| `IAXL_RDMA_CLIENT_IP` | `10.10.10.11` | Client scheduler's local RDMA NIC IP; also selects the default data-plane NIC for workers when no per-rank list is configured. |
-| `IAXL_RDMA_CLIENT_NIC_IPS` | Unset | List of local RDMA NIC IPs for client workers; does not change the daemon connection target. |
+| `IAXL_RDMA_CLIENT_NIC_IPS` | `10.10.10.11` (required; may be a single IP) | Local RDMA NIC IPs on the client. The first IP is also used by the client scheduler; worker `r` uses the NIC of the IP at index `r % list_length`. |
 | `IAXL_RDMA_TP_SIZE` | `4` | Must match vLLM's `-tp` value. |
 | `MODEL` | `Qwen/Qwen3-32B` | Model ID or local path loaded by vLLM; the client sends the model identifier to the daemon when registering KV caches. |
 | `TP_SIZE` | `4` | vLLM tensor-parallel size. |
@@ -133,9 +130,9 @@ Do not configure `KVSHRINK_QAT_DEVICES`, `KVSHRINK_DSA_DEVICES`, `IAXL_QAT_*`, `
 
 # ---- Run this command in the container shell opened by start.sh ----
 export IAXL_RDMA_ENABLE=1
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # Same as on the daemon
 export IAXL_RDMA_DAEMON_PORT=5555
-export IAXL_RDMA_CLIENT_IP=10.10.10.11
+export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11   # Single NIC; see section 3.3 for multiple NICs
 export IAXL_RDMA_TP_SIZE=4
 export TP_SIZE=4
 export MODEL=Qwen/Qwen3-32B
@@ -145,24 +142,26 @@ export MODEL=Qwen/Qwen3-32B
 
 After vLLM starts, five `KVStoreRemote connected: peer=... rank=... has_only=...` messages (one has-only process and four workers) indicate that all ranks completed the handshake.
 
-### 3.3 Select an RDMA NIC Per Rank (Optional, TP=4 Example)
+### 3.3 Multiple NICs: Select an RDMA NIC Per Rank (TP=4 Example)
 
-`IAXL_RDMA_DAEMON_IP` is required: it sets the listen address for all daemon ranks and is the client connection target (the port remains `port + 1 + rank`). Set `IAXL_RDMA_CLIENT_IP` for the client scheduler's local NIC; otherwise, the system selects one. The `*_NIC_IPS` lists select a local NIC for each worker without changing the metadata handshake listen address or connection target. The scheduler continues to use a single IP.
+Both lists follow the same rules:
 
-Each node's list is indexed by rank; rank `r` uses the IP at index `r % list_length`. In this example, ranks 0 and 1 use `10.10.10.x`, while ranks 2 and 3 use `10.10.11.x`:
+- **The first IP is also the control-plane address.** It is primarily rank 0's RDMA data-plane IP (or every rank's, with a single-entry list). In addition, the first IP in `IAXL_RDMA_DAEMON_NIC_IPS` is the client connection target (the scheduler connects to `port`, worker `r` to `port + 1 + r`) and the management REST entry point, and on both nodes the scheduler process also uses the NIC of the first IP in its local list.
+- **Rank `r` uses the NIC of the IP at index `r % list_length`** for its RPC notifications and KV data transfers. With a single-entry list, all ranks share that NIC.
+- The daemon node needs only `IAXL_RDMA_DAEMON_NIC_IPS`. The client node needs both lists, and its `IAXL_RDMA_DAEMON_NIC_IPS` value must match the daemon's.
+
+In this example, ranks 0 and 1 use `10.10.10.x`, while ranks 2 and 3 use `10.10.11.x`:
 
 ```bash
 # Daemon container: set before starting the daemon
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
 export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10,10.10.10.10,10.10.11.10,10.10.11.10
 
 # Client container: set before starting vLLM
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
-export IAXL_RDMA_CLIENT_IP=10.10.10.11
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10,10.10.10.10,10.10.11.10,10.10.11.10
 export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11,10.10.10.11,10.10.11.11,10.10.11.11
 ```
 
-Each IP must belong to an RDMA NIC on its own node. The selected interfaces for the same rank on both nodes must be reachable over a compatible RoCE network. Interface names may differ between nodes; pair interfaces by network reachability, not by names such as `mlx5_*`. List entries must not be empty. Without a list, the single-NIC setup is used. Check local IP ownership with `ip -j -4 addr`; compare the per-port `port_rcv_data` counter under `/sys/class/infiniband/<device>/ports/1/counters/` to confirm traffic distribution. Evaluate throughput and TTFT together with GPU and NIC NUMA topology.
+Each IP must belong to an RDMA NIC on its own node. The selected interfaces for the same rank on both nodes must be reachable over a compatible RoCE network. Interface names may differ between nodes; pair interfaces by network reachability, not by names such as `mlx5_*`. Lists must not be empty or contain empty entries. The lists override any inherited `UCX_NET_DEVICES` and set `UCX_MAX_RNDV_RAILS=1`, so do not configure UCX multi-rail manually. Each process logs `RDMA NIC <device> (<interface>, <IP>)` at startup so you can verify the selection. Check local IP ownership with `ip -j -4 addr`; compare the per-port `port_rcv_data` counter under `/sys/class/infiniband/<device>/ports/1/counters/` to confirm traffic distribution. Evaluate throughput and TTFT together with GPU and NIC NUMA topology.
 
 ### 3.4 Startup Order
 
@@ -185,7 +184,8 @@ Each IP must belong to an RDMA NIC on its own node. The selected interfaces for 
 
 ## 5. Troubleshooting
 
-- `--ip or IAXL_RDMA_DAEMON_IP is required`: the daemon was started without a listen IP.
+- `... IAXL_RDMA_DAEMON_NIC_IPS is required ...` / `IAXL_RDMA_CLIENT_NIC_IPS is required ...`: the list is unset, empty, or contains an empty entry.
+- `no metadata from daemon<r>` with `no route to ...` in the daemon log: the NICs selected for that rank on the two nodes cannot reach each other. Check that the IPs at the same list position on both nodes are on a reachable network.
 - `IAXL_RDMA_ENABLE=1 is required on the daemon`: set `IAXL_RDMA_ENABLE=1` in the daemon container shell before running `examples/kvshrink-daemon.sh`.
 - `no network interface owns 10.10.10.10`: the IP is not assigned to a local interface. Check with `ip -j -4 addr` before importing NIXL or initializing RDMA.
 - `<netdev> (10.10.10.10) is not an RDMA-capable NIC`: the interface exists but has no RDMA device under `/sys/class/net/*/device/infiniband/`. Verify that the interface supports RDMA and that MLNX_OFED or rdma-core is installed on the host.

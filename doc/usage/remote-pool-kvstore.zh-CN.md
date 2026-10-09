@@ -18,7 +18,9 @@ client 显存；client 不参与数据面、不需要 GPU 拷贝流、也不需�
 
 - **daemon 节点**（无 GPU）：`10.10.10.10`，RDMA NIC 持有该 IP
 - **client 节点**（vLLM，TP=4）：`10.10.10.11`，RDMA NIC 持有该 IP
-- **默认单网口配置**：控制面 + RPC + RDMA 数据面走上述 IP 对应的 RDMA NIC；逐 rank 网口配置见 3.3 节
+- **网口配置**：两端都用必填的 IP 列表（`IAXL_RDMA_DAEMON_NIC_IPS` /
+  `IAXL_RDMA_CLIENT_NIC_IPS`）指定 RDMA 网口；各 rank 按列表选择数据面网口，列表
+  第一个 IP 在承担RDMA 数据传输之外也用于控制面。列表只有一个 IP 时即单网口配置，多网口见 3.3 节
 
 端口分配（`IAXL_RDMA_DAEMON_PORT` 默认 `5555`，`rank_port(port, r) = port + 1 + r`）：
 
@@ -50,11 +52,11 @@ daemon 与 client 节点分别使用同一代码版本构建和启动。daemon �
 GPU 参数；client 节点按常规方式运行 `start.sh`。该变量只控制宿主机上的 Docker 启动
 参数，不会传入容器，也不影响镜像构建。
 
-`start.sh` 会把 `MODEL`、`TP_SIZE` 和 `setvars.sh` 中列出的 remote-pool 连接变量
-透传给容器；它们是运行配置，不是镜像构建输入。为便于两侧配置，下面示例在
-`start.sh` 打开的容器 shell 中设置这些变量。压缩和资源配置也应在容器内、启动服务前
-设置。若 client 使用仓库目录之外的本地模型路径，需在宿主机运行 `start.sh` 前设置
-`MODEL`，使脚本将该目录挂载进容器；使用模型 ID 或容器内已有路径时，可在容器内设置。
+`start.sh` 会把 `MODEL`、`TP_SIZE` 和 `setvars.sh` 中列出的变量透传给容器；它们是
+运行配置，不是镜像构建输入。为便于两侧配置，下面示例在`start.sh` 打开的容器 shell 中
+设置这些变量。压缩和资源配置也应在容器内、启动服务前设置。若 client 使用仓库目录之外的
+本地模型路径，需在宿主机运行 `start.sh` 前设置`MODEL`，使脚本将该目录挂载进容器；使用
+模型 ID 或容器内已有路径时，可在容器内设置。
 下面步骤都从各自节点的仓库根目录执行。
 
 ### 2.1 环境变量与参数
@@ -65,7 +67,7 @@ daemon 侧的启动脚本是 [`examples/kvshrink-daemon.sh`](../../examples/kvsh
 
 | 参数 | 环境变量默认 | 含义 |
 |------|-------------|------|
-| `--ip` | `IAXL_RDMA_DAEMON_IP` | 本机 RDMA NIC 的 IP，也是 NIXL listen 地址（每个 rank 进程一个监听端口） |
+| `--nic-ips` | `IAXL_RDMA_DAEMON_NIC_IPS` | 本机 RDMA NIC IP 列表（逗号分隔，必填，可以是单个IP）；第一个 IP 也是控制面地址，rank r 的数据面使用第 `r % 列表长度` 个 IP |
 | `--port` | `IAXL_RDMA_DAEMON_PORT`（默认 `5555`） | scheduler 端口；rank r 用 `port + 1 + r` |
 | `--tp-size` | `IAXL_RDMA_TP_SIZE`（默认 `$TP_SIZE`） | 要 spawn 的 rank 进程数，**必须等于** vLLM 的 `tensor_parallel_size` |
 
@@ -74,8 +76,7 @@ daemon 侧的启动脚本是 [`examples/kvshrink-daemon.sh`](../../examples/kvsh
 | 变量 | 推荐值 / 默认 | 作用 |
 |------|--------------|------|
 | `IAXL_RDMA_ENABLE` | `1`（必需） | 打开 remote_pool 分支。`0` 时 daemon 会拒绝启动 |
-| `IAXL_RDMA_DAEMON_IP` | `10.10.10.10` | daemon 监听地址，也是 client 唯一连接目标；未配置逐 rank 网口时用于选择默认数据面网口 |
-| `IAXL_RDMA_DAEMON_NIC_IPS` | 未设置 | daemon 各 worker 的本机 RDMA NIC IP 列表；选择该 rank 使用的本机网口，不改变监听地址和端口 |
+| `IAXL_RDMA_DAEMON_NIC_IPS` | `10.10.10.10`（必填） | daemon 本机 RDMA NIC IP 列表，必填，可以是单个IP。第一个 IP 也是控制面地址（client 连接目标、scheduler 网口、管理 REST 入口）；rank r 使用第 `r % 列表长度` 个 IP 对应的网口 |
 | `IAXL_RDMA_DAEMON_PORT` | `5555` | scheduler 监听；rank r 监听 `5555+1+r` |
 | `IAXL_RDMA_TP_SIZE` | `4` | TP 组内 rank 进程数。**client 与 daemon 必须一致**，`register_kv_caches` 时会校验 |
 | `VLLM_CPU_OMP_THREADS_BIND` | `cpu_auto_detect $TP_SIZE`（由 `setvars.sh` 自动填 `\|` 分段） | daemon rank 进程按 rank 从该 `\|`-分段列表里取自己那一段做 `sched_setaffinity`（复用 connector 里那套 `bind_cpu_affinity`） |
@@ -95,7 +96,7 @@ NVIDIA_RUNTIME=none ./start.sh
 
 # ---- 以下命令在 start.sh 打开的容器 shell 中执行 ----
 export IAXL_RDMA_ENABLE=1
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # 单网口；多网口见 3.3 节
 export IAXL_RDMA_DAEMON_PORT=5555
 export IAXL_RDMA_TP_SIZE=4
 export TP_SIZE=4
@@ -109,7 +110,7 @@ export IAXL_SCRATCH_POOL_SIZE_GB=16
 ./examples/kvshrink-daemon.sh
 ```
 
-启动日志会分别显示 scheduler 和 4 个 rank 进程的监听地址。若任何一个子进程崩溃，
+启动日志会分别显示 scheduler 和 4 个 rank 进程选中的 RDMA 网口（`RDMA NIC ...`）及监听地址。若任何一个子进程崩溃，
 launcher 会自动终止其它子进程并退出。
 
 ### 2.3 参数推荐
@@ -136,10 +137,9 @@ daemon 节点了；connector 里同一分支上（L148）会自动跳过
 | 变量 | 值 | 作用 |
 |------|-----|------|
 | `IAXL_RDMA_ENABLE` | `1` | 切到 `KVStoreRemote` |
-| `IAXL_RDMA_DAEMON_IP` | `10.10.10.10` | 连接目标 |
+| `IAXL_RDMA_DAEMON_NIC_IPS` | `10.10.10.10`（必填，可以是单个IP） | 与 daemon 侧取值相同；client 只使用第一个 IP 作为连接目标 |
 | `IAXL_RDMA_DAEMON_PORT` | `5555` | 与 daemon 侧一致；scheduler 连 `5555`，worker r 连 `5555+1+r` |
-| `IAXL_RDMA_CLIENT_IP` | `10.10.10.11` | client scheduler 的本机 RDMA NIC IP；未配置逐 rank 网口时也用于选择默认数据面网口 |
-| `IAXL_RDMA_CLIENT_NIC_IPS` | 未设置 | client 各 worker 的本机 RDMA NIC IP 列表；不改变连接目标 |
+| `IAXL_RDMA_CLIENT_NIC_IPS` | `10.10.10.11`（必填，可以是单个IP） | client 本机 RDMA NIC IP 列表。第一个 IP 也用于 client scheduler；worker r 使用第 `r % 列表长度` 个 IP 对应的网口 |
 | `IAXL_RDMA_TP_SIZE` | `4` | 必须等于 vLLM `-tp` |
 | `MODEL` | `Qwen/Qwen3-32B` | vLLM 加载的模型 ID 或本地路径；client 注册 KV Cache 时会将模型标识发送给 daemon |
 | `TP_SIZE` | `4` | vLLM `-tp` |
@@ -156,9 +156,9 @@ daemon 节点了；connector 里同一分支上（L148）会自动跳过
 
 # ---- 以下命令在 start.sh 打开的容器 shell 中执行 ----
 export IAXL_RDMA_ENABLE=1
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # 与 daemon 侧一致
 export IAXL_RDMA_DAEMON_PORT=5555
-export IAXL_RDMA_CLIENT_IP=10.10.10.11
+export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11   # 单网口；多网口见 3.3 节
 export IAXL_RDMA_TP_SIZE=4
 export TP_SIZE=4
 export MODEL=Qwen/Qwen3-32B
@@ -168,31 +168,37 @@ export MODEL=Qwen/Qwen3-32B
 
 vLLM 启动完成后，5 条 `KVStoreRemote connected: peer=... rank=... has_only=...`
 日志（1 个 has-only + 4 个 worker）表示所有 rank 都握手成功了。
-### 3.3 按 rank 指定 RDMA 网口（可选，TP=4 示例）
 
-`IAXL_RDMA_DAEMON_IP` 不能省略：它决定 daemon 所有 rank 的监听地址和
-client 连接目标（端口仍是 `port+1+rank`）。建议设置
-`IAXL_RDMA_CLIENT_IP` 作为 client scheduler 的本机网口；不设置时由系统选择。
-`*_NIC_IPS` 列表只为各 worker 选择本机网口，不改变 metadata 握手的监听地址和
-连接目标；scheduler 仍使用单 IP。
+### 3.3 多网口：按 rank 指定 RDMA 网口（TP=4 示例）
 
-每端列表按 rank 索引，rank `r` 使用第 `r % 列表长度` 个 IP。下面的两个本机列表
-分别在各自节点设置，rank 0/1 走 10.10.10.x，rank 2/3 走 10.10.11.x：
+两个列表的规则相同：
+
+- **第一个 IP 也是控制面地址**：它首先是 rank 0 的 RDMA 数据面 IP（单 IP 时则是
+  所有 rank 的）；同时 `IAXL_RDMA_DAEMON_NIC_IPS` 的第一个 IP 也是 client 的连接
+  目标（scheduler 连 `port`，worker r 连 `port+1+r`）和管理 REST 入口，两端
+  scheduler 进程也都使用各自列表第一个 IP 对应的网口。
+- **rank `r` 使用第 `r % 列表长度` 个 IP 对应的网口**承载该 rank 的 RPC 通知和
+  KV 数据传输。列表只有一个 IP 时所有 rank 共用该网口。
+- daemon 节点只需要 `IAXL_RDMA_DAEMON_NIC_IPS`；client 节点两个都需要，且
+  `IAXL_RDMA_DAEMON_NIC_IPS` 的设置值须与 daemon 侧一致。
+
+下例中 rank 0/1 走 10.10.10.x，rank 2/3 走 10.10.11.x：
 
 ```bash
 # daemon 节点容器：启动 daemon 前设置
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
 export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10,10.10.10.10,10.10.11.10,10.10.11.10
 
 # client 节点容器：启动 vLLM 前设置
-export IAXL_RDMA_DAEMON_IP=10.10.10.10
-export IAXL_RDMA_CLIENT_IP=10.10.10.11
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10,10.10.10.10,10.10.11.10,10.10.11.10
 export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11,10.10.10.11,10.10.11.11,10.10.11.11
 ```
 
 IP 必须是**所在节点本机** RDMA 网口的地址；两端同一 rank 所选端口必须在
 可互通的 RoCE 网络上。网口设备名可不同，不要直接按 `mlx5_*` 名称配对。
-逗号列表不可包含空项；不设置列表则使用单网口配置。可分别在两端用
+逗号列表不可为空，也不可包含空项。列表会覆盖进程继承的 `UCX_NET_DEVICES`，
+并设置 `UCX_MAX_RNDV_RAILS=1`，因此无需（也不应）手动配置 UCX 多 rail。
+两端启动日志中每个进程会打印 `RDMA NIC <设备> (<网口>, <IP>)`，用于核对选择结果。
+可分别在两端用
 `ip -j -4 addr` 核对 IP 归属，并比较两个口的
 `/sys/class/infiniband/<设备>/ports/1/counters/port_rcv_data` 增量；确认流量
 是否按预期分摊，吞吐/TTFT 还要结合 GPU 与网卡 NUMA 拓扑评估。
@@ -222,7 +228,10 @@ IP 必须是**所在节点本机** RDMA 网口的地址；两端同一 rank 所�
 
 ## 五、常见问题
 
-- `--ip or IAXL_RDMA_DAEMON_IP is required`：daemon launcher 参数解析拒绝空 IP。
+- `... IAXL_RDMA_DAEMON_NIC_IPS is required ...` / `IAXL_RDMA_CLIENT_NIC_IPS is
+  required ...`：对应列表未设置、为空或含空项。
+- `no metadata from daemon<r>`，且 daemon 日志有 `no route to ...`：该 rank 两端
+  选中的网口之间不可达，检查两端列表中同一位置的 IP 是否在可互通的网络上。
 - `IAXL_RDMA_ENABLE=1 is required on the daemon`：在 daemon 容器 shell 中、运行
   `examples/kvshrink-daemon.sh` 前设置 `IAXL_RDMA_ENABLE=1`。
 - `no network interface owns 10.10.10.10`：`configure_ucx_env` 在
