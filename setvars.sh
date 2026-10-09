@@ -67,6 +67,7 @@ printf '%s\n' \
     "  MODEL=$MODEL" \
     "  TP_SIZE=$TP_SIZE" \
     "  DP_SIZE=$DP_SIZE" \
+    "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-all}" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
@@ -221,6 +222,8 @@ esac
 for var in "${ENV_VARS[@]}"; do
     DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
 done
+# Only forward when non-empty: an empty value would hide every GPU inside the container.
+[[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && DOCKER_RUN_ARGS+=("-e" "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
 if [[ -d "$MODEL" ]]; then
