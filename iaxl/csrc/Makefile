@@ -24,6 +24,8 @@ QATLIBS  :=
 QATCFLAGS:= -I$(shell pkg-config --variable=includedir qatlib)/qat
 QATLDLIBS:= $(shell pkg-config --libs-only-L libqat libusdm) -lqat -lusdm
 else ifeq ($(QATMODE),oot)
+QATARCHIVE := QAT20.L.1.2.30-00178.tar.gz
+BUILD_DEPS := /opt/iaxl-build-deps
 QATLIBS  := $(LIBDIR)/libqat_s.so $(LIBDIR)/libusdm_drv_s.so
 QATCFLAGS:=
 QATLDLIBS:= $(QATLIBS)
@@ -36,6 +38,7 @@ QPLTAG   := v1.9.0
 QPLPREFIX:= $(abspath $(QPLBUILD)/install)
 QPLINC   := $(QPLPREFIX)/include
 QPLLIBS  := $(LIBDIR)/libqpl.so
+QPLHEADER:= $(QPLINC)/qpl/qpl.h
 RPATH    := -Wl,-rpath,$(abspath $(LIBDIR)) -Wl,-rpath,$(abspath .)
 
 CC       := gcc
@@ -90,19 +93,35 @@ $(LIBDIR)/libqat_s.so:
 	mkdir -p $(QATBUILD)
 	mkdir -p $(LIBDIR)
 	cd $(QATBUILD) \
-	    && wget -q "$(QATURL)" \
-	    && tar xf *.tar.gz \
+	    && if [ ! -f "$(QATARCHIVE)" ]; then \
+	        if [ -f "$(BUILD_DEPS)/$(QATARCHIVE)" ]; then \
+	            cp "$(BUILD_DEPS)/$(QATARCHIVE)" .; \
+	        elif [ "$${IAXL_OFFLINE:-0}" = 1 ]; then \
+	            echo "Missing offline QAT archive in $(BUILD_DEPS)" >&2; exit 1; \
+	        else \
+	            wget -q "$(QATURL)"; \
+	        fi; \
+	    fi \
+	    && tar xf "$(QATARCHIVE)" \
 	    && export KERNEL_SOURCE_ROOT=$$(ls -dv /usr/src/linux-headers-*-generic | tail -n 1) \
 	    && ./configure \
 	    && sed "s/^ALL_TARGETS\ *=\ *.*/ALL_TARGETS = lac_user/g" -i quickassist/Makefile \
 	    && make -j"$$(nproc)" quickassist-all
 	cp -a $(QATBUILD)/build/*.so $(LIBDIR)/
 
-$(LIBDIR)/libqpl.so:
+$(QPLLIBS) $(QPLHEADER) &:
 	mkdir -p $(QPLBUILD)
 	mkdir -p $(LIBDIR)
 	cd $(QPLBUILD) \
-	    && [ -d qpl ] || git clone -b $(QPLTAG) --depth 1 $(QPLREPO) qpl
+	    && if [ ! -d qpl ]; then \
+	        if [ -d "$(BUILD_DEPS)/qpl" ]; then \
+	            cp -a "$(BUILD_DEPS)/qpl" qpl; \
+	        elif [ "$${IAXL_OFFLINE:-0}" = 1 ]; then \
+	            echo "Missing offline QPL source in $(BUILD_DEPS)" >&2; exit 1; \
+	        else \
+	            git clone -b $(QPLTAG) --depth 1 $(QPLREPO) qpl; \
+	        fi; \
+	    fi
 	cd $(QPLBUILD)/qpl \
 	    && cmake -B build -DCMAKE_BUILD_TYPE=Release -DQPL_LIBRARY_TYPE=SHARED \
 	        -DQPL_BUILD_TESTS=OFF -DQPL_BUILD_EXAMPLES=OFF \
@@ -149,7 +168,7 @@ test-zip-throughput: zip_throughput_test
 
 qat-userspace: $(QATLIBS)
 
-qpl-userspace: $(QPLLIBS)
+qpl-userspace: $(QPLLIBS) $(QPLHEADER)
 
 
 test: $(TEST_TARGETS)

@@ -92,6 +92,34 @@ KVShrink 是基于 IAXL `KVStore` 的 vLLM V1 KV connector。完成 `setvars.sh`
 pip install -e . --verbose --no-build-isolation
 ```
 
+### 离线环境编译
+
+在**联网机器**上先运行 `./start.sh` 构建最新 dev 镜像。镜像会预装 Python/系统依赖和 UCX、NIXL 等库，并保存编译 QAT、QPL 所需的库和头文件。可以通过如下步骤将镜像带到目标机器，例如：
+
+```bash
+docker save -o vllm-iaxl-dev.tar vllm-iaxl-dev:latest
+# 在离线机器上导入镜像（镜像也已包含 vLLM 基础镜像中的内容）
+docker load -i vllm-iaxl-dev.tar
+```
+
+在离线机器的工程根目录启动容器，跳过镜像构建和进入容器时的自动安装：
+
+```bash
+./start.sh --offline
+# 在容器内，从挂载的工程目录编译安装；禁止 pip 访问包索引
+pip install -e . --verbose --no-build-isolation --no-index --no-deps
+```
+
+修改源码后可在容器中重复上述 `pip install` 命令。离线环境宿主机需要通过手动操作配置 GPU 驱动、Docker 运行时和QAT 驱动。具体使用的模型也需在本地可用（可通过 `MODEL` 指向本地模型目录），运行服务不要依赖在线拉取模型。
+
+启用 IAA 或 DSA 时，需要特别注意宿主机硬件配置：
+
+- IAA 的 QPL 源码及DSA的相关库已预置在 dev 镜像，离线编译无需额外下载，但运行前必须在宿主机启用 IAA 设备或DSA设备及其用户态工作队列，确保 `/sys/bus/dsa/devices/iax*` 和对应的 `/dev/iax/` 设备可见；仅设置 `IAXL_IAA_ZIP_ENABLE=1`或 `IAXL_DSA_GD_ENABLE=1`不会自动配置设备。
+- CUDA 下的 DSA/GDRCopy 代码会随源码一起编译，dev 镜像中已有 `gdrapi.h`、`libgdrapi.so` 和 `accel-config`，但宿主机需安装与其内核及 CUDA 版本匹配的 GDRCopy 驱动、加载 `gdrdrv` 并暴露 `/dev/gdrdrv`。在有外网访问条件时时，可以执行`tools/install_gdr_driver.sh` 脚本通过执行 `apt-get` 和 `wget`来安装相关的驱动，但对于离线宿主机必须提前手动准备并安装对应的驱动包及依赖。
+- 在导入 dev 镜像后、启动服务前，可在宿主机运行 `./tools/setup_dsa_cnt.sh --offline`，使用镜像内的 `accel-config` 配置 DSA 工作队列。随后设置 `IAXL_DSA_GD_ENABLE=1` 启动容器；`setvars.sh` 会检查与 GPU 对应的 DSA 用户态工作队列是否已启用。
+
+例如要同时使用 IAA 压缩时，在宿主机运行 `IAXL_QAT_ZIP_ENABLE=1 IAXL_IAA_ZIP_ENABLE=1 ./start.sh --offline`；同时启用 DSA 时再添加 `IAXL_DSA_GD_ENABLE=1`。物理设备配置须在执行 `start.sh` 前完成。
+
 完成安装后，在容器内启动服务：
 
 ```bash

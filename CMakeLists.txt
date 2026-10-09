@@ -123,7 +123,7 @@ else()
 endif()
 
 set(QPL_PREFIX "${CMAKE_SOURCE_DIR}/_build/qpl/install")
-set(QPL_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqpl.so")
+set(QPL_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqpl.so" "${QPL_PREFIX}/include/qpl/qpl.h")
 add_custom_command(
     OUTPUT ${QPL_USERSPACE_LIBS}
     COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"

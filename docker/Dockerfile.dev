@@ -20,6 +20,12 @@ COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+# Keep build inputs outside the bind-mounted source tree for offline rebuilds.
+RUN mkdir -p /opt/iaxl-build-deps \
+    && wget -q -O /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz \
+        https://downloadmirror.intel.com/921047/QAT20.L.1.2.30-00178.tar.gz \
+    && git clone --depth 1 --branch v1.9.0 https://github.com/intel/qpl.git /opt/iaxl-build-deps/qpl
+
 # Own prefix: Ubuntu's libucx0 1.12 (a libboost-mpi/openmpi dependency) lives in
 # /usr/lib/x86_64-linux-gnu and would shadow a UCX installed under /usr at runtime.
 # ld.so.conf.d/ucx.conf sorts before x86_64-linux-gnu.conf, so this UCX wins.
