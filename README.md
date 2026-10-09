@@ -94,34 +94,6 @@ Inside the container, optionally install the package with pip:
 pip install -e . --verbose --no-build-isolation
 ```
 
-### Offline Builds
-
-On a machine with internet access, run `./start.sh` to build the latest dev image. The image includes Python and system dependencies, libraries such as UCX and NIXL, and the libraries and headers needed to build QAT and QPL. Transfer the image to the target machine, for example:
-
-```bash
-docker save -o vllm-iaxl-dev.tar vllm-iaxl-dev:latest
-# On the offline machine, import the image, which also contains the vLLM base image
-docker load -i vllm-iaxl-dev.tar
-```
-
-From the project root on the offline machine, start the container while skipping the image build and automatic installation on container entry:
-
-```bash
-./start.sh --offline
-# Inside the container, build and install from the mounted project directory without accessing the package index
-pip install -e . --verbose --no-build-isolation --no-index --no-deps
-```
-
-Repeat the `pip install` command after modifying the source. On the offline host, configure the GPU drivers, Docker runtime, and QAT driver manually. The model must also be available locally (set `MODEL` to its local directory if needed); serving must not depend on downloading the model.
-
-When enabling IAA or DSA, pay special attention to the host hardware configuration:
-
-- The dev image includes the IAA QPL source and libraries for DSA, so offline builds need no additional downloads. Before running, enable the IAA or DSA devices and their user-space work queues on the host, and ensure `/sys/bus/dsa/devices/iax*` and the corresponding `/dev/iax/` devices are visible. Setting `IAXL_IAA_ZIP_ENABLE=1` or `IAXL_DSA_GD_ENABLE=1` alone does not configure the devices.
-- CUDA DSA/GDRCopy code is built with the source. The dev image includes `gdrapi.h`, `libgdrapi.so`, and `accel-config`, but the host must have a GDRCopy driver matching its kernel and CUDA versions, with `gdrdrv` loaded and `/dev/gdrdrv` exposed. With internet access, `tools/install_gdr_driver.sh` can install the driver using `apt-get` and `wget`; offline hosts must have the required driver packages and dependencies prepared and installed manually.
-- After importing the dev image and before starting the service, run `./tools/setup_dsa_cnt.sh --offline` on the host to configure DSA work queues with the image's `accel-config`. Then start the container with `IAXL_DSA_GD_ENABLE=1`; `setvars.sh` checks that the DSA user-space work queues corresponding to the GPUs are enabled.
-
-For example, to enable IAA compression, run `IAXL_QAT_ZIP_ENABLE=1 IAXL_IAA_ZIP_ENABLE=1 ./start.sh --offline` on the host. Add `IAXL_DSA_GD_ENABLE=1` to enable DSA as well. Configure physical devices before running `start.sh`.
-
 Start the service inside the container:
 
 ```bash
