@@ -116,7 +116,8 @@ int cpu_zip_decompress(int slot, void *src, int len) {
     return 0;
 }
 
-int cpu_zip_wait(int slot, void **dest, int *len) {
+int cpu_zip_wait(int slot, void **dest, int *len, int non_block) {
+    (void)non_block;
     if (!g_slots || slot < 0 || slot >= g_slot_count || !g_slots[slot].ready)
         return -1;
 

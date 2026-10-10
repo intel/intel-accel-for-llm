@@ -4,7 +4,8 @@
 // QAT, IAA and CPU workers share one task pool. Each worker claims another item when a request
 // completes, so the faster backend naturally processes more of the batch. QAT and IAA workers keep
 // multiple asynchronous requests in flight, while CPU workers run one synchronous raw-DEFLATE
-// request each.
+// request each. Up to IAXL_OMP_THREAD_NUM threads (see parallel.h) drive the workers, each polling
+// the slots of its workers without blocking, so a single thread can drive them all.
 //
 // QAT and CPU streams are mutually compatible, IAA streams are compatible with neither, so a
 // compressed block records in its header whether IAA produced it and decompression only hands it
@@ -12,7 +13,7 @@
 
 #include <torch/extension.h>
 
-#include <omp.h>
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cstdint>
@@ -23,14 +24,13 @@
 
 #include "env.h"
 #include "iaxl_common.h"
+#include "parallel.h"
 #include "cpu_zip.h"
 #include "iaa_zip.h"
 #include "qat_zip.h"
 #include "data_shuffle.h"
 #include "lossy.h"
 #include "kv_zip.h"
-
-#define OMP_SCHEDULE dynamic
 
 // Top bit of the header's payload length field, set when IAA produced the stream.
 #define KV_ZIP_IAA_FLAG (1u << 31)
@@ -43,7 +43,7 @@ enum class ZipBackend { QAT, IAA, CPU };
 struct ZipOps {
     int (*compress)(int slot, void *src, int len);
     int (*decompress)(int slot, void *src, int len);
-    int (*wait)(int slot, void **dest, int *len);
+    int (*wait)(int slot, void **dest, int *len, int non_block);
     int (*src_cap)(void);
     int (*queue_depth)(void);
 };
@@ -82,56 +82,65 @@ static void zip_pipeline(Next &&get_next, Submit &&submit, Complete &&complete) 
                "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
     IAXL_CHECK(iaa_workers == 0 || iaa_workers <= iaa_zip_num_slots() / iaa_zip_queue_depth(),
                "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
-    IAXL_CHECK(worker_count == envs.IAXL_OMP_THREAD_NUM,
-               "kv_zip: compression workers do not match OMP_NUM_THREADS");
+    const int threads = std::min(envs.IAXL_OMP_THREAD_NUM, worker_count);
 
-#pragma omp parallel num_threads(worker_count)
-    {
-        const int t = omp_get_thread_num();
-        ZipBackend backend = ZipBackend::CPU;
-        int first = qat_workers + iaa_workers;
-        if (t < qat_workers) {
-            backend = ZipBackend::QAT;
-            first = 0;
-        } else if (t < qat_workers + iaa_workers) {
-            backend = ZipBackend::IAA;
-            first = qat_workers;
-        }
-        const int depth = ops(backend).queue_depth();
-        const int base = (t - first) * depth;
-        IAXL_CHECK(omp_get_num_threads() == worker_count,
-                   "kv_zip: OpenMP did not create the configured worker team");
-
-        int active_depth = 0;
-        std::vector<size_t> slot_item(static_cast<size_t>(depth));
-        for (int k = 0; k < depth; k++) {
-            const size_t i = get_next(backend);
-            if (i == kNoTask)
-                break;
-            submit(backend, base + k, i);
-            slot_item[k] = i;
-            active_depth++;
-        }
-
-        int in_flight = active_depth;
-        bool draining = false;
-        for (int s = 0; in_flight > 0; s = (s + 1) % active_depth) {
-            void *out;
-            int out_len;
-            const int status = ops(backend).wait(base + s, &out, &out_len);
-            IAXL_CHECK(status == 0, "kv_zip: zip wait failed");
-            complete(backend, slot_item[s], out, out_len);
-
-            const size_t i = draining ? kNoTask : get_next(backend);
-            if (i != kNoTask) {
-                submit(backend, base + s, i);
-                slot_item[s] = i;
-            } else {
-                draining = true;
-                in_flight--;
+    // Thread `tid` owns workers tid, tid + threads, ..., so each backend instance stays on one
+    // thread while the backends are spread across all of them.
+    auto drive = [&](int tid) {
+        struct Lane {
+            ZipBackend backend;
+            int slot;
+            size_t item;
+        };
+        std::vector<Lane> lanes;
+        for (int w = tid; w < worker_count; w += threads) {
+            ZipBackend backend = ZipBackend::CPU;
+            int first = qat_workers + iaa_workers;
+            if (w < qat_workers) {
+                backend = ZipBackend::QAT;
+                first = 0;
+            } else if (w < qat_workers + iaa_workers) {
+                backend = ZipBackend::IAA;
+                first = qat_workers;
+            }
+            const int depth = ops(backend).queue_depth();
+            for (int k = 0; k < depth; k++) {
+                const size_t i = get_next(backend);
+                if (i == kNoTask)
+                    break;
+                const int slot = (w - first) * depth + k;
+                submit(backend, slot, i);
+                lanes.push_back({backend, slot, i});
             }
         }
-    }
+
+        while (!lanes.empty()) {
+            for (size_t s = 0; s < lanes.size();) {
+                Lane &lane = lanes[s];
+                void *out;
+                int out_len;
+                const int status =
+                    ops(lane.backend).wait(lane.slot, &out, &out_len, /*non_block=*/1);
+                if (status == IAXL_ZIP_PENDING) {
+                    s++;
+                    continue;
+                }
+                IAXL_CHECK(status == 0, "kv_zip: zip wait failed");
+                complete(lane.backend, lane.item, out, out_len);
+
+                lane.item = get_next(lane.backend);
+                if (lane.item == kNoTask) {
+                    lane = lanes.back();
+                    lanes.pop_back();
+                    continue;
+                }
+                submit(lane.backend, lane.slot, lane.item);
+                s++;
+            }
+        }
+    };
+
+    parallel::run_threads(threads, drive);
 }
 
 void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
@@ -140,8 +149,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     const size_t n = tensors.size();
 
     if (!compress || !envs.IAXL_KV_COMPRESSION) {
-#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
-        for (size_t i = 0; i < n; i++) {
+        parallel::parallel_for(n, [&](size_t i) {
             const auto &tensor = tensors[i];
             IAXL_CHECK(tensor.is_contiguous() && tensor.device().type() == c10::DeviceType::CPU,
                        "kv_zip: tensor must be a contiguous CPU tensor");
@@ -154,7 +162,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
             out_bufs[i] = buffer;
             out_sizes[i] = sizeof(int) * 2 + nbytes;
             orig_sizes[i] = nbytes;
-        }
+        });
         return;
     }
 
@@ -217,23 +225,20 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
     };
 
     // IAA-produced blocks must go back to IAA, everything else to QAT/CPU.
-    std::vector<size_t> iaa_items, other_items;
+    std::vector<size_t> raw_items, iaa_items, other_items;
     for (size_t i = 0; i < n; i++) {
         const int *header = reinterpret_cast<const int *>(data_ptrs[i]);
-        if (header[1] == 0)
+        if (header[1] == 0) {
+            raw_items.push_back(i);
             continue;
+        }
         const uint32_t encoded = static_cast<uint32_t>(header[0]);
         IAXL_CHECK((encoded & ~KV_ZIP_IAA_FLAG) != 0,
                    "kv_zip: invalid compressed payload length");
         ((encoded & KV_ZIP_IAA_FLAG) ? iaa_items : other_items).push_back(i);
     }
 
-#pragma omp parallel for schedule(OMP_SCHEDULE) num_threads(envs.IAXL_OMP_THREAD_NUM)
-    for (size_t i = 0; i < n; i++) {
-        const int *header = reinterpret_cast<const int *>(data_ptrs[i]);
-        if (header[1] == 0)
-            copy_raw(i);
-    }
+    parallel::parallel_for(raw_items.size(), [&](size_t k) { copy_raw(raw_items[k]); });
 
     if (iaa_items.empty() && other_items.empty())
         return;

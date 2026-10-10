@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// Returned by a zip backend's non-blocking wait while the request is still in flight.
+#define IAXL_ZIP_PENDING 1
+
 #define IAXL_CHECK(condition, message)                                                             \
     do {                                                                                           \
         if (!(condition)) {                                                                        \

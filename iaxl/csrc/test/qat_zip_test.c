@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
 
     void *cptr;
     int clen;
-    if (qat_zip_compress(0, src, block) != 0 || qat_zip_wait(0, &cptr, &clen) != 0) {
+    if (qat_zip_compress(0, src, block) != 0 || qat_zip_wait(0, &cptr, &clen, 0) != 0) {
         fprintf(stderr, "[verify] compress failed\n");
         free(src);
         free(data);
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
 
     void *dptr;
     int dlen;
-    if (qat_zip_decompress(0, cblock, cblock_len) != 0 || qat_zip_wait(0, &dptr, &dlen) != 0) {
+    if (qat_zip_decompress(0, cblock, cblock_len) != 0 || qat_zip_wait(0, &dptr, &dlen, 0) != 0) {
         fprintf(stderr, "[verify] decompress failed\n");
         free(cblock);
         free(src);
@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
             void *p;
             int l;
             qat_zip_compress(slot, src, block);
-            qat_zip_wait(slot, &p, &l);
+            qat_zip_wait(slot, &p, &l, 0);
         }
 
     double t0 = now_sec();
@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
         while (completed < PERF_ITERS) {
             void *p;
             int l;
-            qat_zip_wait(base + s, &p, &l);
+            qat_zip_wait(base + s, &p, &l, 0);
             completed++;
             if (submitted < PERF_ITERS) {
                 qat_zip_compress(base + s, src, block);
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
         while (completed < PERF_ITERS) {
             void *p;
             int l;
-            qat_zip_wait(base + s, &p, &l);
+            qat_zip_wait(base + s, &p, &l, 0);
             completed++;
             if (submitted < PERF_ITERS) {
                 qat_zip_decompress(base + s, cblock, cblock_len);

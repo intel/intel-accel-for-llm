@@ -23,7 +23,8 @@ int cpu_zip_iaa_decodable(void);
 int cpu_zip_compress(int slot, void *src, int len);
 int cpu_zip_decompress(int slot, void *src, int len);
 
-int cpu_zip_wait(int slot, void **dest, int *len);
+// Requests finish inside submit, so non_block is accepted only to match the QAT/IAA API.
+int cpu_zip_wait(int slot, void **dest, int *len, int non_block);
 
 void cpu_zip_shutdown(void);
 

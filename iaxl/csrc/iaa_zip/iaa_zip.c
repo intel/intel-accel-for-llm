@@ -36,6 +36,7 @@ typedef struct {
     int submitted;
     int compress;
     uint32_t in_len;
+    int fault_replays;
 } IaaSlot;
 
 typedef struct {
@@ -351,23 +352,27 @@ static int submit_slot(int slot, int compress, void *src, int len) {
     }
 
     sl->submitted = 1;
+    sl->fault_replays = 0;
     return 0;
 }
 
 int iaa_zip_compress(int slot, void *src, int len) { return submit_slot(slot, 1, src, len); }
 int iaa_zip_decompress(int slot, void *src, int len) { return submit_slot(slot, 0, src, len); }
 
-int iaa_zip_wait(int slot, void **dest, int *len) {
+int iaa_zip_wait(int slot, void **dest, int *len, int non_block) {
     IaaSlot *sl = resolve_slot(slot);
     if (!sl || !sl->submitted)
         return -1;
 
     qpl_status status;
-    for (int attempt = 0;; attempt++) {
-        while ((status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED)
-            ;
-        if (!is_page_fault(status) || attempt >= PAGE_FAULT_RETRY_LIMIT)
+    for (;;) {
+        while ((status = qpl_check_job(sl->job)) == QPL_STS_BEING_PROCESSED) {
+            if (non_block)
+                return IAXL_ZIP_PENDING;
+        }
+        if (!is_page_fault(status) || sl->fault_replays >= PAGE_FAULT_RETRY_LIMIT)
             break;
+        sl->fault_replays++;
         touch_slot_pages(sl);
         prepare_job(sl);
         status = submit_job(sl);

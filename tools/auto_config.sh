@@ -496,12 +496,12 @@ validate_omp_config() {
             return 1
         fi
     elif ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
-        ((IAXL_OMP_THREAD_NUM != IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
-        echo "ERROR: IAXL_OMP_THREAD_NUM must equal IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
+        ((IAXL_OMP_THREAD_NUM > IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
+        echo "ERROR: IAXL_OMP_THREAD_NUM must be between 1 and IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
         return 1
     fi
     if ((IAXL_OMP_THREAD_NUM + IAXL_RESERVED_CPU_NUM > min_rank_cpu_count)); then
-        echo "ERROR: QAT ($IAXL_QAT_INSTANCE_NUM) + IAA ($IAXL_IAA_INSTANCE_NUM) + CPU zip ($IAXL_CPU_ZIP_THREADS) + reserved " \
+        echo "ERROR: IAXL_OMP_THREAD_NUM ($IAXL_OMP_THREAD_NUM) + reserved " \
             "($IAXL_RESERVED_CPU_NUM) exceeds the smallest rank CPU allocation ($min_rank_cpu_count)" >&2
         return 1
     fi
@@ -520,5 +520,6 @@ validate_omp_config() {
         "  IAXL_IAA_INSTANCE_NUM=$IAXL_IAA_INSTANCE_NUM" \
         "  IAXL_CPU_ZIP_THREADS=$IAXL_CPU_ZIP_THREADS" \
         "  IAXL_RESERVED_CPU_NUM=$IAXL_RESERVED_CPU_NUM" \
-        "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM"
+        "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM" \
+        "  IAXL_USE_OMP=$IAXL_USE_OMP"
 }

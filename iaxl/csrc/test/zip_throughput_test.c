@@ -51,7 +51,7 @@ static int submit(Backend b, int slot, void *src, int len) {
 }
 
 static int wait_one(Backend b, int slot, void **dst, int *len) {
-    return b == BACKEND_QAT ? qat_zip_wait(slot, dst, len) : iaa_zip_wait(slot, dst, len);
+    return b == BACKEND_QAT ? qat_zip_wait(slot, dst, len, 0) : iaa_zip_wait(slot, dst, len, 0);
 }
 
 struct Config {

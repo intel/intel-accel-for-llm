@@ -59,6 +59,7 @@ struct Envs {
     int IAXL_IAA_ZIP_QUEUE_DEPTH;
     int IAXL_CPU_ZIP_THREADS;
     int IAXL_OMP_THREAD_NUM;
+    bool IAXL_USE_OMP;
 
     bool IAXL_KV_COMPRESSION;
     int IAXL_KV_LOSSY_TRUNC;

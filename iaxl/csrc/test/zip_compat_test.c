@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[compat] QAT compression submission failed: %d\n", rc);
         goto out;
     }
-    rc = qat_zip_wait(0, &output, &output_len);
+    rc = qat_zip_wait(0, &output, &output_len, 0);
     if (rc != 0 || output_len <= 0) {
         fprintf(stderr, "[compat] QAT compression completion failed: status=%d length=%d\n", rc,
                 output_len);
@@ -121,14 +121,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[compat] QAT compress -> CPU decompress rejected: %d\n", rc);
         failures++;
     } else {
-        rc = cpu_zip_wait(0, &output, &output_len);
+        rc = cpu_zip_wait(0, &output, &output_len, 0);
         if (rc != 0 ||
             verify("QAT compress -> CPU decompress", input, input_len, output, output_len) != 0)
             failures++;
     }
 
     rc = cpu_zip_compress(0, input, input_len);
-    if (rc != 0 || (rc = cpu_zip_wait(0, &output, &output_len)) != 0 || output_len <= 0) {
+    if (rc != 0 || (rc = cpu_zip_wait(0, &output, &output_len, 0)) != 0 || output_len <= 0) {
         fprintf(stderr, "[compat] CPU compression failed: status=%d length=%d\n", rc, output_len);
         goto out;
     }
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[compat] CPU compress -> QAT decompress submission failed: %d\n", rc);
         failures++;
     } else {
-        rc = qat_zip_wait(0, &output, &output_len);
+        rc = qat_zip_wait(0, &output, &output_len, 0);
         if (rc != 0) {
             fprintf(stderr, "[compat] CPU compress -> QAT decompress completion failed: %d\n", rc);
             failures++;
@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
     }
 
     rc = iaa_zip_compress(0, input, input_len);
-    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 || output_len <= 0) {
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len, 0)) != 0 || output_len <= 0) {
         fprintf(stderr, "[compat] IAA compression failed: status=%d length=%d\n", rc, output_len);
         goto out;
     }
@@ -171,14 +171,14 @@ int main(int argc, char **argv) {
     int iaa_len = output_len;
 
     rc = cpu_zip_decompress(0, iaa_data, iaa_len);
-    if (rc != 0 || (rc = cpu_zip_wait(0, &output, &output_len)) != 0 ||
+    if (rc != 0 || (rc = cpu_zip_wait(0, &output, &output_len, 0)) != 0 ||
         verify("IAA compress -> CPU decompress", input, input_len, output, output_len) != 0) {
         fprintf(stderr, "[compat] IAA compress -> CPU decompress failed: %d\n", rc);
         failures++;
     }
 
     rc = qat_zip_decompress(0, iaa_data, iaa_len);
-    if (rc != 0 || (rc = qat_zip_wait(0, &output, &output_len)) != 0 ||
+    if (rc != 0 || (rc = qat_zip_wait(0, &output, &output_len, 0)) != 0 ||
         verify("IAA compress -> QAT decompress", input, input_len, output, output_len) != 0) {
         fprintf(stderr, "[compat] IAA compress -> QAT decompress failed: %d\n", rc);
         failures++;
@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
     // The invariant kv_zip is built on: QAT streams must never reach an IAA worker.
     rc = iaa_zip_decompress(0, qat_data, qat_len);
     if (rc == 0)
-        rc = iaa_zip_wait(0, &output, &output_len);
+        rc = iaa_zip_wait(0, &output, &output_len, 0);
     if (rc == 0) {
         fprintf(stderr, "[compat] IAA unexpectedly decoded a QAT stream\n");
         failures++;
@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
 
     rc = iaa_zip_decompress(0, cpu_data, cpu_len);
     if (rc == 0)
-        rc = iaa_zip_wait(0, &output, &output_len);
+        rc = iaa_zip_wait(0, &output, &output_len, 0);
     if (rc == 0) {
         fprintf(stderr, "[compat] IAA unexpectedly decoded a 32 KB-window CPU stream\n");
         failures++;
@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
     envs.IAXL_QAT_ZIP_ENABLE = false;
     rc = cpu_zip_compress(0, input, input_len);
     if (rc == 0)
-        rc = cpu_zip_wait(0, &output, &output_len);
+        rc = cpu_zip_wait(0, &output, &output_len, 0);
     envs.IAXL_QAT_ZIP_ENABLE = true;
     if (rc != 0 || output_len <= 0) {
         fprintf(stderr, "[compat] 4 KB-window CPU compression failed: %d\n", rc);
@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     int cpu4k_len = output_len;
 
     rc = iaa_zip_decompress(0, cpu4k_data, cpu4k_len);
-    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 ||
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len, 0)) != 0 ||
         verify("CPU compress (4 KB window) -> IAA decompress", input, input_len, output,
                output_len) != 0) {
         fprintf(stderr, "[compat] 4 KB CPU compress -> IAA decompress failed: %d\n", rc);
@@ -257,13 +257,13 @@ int main(int argc, char **argv) {
         goto out;
     }
     rc = qat_zip_decompress(0, raw_data, raw_len);
-    if (rc != 0 || (rc = qat_zip_wait(0, &output, &output_len)) != 0 ||
+    if (rc != 0 || (rc = qat_zip_wait(0, &output, &output_len, 0)) != 0 ||
         verify("raw zlib deflate -> QAT decompress", input, input_len, output, output_len) != 0) {
         fprintf(stderr, "[compat] raw zlib -> QAT failed: %d\n", rc);
         goto out;
     }
     rc = iaa_zip_decompress(0, raw_data, raw_len);
-    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 ||
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len, 0)) != 0 ||
         verify("raw zlib deflate -> IAA decompress", input, input_len, output, output_len) != 0) {
         fprintf(stderr, "[compat] raw zlib -> IAA failed: %d\n", rc);
         goto out;

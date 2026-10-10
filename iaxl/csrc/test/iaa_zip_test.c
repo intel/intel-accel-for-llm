@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     for (int s = 0; s < slots; s++) {
         void *out;
         int len;
-        if (iaa_zip_wait(s, &out, &len) != 0 || len <= 0) {
+        if (iaa_zip_wait(s, &out, &len, 0) != 0 || len <= 0) {
             fprintf(stderr, "[test] compression failed on slot %d\n", s);
             goto out;
         }
@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
     for (int s = 0; s < slots; s++) {
         void *out;
         int len;
-        if (iaa_zip_wait(s, &out, &len) != 0 || len != block ||
+        if (iaa_zip_wait(s, &out, &len, 0) != 0 || len != block ||
             memcmp(out, input, (size_t)block) != 0) {
             fprintf(stderr, "[test] decompression mismatch on slot %d\n", s);
             goto out;

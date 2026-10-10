@@ -105,10 +105,12 @@ static int submit_op(Instance *d, int si, int compress, void *src, uint32_t src_
     return (s == CPA_STATUS_SUCCESS) ? 0 : -1;
 }
 
-static int wait_op(Instance *d, int si, uint32_t *produced) {
+static int wait_op(Instance *d, int si, int non_block, uint32_t *produced) {
     Slot *sl = &d->slot[si];
     while (!sl->done) {
         icp_sal_DcPollInstance(d->inst, 0);
+        if (non_block && !sl->done)
+            return IAXL_ZIP_PENDING;
     }
     if (sl->res.status != CPA_DC_OK)
         return -1;
@@ -329,7 +331,7 @@ static int submit_slot(int slot, int compress, void *src, int len) {
 int qat_zip_compress(int slot, void *src, int len) { return submit_slot(slot, 1, src, len); }
 int qat_zip_decompress(int slot, void *src, int len) { return submit_slot(slot, 0, src, len); }
 
-int qat_zip_wait(int slot, void **dest, int *len) {
+int qat_zip_wait(int slot, void **dest, int *len, int non_block) {
     if (slot < 0 || slot >= g_inst_count * g_queue_depth)
         return -1;
 
@@ -337,8 +339,9 @@ int qat_zip_wait(int slot, void **dest, int *len) {
     int si = slot % g_queue_depth;
 
     uint32_t produced = 0;
-    if (wait_op(in, si, &produced) != 0)
-        return -1;
+    const int status = wait_op(in, si, non_block, &produced);
+    if (status != 0)
+        return status;
     if (dest)
         *dest = in->slot[si].out;
     if (len)

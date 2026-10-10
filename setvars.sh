@@ -123,7 +123,8 @@ case "${IAXL_CPU_ZIP_ENABLE,,}" in
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
 if env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
-    export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+    # Defaults to one thread per zip worker; fewer threads each poll several workers (1 = caller only).
+    export IAXL_OMP_THREAD_NUM=${IAXL_OMP_THREAD_NUM:-$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM")} || return 1 2>/dev/null || exit 1
 else
     # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.
     if [[ -z "$IAXL_OMP_THREAD_NUM" ]]; then
@@ -135,6 +136,7 @@ fi
 export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
 export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
 export OMP_MAX_ACTIVE_LEVELS=2
+export IAXL_USE_OMP=${IAXL_USE_OMP:-1} # parallel.h runs on OpenMP (1) or iaxl's own thread pool (0), which stays off the OpenMP runtime vLLM and torch share
 validate_omp_config "$MIN_RANK_CPU_COUNT" || return 1 2>/dev/null || exit 1
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------

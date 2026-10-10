@@ -25,9 +25,9 @@ int main(void) {
 
     void *compressed;
     int compressed_len;
-    if (cpu_zip_wait(0, NULL, NULL) == 0 ||
+    if (cpu_zip_wait(0, NULL, NULL, 0) == 0 ||
         cpu_zip_compress(0, (void *)input, (int)sizeof(input)) != 0 ||
-        cpu_zip_wait(0, &compressed, &compressed_len) != 0) {
+        cpu_zip_wait(0, &compressed, &compressed_len, 0) != 0) {
         fprintf(stderr, "[test] synchronous compression failed\n");
         cpu_zip_shutdown();
         return 1;
@@ -43,7 +43,7 @@ int main(void) {
     void *decompressed;
     int decompressed_len;
     if (cpu_zip_decompress(1, compressed_copy, compressed_len) != 0 ||
-        cpu_zip_wait(1, &decompressed, &decompressed_len) != 0 ||
+        cpu_zip_wait(1, &decompressed, &decompressed_len, 0) != 0 ||
         decompressed_len != (int)sizeof(input) ||
         memcmp(decompressed, input, sizeof(input)) != 0) {
         fprintf(stderr, "[test] synchronous decompression failed\n");
