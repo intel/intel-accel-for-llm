@@ -11,8 +11,6 @@ INCDIR   := include
 
 
 LIBDIR   := ../../_lib
-QATBUILD := ../../_build/qat
-QATURL   := https://downloadmirror.intel.com/921047/QAT20.L.1.2.30-00178.tar.gz
 # IAXL_QATLIB (optional): oot (default when unset/empty) = build the out-of-tree
 # QAT20 package into _lib, intree = system qatlib for the in-tree kernel driver.
 QATMODE  := $(or $(strip $(IAXL_QATLIB)),oot)
@@ -24,20 +22,15 @@ QATLIBS  :=
 QATCFLAGS:= -I$(shell pkg-config --variable=includedir qatlib)/qat
 QATLDLIBS:= $(shell pkg-config --libs-only-L libqat libusdm) -lqat -lusdm
 else ifeq ($(QATMODE),oot)
-QATLIBS  := $(LIBDIR)/libqat_s.so $(LIBDIR)/libusdm_drv_s.so
-QATCFLAGS:=
-QATLDLIBS:= $(QATLIBS)
+QATLIBS  := -lqat_s -lusdm_drv_s
+QATCFLAGS:= -I/usr/local/include/qat -I/usr/local/include/qat/dc
+QATLDLIBS:= -L/usr/local/lib $(QATLIBS)
 else
 $(error IAXL_QATLIB must be oot or intree)
 endif
-QPLBUILD := ../../_build/qpl
-QPLREPO  := https://github.com/intel/qpl.git
-QPLTAG   := v1.9.0
-QPLPREFIX:= $(abspath $(QPLBUILD)/install)
-QPLINC   := $(QPLPREFIX)/include
-QPLLIBS  := $(LIBDIR)/libqpl.so
-RPATH    := -Wl,-rpath,$(abspath $(LIBDIR)) -Wl,-rpath,$(abspath .)
-
+QPLLIBS  := -lqpl
+QPLINC   := /usr/local/include
+RPATH    := -Wl,-rpath,/usr/local/lib -Wl,-rpath,$(abspath $(LIBDIR)) -Wl,-rpath,$(abspath .)
 CC       := gcc
 CXX      := g++
 CFLAGS   := -O2 -g -Wall -I$(INCDIR)
@@ -50,9 +43,6 @@ ARGS     ?=
 qat_zip_SRCS   := qat_zip/qat_zip.c common/envs.c
 qat_zip_CFLAGS := $(QATCFLAGS)
 qat_zip_LDLIBS := $(QATLDLIBS)
-qat_zip_DEPS   := $(QATLIBS)
-
-
 cpu_zip_SRCS   := cpu_zip/cpu_zip.c common/envs.c
 cpu_zip_LDLIBS := -lz
 
@@ -60,7 +50,6 @@ cpu_zip_LDLIBS := -lz
 iaa_zip_SRCS   := iaa_zip/iaa_zip.c common/envs.c
 iaa_zip_CFLAGS := -I$(QPLINC)
 iaa_zip_LDLIBS := $(QPLLIBS) -ldl
-iaa_zip_DEPS   := $(QPLLIBS)
 
 
 dsa_gd_SRCS   := dsa_gd/dsa_gd.c dsa_gd/dsa_memcpy.c common/envs.c
@@ -79,37 +68,9 @@ TEST_TARGETS += test-zip-compat
 TESTS        += zip_throughput_test
 TEST_TARGETS += test-zip-throughput
 
-.PHONY: all test clean qat-userspace qpl-userspace $(TEST_TARGETS)
+.PHONY: all test clean $(TEST_TARGETS)
 
 all: $(LIBS) $(TESTS)
-
-
-$(LIBDIR)/libusdm_drv_s.so: $(LIBDIR)/libqat_s.so
-
-$(LIBDIR)/libqat_s.so:
-	mkdir -p $(QATBUILD)
-	mkdir -p $(LIBDIR)
-	cd $(QATBUILD) \
-	    && wget -q "$(QATURL)" \
-	    && tar xf *.tar.gz \
-	    && export KERNEL_SOURCE_ROOT=$$(ls -dv /usr/src/linux-headers-*-generic | tail -n 1) \
-	    && ./configure \
-	    && sed "s/^ALL_TARGETS\ *=\ *.*/ALL_TARGETS = lac_user/g" -i quickassist/Makefile \
-	    && make -j"$$(nproc)" quickassist-all
-	cp -a $(QATBUILD)/build/*.so $(LIBDIR)/
-
-$(LIBDIR)/libqpl.so:
-	mkdir -p $(QPLBUILD)
-	mkdir -p $(LIBDIR)
-	cd $(QPLBUILD) \
-	    && [ -d qpl ] || git clone -b $(QPLTAG) --depth 1 $(QPLREPO) qpl
-	cd $(QPLBUILD)/qpl \
-	    && cmake -B build -DCMAKE_BUILD_TYPE=Release -DQPL_LIBRARY_TYPE=SHARED \
-	        -DQPL_BUILD_TESTS=OFF -DQPL_BUILD_EXAMPLES=OFF \
-	        -DCMAKE_INSTALL_PREFIX="$(QPLPREFIX)" \
-	    && cmake --build build -j"$$(nproc)" \
-	    && cmake --install build
-	cp -a $(QPLPREFIX)/lib*/libqpl.so* $(LIBDIR)/
 
 
 define MODULE_template
@@ -145,11 +106,6 @@ zip_throughput_test: test/zip_throughput_test.c $(LIBDIR)/libqat_zip.so $(LIBDIR
 
 test-zip-throughput: zip_throughput_test
 	(cd test && numactl --cpunodebind=0 --membind=0 ../zip_throughput_test $(ARGS))
-
-
-qat-userspace: $(QATLIBS)
-
-qpl-userspace: $(QPLLIBS)
 
 
 test: $(TEST_TARGETS)

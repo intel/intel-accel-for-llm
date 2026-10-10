@@ -20,6 +20,12 @@ COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+# Keep build inputs outside the bind-mounted source tree for offline rebuilds.
+RUN mkdir -p /opt/iaxl-build-deps \
+    && wget -q -O /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz \
+        https://downloadmirror.intel.com/921047/QAT20.L.1.2.30-00178.tar.gz \
+    && git clone --depth 1 --branch v1.9.0 https://github.com/intel/qpl.git /opt/iaxl-build-deps/qpl
+
 # Own prefix: Ubuntu's libucx0 1.12 (a libboost-mpi/openmpi dependency) lives in
 # /usr/lib/x86_64-linux-gnu and would shadow a UCX installed under /usr at runtime.
 # ld.so.conf.d/ucx.conf sorts before x86_64-linux-gnu.conf, so this UCX wins.
@@ -56,4 +62,28 @@ RUN echo "install idxd-config" \
     && ./configure CFLAGS='-g -O2' --prefix=/usr --sysconfdir=/etc --libdir=/usr/lib --disable-docs \
     && make install \
     && rm -rf /idxd-config
+
+# Build and install QAT/QPL once in the image so source builds need no network access.
+RUN set -eux; \
+    mkdir -p /tmp/iaxl-build-deps/qat; \
+    tar xf /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz -C /tmp/iaxl-build-deps/qat; \
+    cd /tmp/iaxl-build-deps/qat; \
+    install -d /usr/local/include/qat; \
+    cp -a quickassist/include/. /usr/local/include/qat/; \
+    cp -a quickassist/lookaside/access_layer/include/. /usr/local/include/qat/; \
+    install -m 644 quickassist/utilities/libusdm_drv/qae_mem.h /usr/local/include/qat/qae_mem.h; \
+    export KERNEL_SOURCE_ROOT="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"; \
+    test -n "$KERNEL_SOURCE_ROOT"; \
+    ./configure; \
+    sed -i 's/^ALL_TARGETS *= *.*/ALL_TARGETS = lac_user/g' quickassist/Makefile; \
+    make -j"$(nproc)" quickassist-all; \
+    cp -a build/*.so /usr/local/lib/; \
+    cmake -S /opt/iaxl-build-deps/qpl -B /tmp/iaxl-build-deps/qpl-build \
+        -DCMAKE_BUILD_TYPE=Release -DQPL_LIBRARY_TYPE=SHARED \
+        -DQPL_BUILD_TESTS=OFF -DQPL_BUILD_EXAMPLES=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local; \
+    cmake --build /tmp/iaxl-build-deps/qpl-build -j"$(nproc)"; \
+    cmake --install /tmp/iaxl-build-deps/qpl-build; \
+    ldconfig; \
+    rm -rf /tmp/iaxl-build-deps
 
