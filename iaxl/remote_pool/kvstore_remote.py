@@ -99,11 +99,12 @@ class KVStoreRemote:
                     self.peer, ip, port, model_name, rank, self.has_only_mode, len(self.layer_names))
 
     # -- data path -------------------------------------------------------------
-    def _xfer(self, method, block_indices, block_hashs, layer_names, description, what):
+    def _xfer(self, method, block_indices, block_hashs, layer_names, description, what, label=None):
         if self.has_only_mode:
             raise RuntimeError(f"{what}() not available in has-only mode (kv_caches not provided)")
         names = layer_names or self.layer_names
-        payload = rpc.pack_blocks(block_indices, block_hashs, [self.layer_idx[n] for n in names], description)
+        payload = rpc.pack_blocks(block_indices, block_hashs, [self.layer_idx[n] for n in names],
+                                  description, label or "")
         job_id = int.from_bytes(self.rpc.call(method, payload), "little")
         tasks = {n: RemoteTask(job_id, n) for n in names}
         self._pending[job_id] = [tasks, len(tasks)]
@@ -111,13 +112,15 @@ class KVStoreRemote:
             self._mark_done(job_id, layer_idx)
         return tasks
 
-    def put(self, block_indices, block_hashs, layer_names=None, description="") -> Dict[str, RemoteTask]:
+    def put(self, block_indices, block_hashs, layer_names=None, description="",
+            label=None) -> Dict[str, RemoteTask]:
         if not self.has_only_mode:
             self._sync()  # attention kernels must have written kv_caches before the daemon READs
-        return self._xfer(rpc.PUT, block_indices, block_hashs, layer_names, description, "put")
+        return self._xfer(rpc.PUT, block_indices, block_hashs, layer_names, description, "put", label=label)
 
-    def get(self, block_indices, block_hashs, layer_names=None, description="") -> Dict[str, RemoteTask]:
-        return self._xfer(rpc.GET, block_indices, block_hashs, layer_names, description, "get")
+    def get(self, block_indices, block_hashs, layer_names=None, description="",
+            label=None) -> Dict[str, RemoteTask]:
+        return self._xfer(rpc.GET, block_indices, block_hashs, layer_names, description, "get", label=label)
 
     def _wait(self, results: Dict[str, RemoteTask], layer_names, wait: bool, what: str) -> bool:
         if self.has_only_mode:
@@ -154,8 +157,10 @@ class KVStoreRemote:
             del self._pending[job_id]
 
     # -- control path ------------------------------------------------------------
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
-        resp = self.rpc.call(rpc.HAS, rpc.pack_hashes(block_hashs or []))
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None,
+            truncate: bool = True) -> List[bool]:
+        resp = self.rpc.call(rpc.HAS, rpc.pack_has(block_hashs or [], label or "", truncate))
         return [bool(b) for b in resp]
 
     def _json(self, method, *args):
