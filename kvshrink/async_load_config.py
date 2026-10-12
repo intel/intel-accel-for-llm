@@ -20,6 +20,8 @@ class AsyncLoadScheme(str, enum.Enum):
     NAIVE = "naive"
     # Async requests of one step share one get() call, one task per layer.
     BATCH_REQS_ASYNC_LOAD_SUBMIT = "batch_reqs_async_load_submit"
+    # Submit the first N layers, then the remaining layers after promotion.
+    SPLIT_ASYNC_LOAD_SUBMIT = "split_async_load_submit"
 
 
 def parse_async_load_scheme(value: str) -> AsyncLoadScheme:

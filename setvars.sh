@@ -29,7 +29,7 @@ export KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=${KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS:--1}       # -1=wait all layers, N=start prefill after first N layers (used when DYNAMIC=0)
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC:-1} # 0=fixed LAYERS, 1=select layers from DYNAMIC_MAP per request concurrency
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP:-0-3:0,4-6:4,7-:8}" # Contiguous START-END:LAYERS rules from 0; 0 layers means sync and the final range is open-ended
-export KVSHRINK_ASYNC_LOAD_SCHEME=${KVSHRINK_ASYNC_LOAD_SCHEME:-naive} # Async load submit scheme: naive | batch_reqs_async_load_submit
+export KVSHRINK_ASYNC_LOAD_SCHEME=${KVSHRINK_ASYNC_LOAD_SCHEME:-split_async_load_submit} # Async load submit scheme: naive | batch_reqs_async_load_submit | split_async_load_submit
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
