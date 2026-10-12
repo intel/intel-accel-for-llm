@@ -1,29 +1,21 @@
 #!/bin/bash -e
 # NVIDIA_RUNTIME=none ./start.sh  -> skip nvidia docker runtime/gpus args (e.g. on a storage-only node)
-case "${1:-}" in
-    --build-docker-image)
-        BUILD_DOCKER_IMAGE=1
-        shift
-        ;;
-    "") BUILD_DOCKER_IMAGE=0 ;;
-    *) echo "Unknown option: $1" >&2; exit 2 ;;
-esac
-if (( $# )); then
-    echo "Unexpected argument: $1" >&2
-    exit 2
-fi
+# ./start.sh --rebuild            -> rebuild the dev image even if it already exists
+REBUILD=0
+for arg in "$@"; do
+    case "$arg" in
+        --rebuild) REBUILD=1 ;;
+        *) echo "Usage: $0 [--rebuild]" >&2; exit 1 ;;
+    esac
+done
+set --
 
 source setvars.sh
 
-if (( BUILD_DOCKER_IMAGE )); then
+if [[ $REBUILD == 1 ]] || ! docker image inspect "$IAXL_DEV_DOCKER_IMAGE" >/dev/null 2>&1; then
     docker build -f docker/Dockerfile.dev -t "$IAXL_DEV_DOCKER_IMAGE" . \
         --build-arg "BASE=$IAXL_BASE_DOCKER_IMAGE" \
         --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy
-else
-    docker image inspect "$IAXL_DEV_DOCKER_IMAGE" >/dev/null || {
-        echo "Dev image $IAXL_DEV_DOCKER_IMAGE is not available locally" >&2
-        exit 1
-    }
 fi
 
 docker run \

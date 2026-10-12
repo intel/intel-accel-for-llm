@@ -1,5 +1,5 @@
 
-ARG BASE="ubuntu:20.04"
+ARG BASE="ubuntu:24.04"
 FROM $BASE
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -12,7 +12,7 @@ RUN CUDA_DIR=$(ls -d /usr/local/cuda-[0-9]*.[0-9]* 2>/dev/null | sort -V | tail 
         uuid-dev libjson-c-dev \
         build-essential cmake \
         rdma-core libibverbs-dev librdmacm-dev libnuma-dev \
-        $(apt-cache search "linux-headers-5.15.*-generic" | tail -n 1 | awk '{print $1}') \
+        $(apt-cache search "linux-headers-6.8.*-generic" | tail -n 1 | awk '{print $1}') \
         ${CUDA_VERSION:+cuda-nvml-dev-$CUDA_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 
@@ -74,7 +74,7 @@ RUN set -eux; \
     install -m 644 quickassist/utilities/libusdm_drv/qae_mem.h /usr/local/include/qat/qae_mem.h; \
     export KERNEL_SOURCE_ROOT="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"; \
     test -n "$KERNEL_SOURCE_ROOT"; \
-    ./configure; \
+    ./configure --disable-dc-strict-mode; \
     sed -i 's/^ALL_TARGETS *= *.*/ALL_TARGETS = lac_user/g' quickassist/Makefile; \
     make -j"$(nproc)" quickassist-all; \
     cp -a build/*.so /usr/local/lib/; \

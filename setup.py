@@ -15,7 +15,9 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
-VERSION = "1.5.0"
+VERSION = os.environ.get("IAXL_VERSION")
+if not VERSION:
+    raise RuntimeError("IAXL_VERSION is not set; source setvars.sh first.")
 DEVICE = os.getenv("DEVICE", "cuda")
 PACKAGE_INCLUDES = ["iaxl", "iaxl.*", "kvshrink", "kvshrink.*"]
 
