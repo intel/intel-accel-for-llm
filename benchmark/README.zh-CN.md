@@ -31,6 +31,63 @@ bash benchmark/kvstore/kvstore_benchmark.sh --ranks 2 --qat --data-source mock
 
 也可以直接运行 `kvstore_benchmark.py`，即不做 CPU / 加速器绑定的单进程测试。
 
+### 跨节点远端复用（remote_pool / RDMA）
+
+同一个启动脚本也能测试
+[remote-pool-kvstore.zh-CN.md](../doc/usage/remote-pool-kvstore.zh-CN.md)
+中描述的跨节点 KV cache 通路。当 `IAXL_RDMA_ENABLE=1` 时，
+`iaxl.kvstore.KVStore` 会透明地解析为 `KVStoreRemote`，于是每个 rank 的
+PUT/GET 都通过 RDMA 由 daemon 节点的缓存池处理，而非本地 store。得到的数值即
+client GPU ↔ daemon 之间的端到端 RDMA 带宽，以及 daemon 侧的压缩率。
+
+压缩 / CPU / 加速器绑定全部在 **daemon** 侧运行，因此在 client 上 `--qat` /
+`--iaa` / `--dsa` 参数会被忽略；client 上打印的「neither --qat nor --iaa」警告
+可以无视。
+
+先启动 daemon，步骤与使用文档完全一致（TP=4 示例，daemon `10.10.10.10`，
+client `10.10.10.11`）：
+
+```bash
+# ---- daemon 节点（10.10.10.10），仓库根目录 ----
+NVIDIA_RUNTIME=none ./start.sh
+# ---- 以下命令在 start.sh 打开的容器 shell 中执行 ----
+export IAXL_RDMA_ENABLE=1
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10
+export IAXL_RDMA_DAEMON_PORT=5555
+export IAXL_RDMA_TP_SIZE=4
+export TP_SIZE=4
+# 配置 daemon 侧压缩后端，以下为 QAT 示例：
+export IAXL_KV_COMPRESSION=1
+export IAXL_QAT_ZIP_ENABLE=1
+export KVSHRINK_QAT_DEVICES="0|1|4|5"
+./examples/kvshrink-daemon.sh
+```
+
+然后在 client 节点运行本测试（而非 vLLM）。`--ranks` 必须等于 daemon 的
+`IAXL_RDMA_TP_SIZE`，且每个 rank 需要一块 GPU：
+
+```bash
+# ---- client 节点（10.10.10.11），仓库根目录 ----
+./start.sh
+# ---- 以下命令在 start.sh 打开的容器 shell 中执行 ----
+export IAXL_RDMA_ENABLE=1
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # 与 daemon 侧取值相同
+export IAXL_RDMA_DAEMON_PORT=5555
+export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11   # 本节点的 RDMA 网口 IP
+export IAXL_RDMA_TP_SIZE=4
+export TP_SIZE=4
+
+bash benchmark/kvstore/kvstore_benchmark.sh --ranks 4 --data-source mock
+```
+
+多 rank 运行时各 rank 直接从自己的 `KVStoreRemote` 读取指标（通过 RPC 转发到
+daemon），因此无需 REST 入口。client 上出现 5 条
+`KVStoreRemote connected: ...` 日志（daemon 上出现 `pool: ...` 与
+`copy_chunks_batch: using RDMA backend`）即表示 RDMA 通路已生效。
+`--data-source model`（需设置 `MODEL`）以及 `--dtype` / `--shape` /
+`--num-layers` 的用法与本地运行一致。务必先启动 daemon 再启动 client，否则
+client 连接会超时（`IAXL_API_TIMEOUT`，默认 60s）。
+
 ## Tensor Transfer
 
 对比 CUDA、`cudaMemcpy3DBatchAsync`、Triton 和 IAXL 的碎片化 H2D/D2H 传输性能，并生成结果图。
