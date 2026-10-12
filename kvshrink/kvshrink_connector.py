@@ -37,7 +37,11 @@ from iaxl import KVStore, generate_block_hashs, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
-from .async_load_config import load_async_load_layer_config_from_env
+from .async_load_config import (
+    AsyncLoadScheme,
+    load_async_load_layer_config_from_env,
+    load_async_load_scheme_from_env,
+)
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -165,6 +169,12 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
         self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
+        )
+        self._async_load_scheme = load_async_load_scheme_from_env()
+        logger.info(
+            "KVShrink async load scheme: %s, role=%s",
+            self._async_load_scheme.value,
+            role.name,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -500,15 +510,34 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 block_hashs=sync_block_hashes,
             )
 
-        # Submit asynchronous loads per request; they are polled across
-        # scheduler steps in get_finished().
-        for req_id, request in async_reqs:
-            self._pending_load_tasks[req_id] = self._store().get(
-                block_indices=request.block_ids,
-                block_hashs=request.block_hashes,
-                description=req_id,
+        # Asynchronous loads are polled across scheduler steps in get_finished().
+        if self._async_load_scheme is AsyncLoadScheme.NAIVE:
+            # One get() per request: each request's layers are queued contiguously.
+            for req_id, request in async_reqs:
+                self._pending_load_tasks[req_id] = self._store().get(
+                    block_indices=request.block_ids,
+                    block_hashs=request.block_hashes,
+                    description=req_id,
+                )
+                self._pending_load_layers[req_id] = request.async_load_layers
+        elif async_reqs:
+            # batch_reqs_async_load_submit: like the sync path, one get() for all
+            # async requests of this step, so each layer is a single task covering
+            # all of them. Every request references the same Task dict;
+            # KVFlow.get_wait() skips tasks already waited on, so per-request
+            # promotion and cleanup stay unchanged.
+            async_block_ids: list[int] = []
+            async_block_hashes: list[str] = []
+            for req_id, request in async_reqs:
+                async_block_ids.extend(request.block_ids)
+                async_block_hashes.extend(request.block_hashes)
+            tasks = self._store().get(
+                block_indices=async_block_ids,
+                block_hashs=async_block_hashes,
             )
-            self._pending_load_layers[req_id] = request.async_load_layers
+            for req_id, request in async_reqs:
+                self._pending_load_tasks[req_id] = tasks
+                self._pending_load_layers[req_id] = request.async_load_layers
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
