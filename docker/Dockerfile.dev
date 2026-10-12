@@ -65,9 +65,9 @@ RUN echo "install idxd-config" \
 
 # Build and install QAT/QPL once in the image so source builds need no network access.
 RUN set -eux; \
-    mkdir -p /tmp/iaxl-build-deps/qat; \
-    tar xf /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz -C /tmp/iaxl-build-deps/qat; \
-    cd /tmp/iaxl-build-deps/qat; \
+    mkdir -p /opt/iaxl-build-deps/qat; \
+    tar xf /opt/iaxl-build-deps/QAT20.L.1.2.30-00178.tar.gz -C /opt/iaxl-build-deps/qat; \
+    cd /opt/iaxl-build-deps/qat; \
     install -d /usr/local/include/qat; \
     cp -a quickassist/include/. /usr/local/include/qat/; \
     cp -a quickassist/lookaside/access_layer/include/. /usr/local/include/qat/; \
