@@ -182,7 +182,74 @@ Each IP must belong to an RDMA NIC on its own node. The selected interfaces for 
 
 ---
 
-## 5. Troubleshooting
+## 5. Cross-Node KVStore Benchmark (remote_pool / RDMA)
+
+The [KVStore benchmark launcher](../../benchmark/kvstore/kvstore_benchmark.sh)
+also measures the cross-node KV cache path described in this document. When
+`IAXL_RDMA_ENABLE=1`, `iaxl.kvstore.KVStore` transparently resolves to
+`KVStoreRemote`, so each rank's PUT/GET is served by RDMA to the daemon node's
+pool instead of a local store. The numbers you get are the end-to-end client
+GPU ↔ daemon RDMA bandwidth plus the daemon-side compression ratio.
+
+Compression / CPU / accelerator binding all run on the **daemon**, so on the
+client the `--qat` / `--iaa` / `--dsa` flags are ignored; the
+"neither --qat nor --iaa" warning on the client is harmless.
+
+### 5.1 Start the Daemon
+
+Start the daemon first, as in section 2.2 (TP=4 example, daemon
+`10.10.10.10`, client `10.10.10.11`):
+
+```bash
+# ---- daemon node (10.10.10.10), repository root ----
+NVIDIA_RUNTIME=none ./start.sh
+# ---- inside the container shell opened by start.sh ----
+export IAXL_RDMA_ENABLE=1
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # Single NIC; see section 3.3 for multiple NICs
+export IAXL_RDMA_DAEMON_PORT=5555
+export IAXL_RDMA_TP_SIZE=4
+export TP_SIZE=4
+# configure the daemon-side compression backend, e.g. QAT:
+export IAXL_KV_COMPRESSION=1
+export IAXL_QAT_ZIP_ENABLE=1
+export KVSHRINK_QAT_DEVICES="0|1|4|5"
+./examples/kvshrink-daemon.sh
+```
+
+### 5.2 Run the Benchmark on the Client
+
+On the client node, run the benchmark instead of vLLM. `--ranks` must
+equal the daemon's `IAXL_RDMA_TP_SIZE`, and each rank needs one GPU:
+
+```bash
+# ---- client node (10.10.10.11), repository root ----
+./start.sh
+# ---- inside the container shell opened by start.sh ----
+export IAXL_RDMA_ENABLE=1
+export IAXL_RDMA_DAEMON_NIC_IPS=10.10.10.10   # same value as the daemon
+export IAXL_RDMA_DAEMON_PORT=5555
+export IAXL_RDMA_CLIENT_NIC_IPS=10.10.10.11   # Single NIC; see section 3.3 for multiple NICs
+export IAXL_RDMA_TP_SIZE=4
+export TP_SIZE=4
+
+bash benchmark/kvstore/kvstore_benchmark.sh --ranks 4 --data-source mock
+```
+
+### 5.3 Verify the RDMA Path and Read Results
+
+Multi-rank runs read metrics straight from each rank's `KVStoreRemote` (RPC to
+the daemon), so no REST endpoint is required. Five
+`KVStoreRemote connected: ...` lines on the client (and `pool: ...` /
+`copy_chunks_batch: using RDMA backend` on the daemon) confirm the RDMA path is
+in use. `--data-source model` (needs `MODEL`) or `--dtype` / `--shape` /
+`--num-layers` work the same as in the [local run](../../benchmark/README.md#kvstore).
+For multiple NICs, use the IP lists described in section 3.3. Start the daemon
+before the client, or the client's connect will time out (`IAXL_API_TIMEOUT`,
+default 60s).
+
+---
+
+## 6. Troubleshooting
 
 - `... IAXL_RDMA_DAEMON_NIC_IPS is required ...` / `IAXL_RDMA_CLIENT_NIC_IPS is required ...`: the list is unset, empty, or contains an empty entry.
 - `no metadata from daemon<r>` with `no route to ...` in the daemon log: the NICs selected for that rank on the two nodes cannot reach each other. Check that the IPs at the same list position on both nodes are on a reachable network.
