@@ -157,7 +157,10 @@ class KVStoreLocal:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
+        # A non-default label is its own namespace: each block hash gets one
+        # more EntryGroup and record row.
 
         if self.has_only_mode:
             raise RuntimeError(
@@ -177,7 +180,7 @@ class KVStoreLocal:
         local_skip = max(0, self.skip_compression_count - base)
 
         result = self.tensorzip.put(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
             chunk_dim=self.block_dim,
             chunk_indices=block_indices,
@@ -186,8 +189,8 @@ class KVStoreLocal:
             skip_compression_count=local_skip,
         )
 
-        if self.layer_names[-1] in layer_names:
-            self.tensorzip.put_finish(self.LABEL, block_hashs)
+        if label is not None or self.layer_names[-1] in layer_names:
+            self.tensorzip.put_finish(label or self.LABEL, block_hashs)
             self.tensorzip.record_flush()
 
         return result
@@ -216,8 +219,8 @@ class KVStoreLocal:
         block_hashs: List[str],
         layer_names: Optional[List[str]] = None,
         description: str = "",
+        label: Optional[str] = None,
     ) -> Dict[str, Task]:
-
         if self.has_only_mode:
             raise RuntimeError(
                 "get() not available in has-only mode (kv_caches not provided)"
@@ -229,7 +232,7 @@ class KVStoreLocal:
         tensors = {name: self.kv_caches[name] for name in layer_names}
 
         return self.tensorzip.get(
-            label=self.LABEL,
+            label=label or self.LABEL,
             tensors=tensors,
             chunk_dim=self.block_dim,
             chunk_indices=block_indices,
@@ -255,15 +258,19 @@ class KVStoreLocal:
             wait=wait,
         )
 
-    def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
+    def has(self, block_hashs: Optional[List[str]] = None,
+            label: Optional[str] = None,
+            truncate: bool = True) -> List[bool]:
         if not block_hashs:
             self.tensorzip.record_flush()
             return []
 
         results = self.tensorzip.has(
-            label=self.LABEL,
+            label=label or self.LABEL,
             chunk_labels=block_hashs,
         )
+        if not truncate:
+            return results
 
         mask = np.array(results, dtype=np.bool_)
         idx = np.argmin(mask)
