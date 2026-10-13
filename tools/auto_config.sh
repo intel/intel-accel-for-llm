@@ -8,24 +8,56 @@ validate_tp_size() {
     fi
 }
 
+# nvidia-smi always reports every GPU, so CUDA_VISIBLE_DEVICES is applied here to
+# keep rank -> GPU mapping identical to what vLLM sees.
 gpu_rows() {
     local tp_size=$1
-    local gpu_output
+    local gpu_output row index pci_bus uuid entry match
+    local -a all_rows=() all_gpus=() gpu_rows=() visible=()
+    local -A row_by_index=() row_by_uuid=()
 
     validate_tp_size "$tp_size" || return 1
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "ERROR: nvidia-smi is required to detect GPU NUMA nodes" >&2
         return 1
     fi
-    if ! gpu_output=$(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits); then
+    if ! gpu_output=$(nvidia-smi --query-gpu=index,pci.bus_id,uuid --format=csv,noheader,nounits); then
         echo "ERROR: failed to query GPU PCI information with nvidia-smi" >&2
         return 1
     fi
+    mapfile -t all_rows <<<"$gpu_output"
 
-    local -a gpu_rows=()
-    mapfile -t gpu_rows <<<"$gpu_output"
+    for row in "${all_rows[@]}"; do
+        IFS=, read -r index pci_bus uuid <<<"$row"
+        index=${index//[[:space:]]/}
+        pci_bus=${pci_bus//[[:space:]]/}
+        uuid=${uuid//[[:space:]]/}
+        [[ -n "$index" ]] || continue
+        row_by_index[$index]="$index,$pci_bus"
+        [[ -n "$uuid" ]] && row_by_uuid[${uuid,,}]="$index,$pci_bus"
+        all_gpus+=("$index,$pci_bus")
+    done
+
+    if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+        IFS=, read -r -a visible <<<"$CUDA_VISIBLE_DEVICES"
+        for entry in "${visible[@]}"; do
+            entry=${entry//[[:space:]]/}
+            [[ -n "$entry" ]] || continue
+            match=${row_by_index[$entry]:-${row_by_uuid[${entry,,}]:-}}
+            if [[ -z "$match" ]]; then
+                # CUDA stops enumerating at the first invalid entry; mirror that.
+                echo "WARNING: CUDA_VISIBLE_DEVICES entry '$entry' matches no GPU, ignoring the rest" >&2
+                break
+            fi
+            gpu_rows+=("$match")
+        done
+    else
+        gpu_rows=("${all_gpus[@]}")
+    fi
+
     if ((${#gpu_rows[@]} < tp_size)); then
-        echo "ERROR: TP_SIZE=$tp_size requires $tp_size GPUs, but only ${#gpu_rows[@]} were found" >&2
+        echo "ERROR: TP_SIZE=$tp_size requires $tp_size GPUs, but only ${#gpu_rows[@]} are visible" \
+            "(CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset})" >&2
         return 1
     fi
     printf '%s\n' "${gpu_rows[@]}"
@@ -202,8 +234,10 @@ cpu_auto_detect() {
 
 qat_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
-    local path driver devices_per_rank extra_devices next_device rank count offset pci numa group result
-    local -a qat_devices=() indices=() pci_devices=() rank_groups=()
+    local path driver devices_per_rank extra_devices next_device rank ranks count offset pci numa group result
+    local gpu_output gpu_index pci_bus gpu_numa local_rank
+    local -a qat_devices=() qat_numas=() gpu_rows=() gpu_numas=() indices=() pci_devices=() rank_groups=()
+    local -A ranks_per_numa=() next_rank_on_numa=() numa_devices=()
 
     validate_tp_size "$tp_size" || return 1
     for path in /sys/bus/pci/devices/*; do
@@ -224,22 +258,71 @@ qat_auto_detect() {
         echo "ERROR: TP_SIZE=$tp_size requires at least $tp_size QAT devices, but only ${#qat_devices[@]} were found" >&2
         return 1
     fi
+    # Indices must match the C backend, which enumerates QAT devices in PCI order.
+    for ((next_device = 0; next_device < ${#qat_devices[@]}; next_device++)); do
+        numa=$(<"/sys/bus/pci/devices/${qat_devices[$next_device]}/numa_node")
+        qat_numas+=("$numa")
+        numa_devices[$numa]="${numa_devices[$numa]:-}${numa_devices[$numa]:+ }$next_device"
+    done
 
-    devices_per_rank=$((${#qat_devices[@]} / tp_size))
-    extra_devices=$((${#qat_devices[@]} % tp_size))
+    if ! gpu_output=$(gpu_rows "$tp_size" 2>/dev/null); then
+        echo "WARNING: no usable NVIDIA GPU detected, splitting QAT devices evenly across $tp_size ranks" >&2
+        gpu_numas=()
+    else
+        mapfile -t gpu_rows <<<"$gpu_output"
+        for ((rank = 0; rank < tp_size; rank++)); do
+            read -r gpu_index pci_bus gpu_numa < <(gpu_info "${gpu_rows[$rank]}") || return 1
+            if [[ -z "${numa_devices[$gpu_numa]:-}" ]]; then
+                echo "ERROR: no QAT device on NUMA $gpu_numa for GPU $gpu_index (rank $rank)" >&2
+                return 1
+            fi
+            gpu_numas+=("$gpu_numa")
+            ranks_per_numa[$gpu_numa]=$((${ranks_per_numa[$gpu_numa]:-0} + 1))
+        done
+    fi
+
     next_device=0
     for ((rank = 0; rank < tp_size; rank++)); do
-        count=$devices_per_rank
-        ((rank < extra_devices)) && count=$((count + 1))
+        local -a pool=()
+        if ((${#gpu_numas[@]} > 0)); then
+            numa=${gpu_numas[$rank]}
+            read -r -a pool <<<"${numa_devices[$numa]}"
+            local_rank=${next_rank_on_numa[$numa]:-0}
+            next_rank_on_numa[$numa]=$((local_rank + 1))
+            ranks=${ranks_per_numa[$numa]}
+            if ((${#pool[@]} < ranks)); then
+                # Fewer local QAT devices than ranks: share one device round-robin.
+                count=1
+                next_device=$((local_rank % ${#pool[@]}))
+            else
+                devices_per_rank=$((${#pool[@]} / ranks))
+                extra_devices=$((${#pool[@]} % ranks))
+                count=$devices_per_rank
+                ((local_rank < extra_devices)) && count=$((count + 1))
+                next_device=$((local_rank * devices_per_rank + (local_rank < extra_devices ? local_rank : extra_devices)))
+            fi
+        else
+            pool=()
+            for ((offset = 0; offset < ${#qat_devices[@]}; offset++)); do pool+=("$offset"); done
+            devices_per_rank=$((${#pool[@]} / tp_size))
+            extra_devices=$((${#pool[@]} % tp_size))
+            count=$devices_per_rank
+            ((rank < extra_devices)) && count=$((count + 1))
+        fi
+        if ((count == 0)); then
+            echo "ERROR: not enough QAT devices to give rank $rank at least one device" >&2
+            return 1
+        fi
+
         indices=()
         pci_devices=()
         for ((offset = 0; offset < count; offset++)); do
-            indices+=("$next_device")
-            pci=${qat_devices[$next_device]}
-            numa=$(<"/sys/bus/pci/devices/$pci/numa_node")
-            pci_devices+=("$pci(numa=$numa)")
-            next_device=$((next_device + 1))
+            local device_index=${pool[$((next_device + offset))]}
+            indices+=("$device_index")
+            pci=${qat_devices[$device_index]}
+            pci_devices+=("$pci(numa=${qat_numas[$device_index]})")
         done
+        ((${#gpu_numas[@]} > 0)) || next_device=$((next_device + count))
         group=$(IFS=,; echo "${indices[*]}")
         rank_groups+=("$group")
         echo "KVShrink QAT rank $rank: indices=$group devices=${pci_devices[*]}" >&2

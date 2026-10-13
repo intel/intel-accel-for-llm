@@ -146,12 +146,22 @@ class KVFlow:
                 pool = self.chunk_pool.pool
                 _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
 
+    def register_kv_caches(self, kv_caches) -> None:
+        """GDR-map each kvcache tensor once (DSA v1); per-layer contexts then only compute offsets."""
+        if not envs.IAXL_DSA_V1_ENABLE:
+            return
+        for t in kv_caches.values():
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                _iqt.dsa_v1_register_mem(t.data_ptr(), t.nbytes)
+
     def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
         if isinstance(tensor, RemoteTensor):
             return Context.create_remote(
                 tensor.base, tensor.dev_id, list(tensor.shape), tensor.element_size(),
                 chunk_dim, direction, description,
             )
+        if envs.IAXL_DSA_V1_ENABLE:
+            return Context.create_dsa_v1(tensor, chunk_dim, direction, description, work_stream=work_stream)
         return Context.create(tensor, chunk_dim, direction, description, work_stream=work_stream)
 
     @profile_func(

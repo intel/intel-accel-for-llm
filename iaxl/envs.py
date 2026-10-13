@@ -60,6 +60,8 @@ class Envs:
                 "or set IAXL_KV_COMPRESSION=0"
             )
         self.IAXL_DSA_GD_ENABLE = _bool("IAXL_DSA_GD_ENABLE")
+        # DSA v1 is a flavour of the DSA path; it is moot when DSA itself is off.
+        self.IAXL_DSA_V1_ENABLE = self.IAXL_DSA_GD_ENABLE and _bool("IAXL_DSA_V1_ENABLE")
         self.IAXL_CACHE_DIR = _str("IAXL_CACHE_DIR", "_data/kvcache")
         self.IAXL_CACHE_STREAM_SYNC_ON_GET = _bool("IAXL_CACHE_STREAM_SYNC_ON_GET")
         self.IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS = max(

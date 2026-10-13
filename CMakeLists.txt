@@ -76,7 +76,8 @@ set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} $
               ${IAA_ZIP_SRCS} ${COMMON_SRCS} "${IAXL_CSRC_DIR}/kv_xfer/rdma.cpp")
 
 if(DEVICE STREQUAL "cuda")
-    list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
+    list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp"
+         "${IAXL_CSRC_DIR}/kv_xfer/dsa_v1.cpp")
     file(GLOB DSA_GD_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/dsa_gd/*.c")
     list(APPEND IAXL_SRCS ${DSA_GD_SRCS})
     set_source_files_properties(${DSA_GD_SRCS} PROPERTIES COMPILE_OPTIONS

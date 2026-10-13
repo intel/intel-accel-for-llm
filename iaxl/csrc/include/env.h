@@ -70,6 +70,7 @@ struct Envs {
 
     bool IAXL_DSA_GD_ENABLE;
     bool IAXL_DSA_GD_RESET_ON_DESTROY;
+    bool IAXL_DSA_V1_ENABLE;
     const char *(*IAXL_DSA_WQS)(void);
 
     bool IAXL_DEBUG_LOG;

@@ -24,8 +24,8 @@ sudo reboot
    **Out-of-tree driver package** (default):
 
 ```bash
-wget -q https://downloadmirror.intel.com/843052/QAT20.L.1.2.30-00078.tar.gz
-tar xf QAT20.L.1.2.30-00078.tar.gz
+wget -q https://downloadmirror.intel.com/921047/QAT20.L.1.2.30-00178.tar.gz
+tar xf QAT20.L.1.2.30-00178.tar.gz
 ./configure
 make -j$(nproc)
 sudo make install

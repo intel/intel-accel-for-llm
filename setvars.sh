@@ -23,6 +23,7 @@ export IAXL_QAT_ZIP_ENABLE=${IAXL_QAT_ZIP_ENABLE:-1} # Enable QAT compression wo
 export IAXL_IAA_ZIP_ENABLE=${IAXL_IAA_ZIP_ENABLE:-0} # Enable IAA (QPL) compression workers (0/1)
 export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-0} # Enable CPU compression workers (0/1); costs a lot of CPU, keep off unless needed
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
+export IAXL_DSA_V1_ENABLE=${IAXL_DSA_V1_ENABLE:-1}   # DSA v1 backend: GDR-map each KV tensor once (needs IAXL_DSA_GD_ENABLE=1) (0/1)
 
 # ---- Async KV load ----------------------------------------------------------
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=${KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED:-1}      # Enable asynchronous KV loading (0/1)
@@ -65,11 +66,13 @@ printf '%s\n' \
     "  MODEL=$MODEL" \
     "  TP_SIZE=$TP_SIZE" \
     "  DP_SIZE=$DP_SIZE" \
+    "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-all}" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
     "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
     "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
+    "  IAXL_DSA_V1_ENABLE=$IAXL_DSA_V1_ENABLE" \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_CPU_OMP_THREADS_BIND=$KVSHRINK_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
@@ -208,6 +211,8 @@ esac
 for var in "${ENV_VARS[@]}"; do
     DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
 done
+# Only forward when non-empty: an empty value would hide every GPU inside the container.
+[[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && DOCKER_RUN_ARGS+=("-e" "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
 if [[ -d "$MODEL" ]]; then
