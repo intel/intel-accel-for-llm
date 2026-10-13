@@ -194,7 +194,7 @@ class KVStoreService:
         self.kvstore = None
         self.layer_names: List[str] = []
         self.layer_idx: Dict[str, int] = {}
-        self.remote_bases: List[int] = []
+        self.remote_bases: Dict[int, tuple] = {}
         self.jobs: Dict[int, Job] = {}
         self._next_job = 0
 
@@ -228,8 +228,11 @@ class KVStoreService:
             dtype = getattr(torch, t["dtype"])
             shape = tuple(t["shape"])
             rt = RemoteTensor(peer, t["base"], shape, dtype, t["dev_id"])
-            torch_ext.rdma_register_remote(peer, rt.base, list(shape), rt.element_size(), rt.dev_id, block_dim)
-            self.remote_bases.append(rt.base)
+            # Hybrid layers of different groups share one buffer: register it once.
+            if rt.base not in self.remote_bases:
+                torch_ext.rdma_register_remote(peer, rt.base, list(shape), rt.element_size(), rt.dev_id, block_dim)
+                self.remote_bases[rt.base] = (shape, dtype)
+            assert self.remote_bases[rt.base] == (shape, dtype), name
             kv_caches[name] = rt
         self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,
                                     rank=self.rank, tp_size=self.tp_size)
