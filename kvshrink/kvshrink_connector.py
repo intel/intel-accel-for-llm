@@ -3,6 +3,7 @@
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -36,12 +37,81 @@ from iaxl import KVStore, generate_block_hashs, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
-from .async_load_config import load_async_load_layer_config_from_env
+from .async_load_config import (
+    AsyncLoadScheme,
+    load_async_load_layer_config_from_env,
+    load_async_load_scheme_from_env,
+)
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
 ReqId = str
+
+
+@dataclass
+class SplitLoadMeta:
+    """Blocks of one async request loaded under split_async_load_submit."""
+    block_ids: list[int]
+    block_hashes: list[str]
+    # Layers [0, num_first_n_layers) are submitted on arrival and must finish before
+    # promotion; layers [num_first_n_layers, L) are submitted after promotion.
+    num_first_n_layers: int
+
+
+@dataclass
+class LayerSegment:
+    """Layers [start, end) loaded by one get() for the blocks of ``req_ids``."""
+    start: int
+    end: int
+    req_ids: list[ReqId]
+
+
+def _layer_ranges(
+    loads: dict[ReqId, SplitLoadMeta], num_layers: int
+) -> list[tuple[int, int]]:
+    # Boundaries are 0, L and every request's N. Between two adjacent boundaries,
+    # each request needs either all of the layers or none of them.
+    boundaries = {0, num_layers}
+    for load in loads.values():
+        boundaries.add(load.num_first_n_layers)
+    sorted_boundaries = sorted(boundaries)
+    ranges = []
+    for index in range(len(sorted_boundaries) - 1):
+        ranges.append((sorted_boundaries[index], sorted_boundaries[index + 1]))
+    return ranges
+
+
+def _first_n_layer_segments(
+    loads: dict[ReqId, SplitLoadMeta], num_layers: int
+) -> list[LayerSegment]:
+    """Segments covering layers [0, N) of every request, in layer order."""
+    segments = []
+    for start, end in _layer_ranges(loads, num_layers):
+        # Layers [start, end) are among a request's first N layers iff N >= end.
+        req_ids = []
+        for req_id, load in loads.items():
+            if load.num_first_n_layers >= end:
+                req_ids.append(req_id)
+        if req_ids:
+            segments.append(LayerSegment(start, end, req_ids))
+    return segments
+
+
+def _remaining_layer_segments(
+    loads: dict[ReqId, SplitLoadMeta], num_layers: int
+) -> list[LayerSegment]:
+    """Segments covering layers [N, L) of every request, in layer order."""
+    segments = []
+    for start, end in _layer_ranges(loads, num_layers):
+        # Layers [start, end) are among a request's remaining layers iff N <= start.
+        req_ids = []
+        for req_id, load in loads.items():
+            if load.num_first_n_layers <= start:
+                req_ids.append(req_id)
+        if req_ids:
+            segments.append(LayerSegment(start, end, req_ids))
+    return segments
 
 
 @dataclass
@@ -86,6 +156,8 @@ class RequestMetadata:
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: RequestMetadata
     reqs_to_save: RequestMetadata
+    # Requests scheduled in this step (keys of SchedulerOutput.num_scheduled_tokens).
+    scheduled_req_ids: set[ReqId] = field(default_factory=set)
 
 
 class KVShrinkConnector(KVConnectorBase_V1):
@@ -157,9 +229,23 @@ class KVShrinkConnector(KVConnectorBase_V1):
         self._early_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
         # Early-promoted tasks active for the current forward pass.
         self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
+        # split_async_load_submit: blocks of async requests whose remaining layers
+        # are not submitted yet. Kept because reqs_to_load no longer carries a
+        # request after its first submission.
+        self._remaining_load_meta: dict[ReqId, SplitLoadMeta] = {}
+        # Promoted requests whose remaining layers the next start_load_kv() submits.
+        self._pending_remaining_load_req_ids: list[ReqId] = []
+        # Worker-side step counter for the async_load debug logs.
+        self._load_step = 0
 
         self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
+        )
+        self._async_load_scheme = load_async_load_scheme_from_env()
+        logger.info(
+            "KVShrink async load scheme: %s, role=%s",
+            self._async_load_scheme.value,
+            role.name,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -359,6 +445,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
+            scheduled_req_ids=set(scheduler_output.num_scheduled_tokens),
         )
         self._reqs_to_load = RequestMetadata()
         self._reqs_to_save = RequestMetadata()
@@ -454,19 +541,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
-
-        # A no-forward batch cannot consume promoted tasks layer by layer.
-        if forward_context.attn_metadata is not None:
-            duplicates = (
-                self._active_promoted_tasks.keys()
-                & self._early_promoted_tasks.keys()
-            )
-            if duplicates:
-                raise RuntimeError(
-                    f"Duplicate promoted load tasks for requests {duplicates}"
-                )
-            self._active_promoted_tasks.update(self._early_promoted_tasks)
-            self._early_promoted_tasks = {}
+        self._load_step += 1
 
         sync_block_ids: list[int] = []
         sync_block_hashes: list[str] = []
@@ -491,15 +566,67 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 block_hashs=sync_block_hashes,
             )
 
-        # Submit asynchronous loads per request; they are polled across
-        # scheduler steps in get_finished().
-        for req_id, request in async_reqs:
-            self._pending_load_tasks[req_id] = self._store().get(
-                block_indices=request.block_ids,
-                block_hashs=request.block_hashes,
-                description=req_id,
+        # Asynchronous loads are polled across scheduler steps in get_finished().
+        if self._async_load_scheme is AsyncLoadScheme.SPLIT_ASYNC_LOAD_SUBMIT:
+            self._submit_split_loads(async_reqs)
+        elif self._async_load_scheme is AsyncLoadScheme.NAIVE:
+            # One get() per request: each request's layers are queued contiguously.
+            for req_id, request in async_reqs:
+                self._pending_load_tasks[req_id] = self._store().get(
+                    block_indices=request.block_ids,
+                    block_hashs=request.block_hashes,
+                    description=req_id,
+                )
+                self._pending_load_layers[req_id] = request.async_load_layers
+        elif async_reqs:
+            # batch_reqs_async_load_submit: like the sync path, one get() for all
+            # async requests of this step, so each layer is a single task covering
+            # all of them. Every request references the same Task dict;
+            # KVFlow.get_wait() skips tasks already waited on, so per-request
+            # promotion and cleanup stay unchanged.
+            async_block_ids: list[int] = []
+            async_block_hashes: list[str] = []
+            for req_id, request in async_reqs:
+                async_block_ids.extend(request.block_ids)
+                async_block_hashes.extend(request.block_hashes)
+            tasks = self._store().get(
+                block_indices=async_block_ids,
+                block_hashs=async_block_hashes,
             )
-            self._pending_load_layers[req_id] = request.async_load_layers
+            for req_id, request in async_reqs:
+                self._pending_load_tasks[req_id] = tasks
+                self._pending_load_layers[req_id] = request.async_load_layers
+
+        # Only promoted requests scheduled in this forward are waited on in
+        # wait_for_layer_load(); the rest stay early-promoted until the step that
+        # schedules them. A no-forward batch waits on nothing. Done after all
+        # submissions, so a promoted request is always in _early_promoted_tasks
+        # when _submit_split_loads() submits its remaining layers.
+        if forward_context.attn_metadata is not None:
+            duplicates = (
+                self._active_promoted_tasks.keys()
+                & self._early_promoted_tasks.keys()
+            )
+            if duplicates:
+                raise RuntimeError(
+                    f"Duplicate promoted load tasks for requests {duplicates}"
+                )
+            scheduled: list[ReqId] = []
+            for req_id in self._early_promoted_tasks:
+                if req_id in metadata.scheduled_req_ids:
+                    scheduled.append(req_id)
+            for req_id in scheduled:
+                self._active_promoted_tasks[req_id] = self._early_promoted_tasks.pop(
+                    req_id
+                )
+            if scheduled or self._early_promoted_tasks:
+                logger.debug(
+                    "async_load step=%d t=%d activate reqs=%s held=%s",
+                    self._load_step,
+                    time.monotonic_ns(),
+                    ",".join(scheduled),
+                    ",".join(self._early_promoted_tasks),
+                )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
@@ -589,6 +716,18 @@ class KVShrinkConnector(KVConnectorBase_V1):
                     del self._pending_load_layers[req_id]
                     self._early_promoted_tasks[req_id] = tasks
                     finished_recving.add(req_id)
+                    # Only split requests that still have remaining layers to
+                    # submit are in _remaining_load_meta.
+                    if req_id in self._remaining_load_meta:
+                        self._pending_remaining_load_req_ids.append(req_id)
+
+        if finished_recving:
+            logger.debug(
+                "async_load step=%d t=%d promote reqs=%s",
+                self._load_step,
+                time.monotonic_ns(),
+                ",".join(sorted(finished_recving)),
+            )
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
@@ -609,6 +748,11 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 self._pending_load_layers.pop(req_id, None)
                 self._early_promoted_tasks.pop(req_id, None)
                 self._active_promoted_tasks.pop(req_id, None)
+                # Finished before its remaining layers were submitted: never
+                # submit them.
+                self._remaining_load_meta.pop(req_id, None)
+                if req_id in self._pending_remaining_load_req_ids:
+                    self._pending_remaining_load_req_ids.remove(req_id)
 
             tasks = self._current_put_tasks.get(req_id)
             if tasks is None:
@@ -623,3 +767,84 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
         self._deferred_finished_req_ids.difference_update(completed)
         return (completed or None), (finished_recving or None)
+
+    def _submit_split_loads(self, async_reqs: list[tuple[ReqId, ReqMeta]]) -> None:
+        # Remaining layers of the requests promoted in the last get_finished() are
+        # submitted before the first N layers of new requests: a forward of this
+        # step may already wait on the former, while the latter are not needed
+        # before their promotion.
+        if self._pending_remaining_load_req_ids:
+            remaining_layer_loads: dict[ReqId, SplitLoadMeta] = {}
+            for req_id in self._pending_remaining_load_req_ids:
+                # Removed here: the metadata is not needed after this submission.
+                remaining_layer_loads[req_id] = self._remaining_load_meta.pop(req_id)
+            self._pending_remaining_load_req_ids = []
+            remaining_layer_tasks = self._submit_layer_segments(
+                _remaining_layer_segments(
+                    remaining_layer_loads, len(self._layer_names)
+                ),
+                remaining_layer_loads,
+            )
+            # The request's Task dict holds its first N layers and is referenced
+            # by _early_promoted_tasks; adding the remaining layers in place lets
+            # wait_for_layer_load() wait on every layer.
+            for req_id, tasks in remaining_layer_tasks.items():
+                self._early_promoted_tasks[req_id].update(tasks)
+
+        if not async_reqs:
+            return
+        num_layers = len(self._layer_names)
+        first_n_layer_loads: dict[ReqId, SplitLoadMeta] = {}
+        for req_id, request in async_reqs:
+            if request.async_load_layers == -1:
+                # Promoted only after all layers are loaded: nothing remains.
+                num_first_n_layers = num_layers
+            elif 0 < request.async_load_layers < num_layers:
+                num_first_n_layers = request.async_load_layers
+            else:
+                raise ValueError(
+                    f"async_load_layers of request {req_id} must be -1 or in "
+                    f"[1, {num_layers}), got {request.async_load_layers}"
+                )
+            first_n_layer_loads[req_id] = SplitLoadMeta(
+                block_ids=request.block_ids,
+                block_hashes=request.block_hashes,
+                num_first_n_layers=num_first_n_layers,
+            )
+
+        first_n_layer_tasks = self._submit_layer_segments(
+            _first_n_layer_segments(first_n_layer_loads, num_layers),
+            first_n_layer_loads,
+        )
+        for req_id, request in async_reqs:
+            # get_finished() polls these tasks and promotes the request once its
+            # first N layers are loaded.
+            self._pending_load_tasks[req_id] = first_n_layer_tasks[req_id]
+            self._pending_load_layers[req_id] = request.async_load_layers
+            if first_n_layer_loads[req_id].num_first_n_layers < num_layers:
+                self._remaining_load_meta[req_id] = first_n_layer_loads[req_id]
+
+    def _submit_layer_segments(
+        self,
+        segments: list[LayerSegment],
+        loads: dict[ReqId, SplitLoadMeta],
+    ) -> dict[ReqId, dict[str, Any]]:
+        # One get() per segment. Returns each request's tasks (layer name -> Task)
+        # over all segments it is in; requests of one segment share its tasks.
+        tasks_by_req: dict[ReqId, dict[str, Any]] = {}
+        for req_id in loads:
+            tasks_by_req[req_id] = {}
+        for segment in segments:
+            block_ids: list[int] = []
+            block_hashes: list[str] = []
+            for req_id in segment.req_ids:
+                block_ids.extend(loads[req_id].block_ids)
+                block_hashes.extend(loads[req_id].block_hashes)
+            tasks = self._store().get(
+                block_indices=block_ids,
+                block_hashs=block_hashes,
+                layer_names=self._layer_names[segment.start : segment.end],
+            )
+            for req_id in segment.req_ids:
+                tasks_by_req[req_id].update(tasks)
+        return tasks_by_req

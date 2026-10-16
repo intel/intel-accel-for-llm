@@ -3,6 +3,7 @@
 
 """Configuration policy for KVShrink asynchronous KV loading."""
 
+import enum
 import logging
 import os
 from collections.abc import Mapping
@@ -10,6 +11,46 @@ from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+class AsyncLoadScheme(str, enum.Enum):
+    """Async KV-load submission scheme, selected by KVSHRINK_ASYNC_LOAD_SCHEME."""
+
+    # Each async request submits all layers with its own get() call.
+    NAIVE = "naive"
+    # Async requests of one step share one get() call, one task per layer.
+    BATCH_REQS_ASYNC_LOAD_SUBMIT = "batch_reqs_async_load_submit"
+    # Submit the first N layers, then the remaining layers after promotion.
+    SPLIT_ASYNC_LOAD_SUBMIT = "split_async_load_submit"
+
+
+def parse_async_load_scheme(value: str) -> AsyncLoadScheme:
+    """Parse ``KVSHRINK_ASYNC_LOAD_SCHEME``.
+
+    Raises:
+        ValueError: the value is not a scheme name.
+    """
+    try:
+        return AsyncLoadScheme(value.strip())
+    except ValueError as error:
+        raise ValueError(
+            "KVSHRINK_ASYNC_LOAD_SCHEME must be one of "
+            f"{[s.value for s in AsyncLoadScheme]}, got {value!r}"
+        ) from error
+
+
+def load_async_load_scheme_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> AsyncLoadScheme:
+    """Load ``KVSHRINK_ASYNC_LOAD_SCHEME`` exported by ``setvars.sh``."""
+    source = os.environ if environ is None else environ
+    value = source.get("KVSHRINK_ASYNC_LOAD_SCHEME")
+    if not value:
+        raise ValueError(
+            "KVSHRINK_ASYNC_LOAD_SCHEME must be set; source setvars.sh before "
+            "starting vLLM"
+        )
+    return parse_async_load_scheme(value)
 
 
 @dataclass(frozen=True)
