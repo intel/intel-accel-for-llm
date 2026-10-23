@@ -103,6 +103,8 @@ class KVStoreLocal:
             cache_size_gb=pool_size_gb,
             rank=rank,
         )
+        if kv_caches is not None:
+            self.tensorzip.register_kv_caches(kv_caches)
         start_profiling()
 
         logger.info(
