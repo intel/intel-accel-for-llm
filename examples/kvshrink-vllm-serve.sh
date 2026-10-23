@@ -16,6 +16,13 @@ fi
 device_args=(--gpu-memory-utilization 0.8)
 [[ "$DEVICE" == cpu ]] && device_args=()
 
+# Hybrid GDN/Mamba models need prefix caching: with it off vLLM sets
+# mamba_cache_mode to 'none' and no block-aligned state is kept.
+cache_args=(--no-enable-prefix-caching)
+if [[ "${KVSHRINK_HYBRID:-0}" == "1" ]]; then
+    cache_args=(--enable-prefix-caching)
+fi
+
 vllm serve "$MODEL" \
     --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
     --trust-remote-code \
@@ -24,5 +31,5 @@ vllm serve "$MODEL" \
     --max-model-len "${MAX_MODEL_LEN:-32765}" \
     --block-size "${BLOCK_SIZE:-16}" \
     --port "${PORT:-8000}" \
-    --no-enable-prefix-caching \
+    "${cache_args[@]}" \
     2>&1 | tee log.kvshrink-vllm
