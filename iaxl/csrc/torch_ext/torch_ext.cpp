@@ -79,10 +79,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("unzip_from_mem", &Context::unzip_from_mem,
              "Retrieve from cache, decompress, and H2D transfer (async).\n"
+             "priority: OMP-Main level 0..3 (0 = most urgent); bundle_id / order_key: for\n"
+             "task_queue_set_bundles_priority() (0 / -1 = none).\n"
              "Call unzip_wait() + xfer_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
              py::arg("chunk_indices"), py::arg("cpu_tensors"),
-             py::call_guard<py::gil_scoped_release>())
+             py::arg("priority") = TaskQueue::PRIORITY_HIGH, py::arg("bundle_id") = 0,
+             py::arg("order_key") = -1, py::call_guard<py::gil_scoped_release>())
         .def("zip_wait", &Context::zip_wait, "Wait for zip_to_mem to complete",
              py::call_guard<py::gil_scoped_release>())
         .def("zip_is_complete", &Context::zip_is_complete,
@@ -505,6 +508,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return d;
         },
         "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
+
+    m.def(
+        "task_queue_set_bundles_priority",
+        [](const std::vector<uint64_t> &bundle_ids, int priority) {
+            return omp_queue().set_bundles_priority(bundle_ids, priority);
+        },
+        "Move waiting OMP-Main tasks of `bundle_ids` at `priority` or below to its tail, by order_key",
+        py::arg("bundle_ids"), py::arg("priority"), py::call_guard<py::gil_scoped_release>());
 
 #ifndef CPU_SUPPORT // RDMA (remote_pool) runs on NIXL, which DEVICE=cpu builds do not link
     m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),

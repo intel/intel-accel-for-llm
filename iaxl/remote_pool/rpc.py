@@ -15,7 +15,7 @@ import logging
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 CTRL_BYTES = 4 << 20
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
-    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER = range(14)
+    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER, SET_BUNDLES_PRIORITY = range(15)
 
 REQ_FMT, RESP_FMT, PUSH_FMT = "<cBIQ", "<cIB", "<cIH"
 REQ_SIZE, RESP_SIZE, PUSH_SIZE = (struct.calcsize(f) for f in (REQ_FMT, RESP_FMT, PUSH_FMT))
@@ -56,13 +56,18 @@ def unpack_hashes(buf: bytes, off: int = 0):
     return hashes, off + n * h
 
 
-def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: str = "") -> bytes:
+def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: str = "",
+                priorities: Optional[List[int]] = None, bundle_id: int = 0) -> bytes:
+    """`priorities`: one OMP-Main level per entry of `layer_idx` (GET only; None: level 0)."""
     desc = description.encode()
     lab = label.encode()
+    levels = priorities or []
     return b"".join((
-        struct.pack("<IHHH", len(block_indices), len(layer_idx), len(desc), len(lab)),
+        struct.pack("<IHHHHQ", len(block_indices), len(layer_idx), len(levels), len(desc),
+                    len(lab), bundle_id),
         np.asarray(block_indices, dtype=np.int32).tobytes(),
         np.asarray(layer_idx, dtype=np.int16).tobytes(),
+        np.asarray(levels, dtype=np.int8).tobytes(),
         pack_hashes(block_hashs),
         desc,
         lab,
@@ -70,16 +75,18 @@ def pack_blocks(block_indices, block_hashs, layer_idx, description: str, label: 
 
 
 def unpack_blocks(buf: bytes):
-    n, nl, nd, nlab = struct.unpack_from("<IHHH", buf)
-    off = 10
+    n, nl, npri, nd, nlab, bundle_id = struct.unpack_from("<IHHHHQ", buf)
+    off = 20
     indices = np.frombuffer(buf, np.int32, count=n, offset=off).tolist()
     off += 4 * n
     layer_idx = np.frombuffer(buf, np.int16, count=nl, offset=off).tolist()
     off += 2 * nl
+    priorities = np.frombuffer(buf, np.int8, count=npri, offset=off).tolist()
+    off += npri
     hashes, off = unpack_hashes(buf, off)
     desc = buf[off:off + nd].decode()
     off += nd
-    return indices, hashes, layer_idx, desc, buf[off:off + nlab].decode()
+    return indices, hashes, layer_idx, desc, buf[off:off + nlab].decode(), priorities, bundle_id
 
 
 def pack_has(block_hashs: List[str], label: str = "", truncate: bool = True) -> bytes:
@@ -255,10 +262,20 @@ class KVStoreService:
         self.layer_idx = {n: i for i, n in enumerate(self.layer_names)}
 
     def _xfer(self, peer, payload, is_put):
-        indices, hashes, layer_idx, desc, label = unpack_blocks(payload)
+        indices, hashes, layer_idx, desc, label, priorities, bundle_id = unpack_blocks(payload)
         names = [self.layer_names[i] for i in layer_idx] or None
-        fn = self.kvstore.put if is_put else self.kvstore.get
-        tasks = fn(indices, hashes, names, desc, label=label or None)
+        if is_put:
+            tasks = self.kvstore.put(indices, hashes, names, desc, label=label or None)
+        else:
+            layer_priorities = None
+            if priorities:
+                if len(priorities) != len(layer_idx):
+                    raise ValueError(f"GET has {len(priorities)} priorities for {len(layer_idx)} layers")
+                layer_priorities = {}
+                for name, priority in zip(names, priorities):
+                    layer_priorities[name] = priority
+            tasks = self.kvstore.get(indices, hashes, names, desc, label=label or None,
+                                     priorities=layer_priorities, bundle_id=bundle_id)
         self._next_job = job_id = (self._next_job + 1) & 0xFFFFFFFF
         self.jobs[job_id] = Job(peer, tasks, is_put, set(tasks.keys()))
         return struct.pack("<I", job_id)
@@ -307,6 +324,7 @@ class KVStoreService:
         EVICT_CANDIDATES: _json_call("get_evict_candidates"),
         STOP: _stop,
         UNREGISTER: _unregister,
+        SET_BUNDLES_PRIORITY: _json_call("set_bundles_priority"),
     }
 
     # -- completion polling --------------------------------------------------

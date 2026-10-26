@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 
 ReqId = str
 
+# OMP-Main TaskQueue levels: P0 loads a forward waits on, P1 first N layers, P2 remaining layers.
+LOAD_PRIORITY_P0 = 0
+LOAD_PRIORITY_P1 = 1
+LOAD_PRIORITY_P2 = 2
+
 
 @dataclass
 class ReqMeta:
@@ -103,6 +108,7 @@ class RequestMetadata:
 class KVShrinkConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: RequestMetadata
     reqs_to_save: RequestMetadata
+    scheduled_req_ids: set[ReqId] = field(default_factory=set)
 
 
 class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
@@ -203,6 +209,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._early_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
         # Early-promoted tasks active for the current forward pass.
         self._active_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
+        # TaskQueue bundle id of each async request's remaining layers until they are raised.
+        self._load_bundle_ids: dict[ReqId, int] = {}
+        # 0 means no bundle in the TaskQueue.
+        self._next_load_bundle_id = 1
 
         self._async_load_layer_config = load_async_load_layer_config_from_env(
             num_layers=self.num_layers,
@@ -447,6 +457,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
+            scheduled_req_ids=set(scheduler_output.num_scheduled_tokens),
         )
         self._reqs_to_load = RequestMetadata()
         self._reqs_to_save = RequestMetadata()
@@ -555,19 +566,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        # A no-forward batch cannot consume promoted tasks layer by layer.
-        if forward_context.attn_metadata is not None:
-            duplicates = (
-                self._active_promoted_tasks.keys()
-                & self._early_promoted_tasks.keys()
-            )
-            if duplicates:
-                raise RuntimeError(
-                    f"Duplicate promoted load tasks for requests {duplicates}"
-                )
-            self._active_promoted_tasks.update(self._early_promoted_tasks)
-            self._early_promoted_tasks = {}
-
         sync_block_ids: list[int] = []
         sync_block_hashes: list[str] = []
         async_reqs: list[tuple[ReqId, ReqMeta]] = []
@@ -587,15 +585,61 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Submit synchronous (blocking) loads first as a single merged batch so
         # they are enqueued ahead of the asynchronous loads for this pass.
         self._current_get_tasks = None
+        # The sync batch has a bundle id so that it is ordered by layer with the raised layers below.
+        sync_load_bundle_id = 0
         if sync_block_ids:
+            sync_load_bundle_id = self._next_load_bundle_id
+            self._next_load_bundle_id += 1
             self._current_get_tasks = self._store().get(
                 block_indices=sync_block_ids,
                 block_hashs=sync_block_hashes,
+                bundle_id=sync_load_bundle_id,
             )
+
+        # Wait only on promoted requests scheduled in this forward; a no-forward batch waits on none.
+        if forward_context.attn_metadata is not None:
+            duplicates = (
+                self._active_promoted_tasks.keys()
+                & self._early_promoted_tasks.keys()
+            )
+            if duplicates:
+                raise RuntimeError(
+                    f"Duplicate promoted load tasks for requests {duplicates}"
+                )
+            scheduled: list[ReqId] = []
+            for req_id in self._early_promoted_tasks:
+                if req_id in metadata.scheduled_req_ids:
+                    scheduled.append(req_id)
+            raise_load_bundle_ids: list[int] = []
+            for req_id in scheduled:
+                self._active_promoted_tasks[req_id] = self._early_promoted_tasks.pop(
+                    req_id
+                )
+                load_bundle_id = self._load_bundle_ids.pop(req_id, None)
+                if load_bundle_id is not None:
+                    raise_load_bundle_ids.append(load_bundle_id)
+            if raise_load_bundle_ids:
+                # Before the async submissions below, so that less of the sync batch has run
+                # when one call moves it and these remaining layers to P0, interleaved by layer.
+                if sync_load_bundle_id:
+                    raise_load_bundle_ids.append(sync_load_bundle_id)
+                self._store().set_bundles_priority(raise_load_bundle_ids, LOAD_PRIORITY_P0)
 
         # Submit asynchronous loads per request; they are polled across
         # scheduler steps in get_finished().
         for req_id, request in async_reqs:
+            # First N layers at P1 overtake waiting remaining layers, which stay at P2 until raised.
+            priorities: dict[str, int] = {}
+            has_remaining_layers = False
+            for layer_index, layer_name in enumerate(self._layer_names):
+                # -1 promotes only after every layer is loaded.
+                if request.async_load_layers == -1 or layer_index < request.async_load_layers:
+                    priorities[layer_name] = LOAD_PRIORITY_P1
+                else:
+                    priorities[layer_name] = LOAD_PRIORITY_P2
+                    has_remaining_layers = True
+            load_bundle_id = self._next_load_bundle_id
+            self._next_load_bundle_id += 1
             tasks: dict[str, Any] = {}
             for index, (is_mamba, layer_names) in enumerate(self.groups):
                 if not layer_names:  # draft-only group
@@ -607,9 +651,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     layer_names=layer_names,
                     description=req_id,
                     label="mamba" if is_mamba else None,
+                    priorities=priorities,
+                    bundle_id=load_bundle_id,
                 ))
             self._pending_load_tasks[req_id] = tasks
             self._pending_load_layers[req_id] = request.async_load_layers
+            if has_remaining_layers:
+                self._load_bundle_ids[req_id] = load_bundle_id
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
@@ -731,6 +779,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 self._pending_load_layers.pop(req_id, None)
                 self._early_promoted_tasks.pop(req_id, None)
                 self._active_promoted_tasks.pop(req_id, None)
+                # Finished before entering a forward: its bundle is never raised.
+                self._load_bundle_ids.pop(req_id, None)
 
             tasks = self._current_put_tasks.get(req_id)
             if tasks is None:

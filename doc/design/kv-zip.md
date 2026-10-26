@@ -27,7 +27,7 @@ flowchart TD
     QAT & IAA & CPU -. "claim next item" .-> Cursor
 ```
 
-All batches run on the single `OMP-Main` queue thread, one at a time. Decompression is queued at high priority and compression at low priority. Because batches never overlap, two batches never share a backend slot. The queue thread also takes part in its own batch as thread 0.
+All batches run on the single `OMP-Main` queue thread, one at a time. Decompression is queued at the level its caller chooses (`P0`–`P2`; KVShrink puts the loads a forward waits on at `P0`) and compression at the lowest level, `P3`. Because batches never overlap, two batches never share a backend slot. The queue thread also takes part in its own batch as thread 0.
 
 ## Workers and Threads
 

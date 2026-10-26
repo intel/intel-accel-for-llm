@@ -99,12 +99,21 @@ class KVStoreRemote:
                     self.peer, ip, port, model_name, rank, self.has_only_mode, len(self.layer_names))
 
     # -- data path -------------------------------------------------------------
-    def _xfer(self, method, block_indices, block_hashs, layer_names, description, what, label=None):
+    def _xfer(self, method, block_indices, block_hashs, layer_names, description, what, label=None,
+              priorities=None, bundle_id=0):
         if self.has_only_mode:
             raise RuntimeError(f"{what}() not available in has-only mode (kv_caches not provided)")
         names = layer_names or self.layer_names
+        # pack_blocks sends one level per entry of the layer index list.
+        layer_priorities = None
+        if priorities is not None:
+            layer_priorities = []
+            for name in names:
+                if name not in priorities:
+                    raise ValueError(f"priorities is missing layer {name}")
+                layer_priorities.append(priorities[name])
         payload = rpc.pack_blocks(block_indices, block_hashs, [self.layer_idx[n] for n in names],
-                                  description, label or "")
+                                  description, label or "", layer_priorities, bundle_id)
         job_id = int.from_bytes(self.rpc.call(method, payload), "little")
         tasks = {n: RemoteTask(job_id, n) for n in names}
         self._pending[job_id] = [tasks, len(tasks)]
@@ -119,8 +128,13 @@ class KVStoreRemote:
         return self._xfer(rpc.PUT, block_indices, block_hashs, layer_names, description, "put", label=label)
 
     def get(self, block_indices, block_hashs, layer_names=None, description="",
-            label=None) -> Dict[str, RemoteTask]:
-        return self._xfer(rpc.GET, block_indices, block_hashs, layer_names, description, "get", label=label)
+            label=None, priorities=None, bundle_id=0) -> Dict[str, RemoteTask]:
+        return self._xfer(rpc.GET, block_indices, block_hashs, layer_names, description, "get",
+                          label=label, priorities=priorities, bundle_id=bundle_id)
+
+    def set_bundles_priority(self, bundle_ids: List[int], priority: int) -> int:
+        """Runs KVStoreLocal.set_bundles_priority on the daemon."""
+        return self._json(rpc.SET_BUNDLES_PRIORITY, bundle_ids, priority)
 
     def _wait(self, results: Dict[str, RemoteTask], layer_names, wait: bool, what: str) -> bool:
         if self.has_only_mode:
