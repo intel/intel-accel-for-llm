@@ -160,7 +160,7 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                              const std::vector<std::string> &chunk_labels,
                              const std::vector<int64_t> &chunk_indices,
                              const std::vector<torch::Tensor> &cpu_tensors, int priority,
-                             uint64_t bundle_id, int64_t order_key) {
+                             uint64_t bundle_id, int64_t sort_key) {
     PROFILE_SCOPE_FMT("unzip_from_mem %s/%s", label.c_str(), tensor_key.c_str());
 
     auto full_chunk_labels = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels);
@@ -187,7 +187,7 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                 IAXL_CHECK(false, "unzip_from_mem: unexpected asynchronous exception");
             }
         },
-        priority, bundle_id, order_key);
+        priority, bundle_id, sort_key);
 }
 
 void Context::zip_wait() {

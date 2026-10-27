@@ -51,10 +51,11 @@ class TaskQueue {
         state_ = State::RUNNING;
     }
 
-    // `bundle_id` (0 = none) and `order_key` (-1 = none) are only used by set_bundles_priority().
+    // `bundle_id` (0 = none) is only read by set_bundles_priority(), `sort_key` (-1 = none) only by
+    // sort_priority_level(); a level is otherwise FIFO.
     template <typename F>
     std::future<void> submit(F &&func, int priority = PRIORITY_HIGH, uint64_t bundle_id = 0,
-                             int64_t order_key = -1) {
+                             int64_t sort_key = -1) {
         check_priority(priority);
         auto task = std::make_shared<std::packaged_task<void()>>(std::forward<F>(func));
         auto future = task->get_future();
@@ -62,14 +63,13 @@ class TaskQueue {
         Item item;
         item.fn = [task]() { (*task)(); };
         item.bundle_id = bundle_id;
-        item.order_key = order_key;
+        item.sort_key = sort_key;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ != State::RUNNING) {
                 throw std::runtime_error("TaskQueue submit rejected: queue is not running");
             }
-            item.seq = next_seq_++;
             tasks_[priority].push_back(std::move(item));
         }
         cv_.notify_one();
@@ -77,34 +77,34 @@ class TaskQueue {
         return future;
     }
 
-    // Moves waiting tasks of `bundle_ids` at `priority` or below to its tail, by (order_key, seq).
+    // Moves waiting tasks of `bundle_ids` from less urgent levels to the tail of `priority`, in order.
     size_t set_bundles_priority(const std::vector<uint64_t> &bundle_ids, int priority) {
         check_priority(priority);
-        std::vector<Item> selected;
+        size_t moved = 0;
         std::lock_guard<std::mutex> lock(mutex_);
-        for (int level = priority; level < NUM_PRIORITIES; ++level) {
+        for (int level = priority + 1; level < NUM_PRIORITIES; ++level) {
             std::deque<Item> kept;
             for (Item &item : tasks_[level]) {
                 if (item.bundle_id != 0 &&
                     std::find(bundle_ids.begin(), bundle_ids.end(), item.bundle_id) !=
                         bundle_ids.end()) {
-                    selected.push_back(std::move(item));
+                    tasks_[priority].push_back(std::move(item));
+                    ++moved;
                 } else {
                     kept.push_back(std::move(item));
                 }
             }
             tasks_[level].swap(kept);
         }
-        // std::sort is not stable; seq keeps tasks of one order key in submit order.
-        std::sort(selected.begin(), selected.end(), [](const Item &a, const Item &b) {
-            if (a.order_key != b.order_key)
-                return a.order_key < b.order_key;
-            return a.seq < b.seq;
-        });
-        for (Item &item : selected) {
-            tasks_[priority].push_back(std::move(item));
-        }
-        return selected.size();
+        return moved;
+    }
+
+    // Stable-sorts the waiting tasks of level `priority` by sort_key; other levels are untouched.
+    void sort_priority_level(int priority) {
+        check_priority(priority);
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::stable_sort(tasks_[priority].begin(), tasks_[priority].end(),
+                         [](const Item &a, const Item &b) { return a.sort_key < b.sort_key; });
     }
 
     void shutdown() {
@@ -167,8 +167,7 @@ class TaskQueue {
     struct Item {
         std::function<void()> fn;
         uint64_t bundle_id = 0;
-        int64_t order_key = -1;
-        uint64_t seq = 0; // submit order within this queue
+        int64_t sort_key = -1;
     };
 
     static void check_priority(int priority) {
@@ -217,5 +216,4 @@ class TaskQueue {
     std::condition_variable state_cv_;
     std::array<std::deque<Item>, NUM_PRIORITIES> tasks_;
     State state_ = State::CREATED;
-    uint64_t next_seq_ = 0;
 };

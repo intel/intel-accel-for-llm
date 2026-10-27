@@ -585,15 +585,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Submit synchronous (blocking) loads first as a single merged batch so
         # they are enqueued ahead of the asynchronous loads for this pass.
         self._current_get_tasks = None
-        # The sync batch has a bundle id so that it is ordered by layer with the raised layers below.
-        sync_load_bundle_id = 0
         if sync_block_ids:
-            sync_load_bundle_id = self._next_load_bundle_id
-            self._next_load_bundle_id += 1
             self._current_get_tasks = self._store().get(
                 block_indices=sync_block_ids,
                 block_hashs=sync_block_hashes,
-                bundle_id=sync_load_bundle_id,
             )
 
         # Wait only on promoted requests scheduled in this forward; a no-forward batch waits on none.
@@ -619,11 +614,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if load_bundle_id is not None:
                     raise_load_bundle_ids.append(load_bundle_id)
             if raise_load_bundle_ids:
-                # Before the async submissions below, so that less of the sync batch has run
-                # when one call moves it and these remaining layers to P0, interleaved by layer.
-                if sync_load_bundle_id:
-                    raise_load_bundle_ids.append(sync_load_bundle_id)
+                # Before the async gets below; sorting P0 by layer interleaves these with the sync batch.
                 self._store().set_bundles_priority(raise_load_bundle_ids, LOAD_PRIORITY_P0)
+                self._store().sort_priority_level(LOAD_PRIORITY_P0)
 
         # Submit asynchronous loads per request; they are polled across
         # scheduler steps in get_finished().

@@ -136,6 +136,10 @@ class KVStoreRemote:
         """Runs KVStoreLocal.set_bundles_priority on the daemon."""
         return self._json(rpc.SET_BUNDLES_PRIORITY, bundle_ids, priority)
 
+    def sort_priority_level(self, priority: int) -> None:
+        """Runs KVStoreLocal.sort_priority_level on the daemon."""
+        self._json(rpc.SORT_PRIORITY_LEVEL, priority)
+
     def _wait(self, results: Dict[str, RemoteTask], layer_names, wait: bool, what: str) -> bool:
         if self.has_only_mode:
             raise RuntimeError(f"{what}() not available in has-only mode (kv_caches not provided)")

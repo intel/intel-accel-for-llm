@@ -19,7 +19,7 @@ from ..envs import envs
 from ..torch_ext import Record
 from ..torch_ext import Context, GpuTransferDirection
 from ..torch_ext import Mem, Storage
-from ..torch_ext import task_queue_set_bundles_priority
+from ..torch_ext import task_queue_set_bundles_priority, task_queue_sort_priority_level
 from .. import torch_ext as _iqt
 from ..utils import cuda_available
 from .scratch_pool import ScratchPool
@@ -326,9 +326,9 @@ class KVFlow:
         description: str = "",
         priorities: Optional[Dict[str, int]] = None,
         bundle_id: int = 0,
-        order_keys: Optional[Dict[str, int]] = None,
+        sort_keys: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Task]:
-        """priorities / order_keys: OMP-Main level / order key per tensor key (None: 0 / -1)."""
+        """priorities / sort_keys: OMP-Main level / sort key per tensor key (None: 0 / -1)."""
 
         self._ensure_streams()
         assert chunk_indices is not None and chunk_labels is not None
@@ -351,8 +351,8 @@ class KVFlow:
             assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
             if priorities is not None and tensor_key not in priorities:
                 raise ValueError(f"priorities is missing tensor key {tensor_key}")
-            if order_keys is not None and tensor_key not in order_keys:
-                raise ValueError(f"order_keys is missing tensor key {tensor_key}")
+            if sort_keys is not None and tensor_key not in sort_keys:
+                raise ValueError(f"sort_keys is missing tensor key {tensor_key}")
 
         results = {}
         num_chunks = len(chunk_indices)
@@ -383,7 +383,7 @@ class KVFlow:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
             priority = 0 if priorities is None else priorities[tensor_key]
-            order_key = -1 if order_keys is None else order_keys[tensor_key]
+            sort_key = -1 if sort_keys is None else sort_keys[tensor_key]
             ctx.unzip_from_mem(
                 self.mem,
                 label,
@@ -393,7 +393,7 @@ class KVFlow:
                 cpu_tensors,
                 priority=priority,
                 bundle_id=bundle_id,
-                order_key=order_key,
+                sort_key=sort_key,
             )
 
             results[tensor_key] = task = Task(
@@ -409,8 +409,12 @@ class KVFlow:
         return results
 
     def set_bundles_priority(self, bundle_ids: List[int], priority: int) -> int:
-        """Moves waiting OMP-Main tasks of ``bundle_ids`` to ``priority``, by order key; returns the count."""
+        """Moves waiting OMP-Main tasks of ``bundle_ids`` from less urgent levels to ``priority``; returns the count."""
         return task_queue_set_bundles_priority(bundle_ids, priority)
+
+    def sort_priority_level(self, priority: int) -> None:
+        """Stable-sorts the waiting OMP-Main tasks of level ``priority`` by sort key."""
+        task_queue_sort_priority_level(priority)
 
     @profile_func(lambda self, get_results, *_: f"(count={len(get_results)})")
     def get_wait(

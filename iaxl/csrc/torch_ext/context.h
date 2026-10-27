@@ -109,13 +109,13 @@ class Context {
                     const std::vector<std::string> &chunk_labels,
                     const std::vector<torch::Tensor> &cpu_tensors, bool compress = true);
 
-    // priority / bundle_id / order_key go to TaskQueue::submit() of the decompression task.
+    // priority / bundle_id / sort_key go to TaskQueue::submit() of the decompression task.
     void unzip_from_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                         const std::vector<std::string> &chunk_labels,
                         const std::vector<int64_t> &chunk_indices,
                         const std::vector<torch::Tensor> &cpu_tensors,
                         int priority = TaskQueue::PRIORITY_HIGH, uint64_t bundle_id = 0,
-                        int64_t order_key = -1);
+                        int64_t sort_key = -1);
 
     void zip_wait();
     bool zip_is_complete();

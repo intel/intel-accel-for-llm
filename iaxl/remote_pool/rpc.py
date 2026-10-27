@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 CTRL_BYTES = 4 << 20
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
-    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER, SET_BUNDLES_PRIORITY = range(15)
+    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER, SET_BUNDLES_PRIORITY, \
+    SORT_PRIORITY_LEVEL = range(16)
 
 REQ_FMT, RESP_FMT, PUSH_FMT = "<cBIQ", "<cIB", "<cIH"
 REQ_SIZE, RESP_SIZE, PUSH_SIZE = (struct.calcsize(f) for f in (REQ_FMT, RESP_FMT, PUSH_FMT))
@@ -325,6 +326,7 @@ class KVStoreService:
         STOP: _stop,
         UNREGISTER: _unregister,
         SET_BUNDLES_PRIORITY: _json_call("set_bundles_priority"),
+        SORT_PRIORITY_LEVEL: _json_call("sort_priority_level"),
     }
 
     # -- completion polling --------------------------------------------------
