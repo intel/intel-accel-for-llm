@@ -643,15 +643,27 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
+        group = self.layer_group[layer_name]
+        merged_block_ids: list[int] = []
+        merged_block_hashes: list[str] = []
+        req_ids: list[ReqId] = []
         for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(self.layer_group[layer_name])
+            block_ids, block_hashes = request.for_group(group)
             if not block_ids:
                 continue
-            tasks = self._store().put(
-                block_indices=block_ids,
-                block_hashs=block_hashes,
-                layer_names=[layer_name],
-            )
+            merged_block_ids.extend(block_ids)
+            merged_block_hashes.extend(block_hashes)
+            req_ids.append(req_id)
+
+        if not req_ids:
+            return
+
+        tasks = self._store().put(
+            block_indices=merged_block_ids,
+            block_hashs=merged_block_hashes,
+            layer_names=[layer_name],
+        )
+        for req_id in req_ids:
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
     def wait_for_save(self) -> None:
