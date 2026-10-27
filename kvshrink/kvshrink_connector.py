@@ -3,6 +3,7 @@
 
 import logging
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 from iaxl import KVStore, generate_block_hashs, setup_root_logger
@@ -37,6 +39,9 @@ setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
 
 ReqId = str
+
+# Bound on block hashes remembered as failed loads (oldest forgotten first).
+_MAX_FAILED_HASHES = 100_000
 
 
 @dataclass
@@ -133,6 +138,12 @@ class KVShrinkConnector(KVConnectorBase_V1):
         self.global_size = self.dp_size * self.tp_size
 
         self._req_states: dict[ReqId, ReqState] = {}
+        # Scheduler side: hash of the block most recently scheduled to load into each vLLM
+        # block id, and hashes whose load failed on some rank (e.g. evicted after the lookup,
+        # or evicted by another TP rank first). A failed hash counts as a miss until it is
+        # saved again; otherwise the lookup keeps matching it and the load keeps failing.
+        self._loading_hashes: dict[int, str] = {}
+        self._failed_hashes: OrderedDict[str, None] = OrderedDict()
         self._reqs_to_load = RequestMetadata()
         self._reqs_to_save = RequestMetadata()
         self._current_get_tasks: Optional[dict[str, Any]] = None
@@ -147,6 +158,10 @@ class KVShrinkConnector(KVConnectorBase_V1):
         self._pending_load_tasks: dict[ReqId, dict[str, Any]] = {}
         # Early-start layer count selected for each pending async request.
         self._pending_load_layers: dict[ReqId, int] = {}
+        # vLLM block ids each pending async request loads into.
+        self._pending_load_blocks: dict[ReqId, set[int]] = {}
+        # Failed-load block ids collected from the store, not yet reported to vLLM.
+        self._load_failures: set[int] = set()
         # Tasks early-promoted (first N layers done) whose remaining layers are
         # waited on-demand in wait_for_layer_load during the prefill forward.
         self._early_promoted_tasks: dict[ReqId, dict[str, Any]] = {}
@@ -208,6 +223,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
             )
         ]
         existence_cache = self._store().has(block_hashes)
+        if self._failed_hashes:
+            for index, block_hash in enumerate(block_hashes):
+                if not existence_cache[index]:
+                    break
+                if block_hash in self._failed_hashes:
+                    existence_cache[index:] = [False] * (len(existence_cache) - index)
+                    break
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
             existence_cache=existence_cache,
@@ -273,10 +295,13 @@ class KVShrinkConnector(KVConnectorBase_V1):
         if load_end <= load_start:
             return
 
+        load_block_ids = list(block_ids[load_start:load_end])
+        load_hashes = state.block_hashes[load_start:load_end]
+        self._loading_hashes.update(zip(load_block_ids, load_hashes))
         self._reqs_to_load.add_request(
             request.request_id,
-            list(block_ids[load_start:load_end]),
-            state.block_hashes[load_start:load_end],
+            load_block_ids,
+            load_hashes,
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
         )
@@ -301,10 +326,30 @@ class KVShrinkConnector(KVConnectorBase_V1):
         ]
         if missing:
             block_ids, hashes = zip(*missing)
+            for block_hash in hashes:
+                self._failed_hashes.pop(block_hash, None)  # re-saved on every rank
             self._reqs_to_save.add_request(
                 req_id, list(block_ids), list(hashes)
             )
         state.num_seen_blocks = end
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        invalid = getattr(connector_output, "invalid_block_ids", None)
+        if not invalid:
+            return
+        for block_id in invalid:
+            block_hash = self._loading_hashes.get(block_id)
+            if block_hash is not None:
+                self._failed_hashes[block_hash] = None
+                self._failed_hashes.move_to_end(block_hash)
+        while len(self._failed_hashes) > _MAX_FAILED_HASHES:
+            self._failed_hashes.popitem(last=False)
+        logger.warning(
+            "%d KV block(s) failed to load from IAXL; treating them as misses until re-saved "
+            "(%d tracked)",
+            len(invalid),
+            len(self._failed_hashes),
+        )
 
     def request_finished(
         self,
@@ -428,6 +473,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 description=req_id,
             )
             self._pending_load_layers[req_id] = request.async_load_layers
+            self._pending_load_blocks[req_id] = set(request.block_ids)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
@@ -495,28 +541,32 @@ class KVShrinkConnector(KVConnectorBase_V1):
         finished_recving: set[str] = set()
         for req_id in list(self._pending_load_tasks.keys()):
             tasks = self._pending_load_tasks[req_id]
-            async_load_layers = self._pending_load_layers[req_id]
-            if async_load_layers == -1:
-                # Require all layers before marking the load finished.
-                if self._store().get_wait(get_results=tasks, wait=False):
-                    self._store().get_wait(get_results=tasks, wait=True)
-                    del self._pending_load_tasks[req_id]
-                    del self._pending_load_layers[req_id]
-                    finished_recving.add(req_id)
-            else:
+            if self._pending_load_layers[req_id] != -1:
                 # Early promote once the first N layers are loaded; the remaining
                 # layers are waited on-demand in wait_for_layer_load().
-                first_n_layers = self._layer_names[:async_load_layers]
-                if self._store().get_wait(
+                first_n_layers = self._layer_names[: self._pending_load_layers[req_id]]
+                if not self._store().get_wait(
                     get_results=tasks, layer_names=first_n_layers, wait=False
                 ):
-                    self._store().get_wait(
-                        get_results=tasks, layer_names=first_n_layers, wait=True
-                    )
-                    del self._pending_load_tasks[req_id]
-                    del self._pending_load_layers[req_id]
+                    continue
+                self._store().get_wait(
+                    get_results=tasks, layer_names=first_n_layers, wait=True
+                )
+                self._load_failures |= self._store().pop_load_failures()
+                if not (self._load_failures & self._pending_load_blocks[req_id]):
+                    self._finish_pending_load(req_id)
                     self._early_promoted_tasks[req_id] = tasks
                     finished_recving.add(req_id)
+                    continue
+                # Some blocks failed: vLLM will roll the request back and may free its
+                # blocks once it is reported finished, so the remaining layers must not
+                # still be writing into them. Report it only after every layer is done.
+                self._pending_load_layers[req_id] = -1
+            # Require all layers before marking the load finished.
+            if self._store().get_wait(get_results=tasks, wait=False):
+                self._store().get_wait(get_results=tasks, wait=True)
+                self._finish_pending_load(req_id)
+                finished_recving.add(req_id)
 
         self._deferred_finished_req_ids.update(finished_req_ids)
         completed: set[str] = set()
@@ -533,8 +583,7 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 ):
                     continue
                 self._store().get_wait(get_results=load_tasks, wait=True)
-                self._pending_load_tasks.pop(req_id, None)
-                self._pending_load_layers.pop(req_id, None)
+                self._finish_pending_load(req_id)
                 self._early_promoted_tasks.pop(req_id, None)
                 self._active_promoted_tasks.pop(req_id, None)
 
@@ -551,3 +600,23 @@ class KVShrinkConnector(KVConnectorBase_V1):
 
         self._deferred_finished_req_ids.difference_update(completed)
         return (completed or None), (finished_recving or None)
+
+    def _finish_pending_load(self, req_id: ReqId) -> None:
+        self._pending_load_tasks.pop(req_id, None)
+        self._pending_load_layers.pop(req_id, None)
+        self._pending_load_blocks.pop(req_id, None)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # Blocks the scheduler's lookup reported as cached but that were gone from the pool by
+        # load time (e.g. evicted in between). Their KV was not written; vLLM recomputes them
+        # with kv_load_failure_policy="recompute" and fails the request with "fail".
+        if self.kvstore is None:
+            return set()
+        failed = self._load_failures | self.kvstore.pop_load_failures()
+        self._load_failures = set()
+        if failed:
+            logger.warning(
+                "%d KV block(s) failed to load from IAXL and will be reported to vLLM",
+                len(failed),
+            )
+        return failed

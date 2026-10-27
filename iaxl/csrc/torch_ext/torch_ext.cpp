@@ -90,7 +90,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("unzip_is_complete", &Context::unzip_is_complete,
              "Check if unzip OMP work complete (non-blocking)",
-             py::call_guard<py::gil_scoped_release>());
+             py::call_guard<py::gil_scoped_release>())
+        .def(
+            "unzip_failed_indices",
+            [](const Context &self) { return self.unzip_failed_indices(); },
+            "Chunk indices the last unzip_from_mem could not find in the pool (call after "
+            "unzip_wait). Those blocks were not transferred and must be treated as failed loads.");
 
     py::class_<kv_pool::Storage>(m, "Storage", "Persistent storage handler")
         .def(py::init<const std::string &>(), "Create storage handler with a persist directory.",
@@ -285,6 +290,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             [](kv_pool::Mem &self, bool enabled) { self.set_evict_enabled(enabled); },
             "Enable/disable eviction (for safe pointer access periods)", py::arg("enabled"))
         .def("is_evict_enabled", &kv_pool::Mem::is_evict_enabled, "Check if eviction is enabled")
+        .def("set_entries_per_group", &kv_pool::Mem::set_entries_per_group,
+             "Record a group only once it holds this many entries (0 = caller-managed record)",
+             py::arg("count"), py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("entries_per_group", &kv_pool::Mem::entries_per_group,
+                               "Entries a group needs before it is recorded (0 = disabled)")
+        .def("set_evict_watermark", &kv_pool::Mem::set_evict_watermark,
+             "Over capacity, evict LRU groups down to capacity * ratio (ratio in (0, 1])",
+             py::arg("ratio"), py::call_guard<py::gil_scoped_release>())
+        .def("pin_groups", &kv_pool::Mem::pin_groups,
+             "Pin groups ('label:chunk_id') present in memory against eviction; returns one state "
+             "per group: 0 = absent (not pinned), 1 = present but incomplete, 2 = complete",
+             py::arg("group_keys"), py::call_guard<py::gil_scoped_release>())
+        .def("unpin_groups", &kv_pool::Mem::unpin_groups,
+             "Release pins taken by pin_groups (pass only the keys that were pinned)",
+             py::arg("group_keys"), py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("evict_watermark", &kv_pool::Mem::evict_watermark,
+                               "Fraction of capacity that over-budget eviction frees down to")
 
         .def(
             "lock",
@@ -332,7 +354,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                "Total cache hits that were loaded from storage")
         .def_property_readonly("misses", &kv_pool::Mem::misses, "Total cache misses")
         .def_property_readonly("puts", &kv_pool::Mem::puts, "Total put operations")
-        .def_property_readonly("evictions", &kv_pool::Mem::evictions, "Total entries evicted")
+        .def_property_readonly("evictions", &kv_pool::Mem::evictions, "Total groups evicted")
+        .def_property_readonly("evicted_bytes", &kv_pool::Mem::evicted_bytes,
+                               "Total bytes freed by eviction")
         .def_property_readonly("total_unzip_bytes", &kv_pool::Mem::total_unzip_bytes,
                                "Total uncompressed (pre-compression) bytes accumulated")
         .def_property_readonly("total_zip_bytes", &kv_pool::Mem::total_zip_bytes,

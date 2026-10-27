@@ -103,8 +103,13 @@ class Record::Impl {
     ~Impl() { shutdown(); }
 
     void submit(const std::string &label, const std::vector<std::string> &chunk_labels) {
+        submit_group_keys(make_group_keys(label, chunk_labels));
+    }
+
+    void submit_group_keys(std::vector<std::string> group_keys) {
+        if (group_keys.empty())
+            return;
         std::lock_guard<std::mutex> lock(operation_mutex_);
-        auto group_keys = make_group_keys(label, chunk_labels);
 
         auto future = queue_.submit([this, group_keys = std::move(group_keys)]() {
             double current_time = now_seconds();
@@ -160,7 +165,7 @@ class Record::Impl {
         sync_locked();
     }
 
-    void remove(const std::vector<std::string> &chunk_labels) {
+    void remove(const std::vector<std::string> &chunk_labels, bool wait) {
         if (chunk_labels.empty())
             return;
         std::lock_guard<std::mutex> lock(operation_mutex_);
@@ -184,7 +189,8 @@ class Record::Impl {
         });
 
         track_future_locked(std::move(future));
-        sync_locked();
+        if (wait)
+            sync_locked();
     }
 
     std::vector<bool> is_persisted(const std::vector<std::string> &chunk_labels) {
@@ -379,7 +385,13 @@ void Record::mark_persisted(const std::vector<std::string> &chunk_labels) {
     impl_->mark_persisted(chunk_labels);
 }
 
-void Record::remove(const std::vector<std::string> &chunk_labels) { impl_->remove(chunk_labels); }
+void Record::submit_group_keys(const std::vector<std::string> &group_keys) {
+    impl_->submit_group_keys(group_keys);
+}
+
+void Record::remove(const std::vector<std::string> &chunk_labels, bool wait) {
+    impl_->remove(chunk_labels, wait);
+}
 
 std::vector<bool> Record::is_persisted(const std::vector<std::string> &chunk_labels) {
     return impl_->is_persisted(chunk_labels);

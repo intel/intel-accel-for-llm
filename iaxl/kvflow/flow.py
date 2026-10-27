@@ -38,6 +38,17 @@ def get_accelerator_device() -> str:
 
 
 @dataclass
+class _LoadPins:
+    """State shared by the per-layer tasks of one get(). Its groups stay pinned until the last
+    layer finishes, so a block present at get() time cannot be evicted between two layers'
+    loads. Each failed block is reported once per get(), not once per layer: layers finishing
+    in different steps would otherwise make vLLM recompute the same blocks again."""
+    group_keys: List[str]
+    remaining: int
+    reported: set = field(default_factory=set)
+
+
+@dataclass
 class Task:
     ctx: Any = None
     cpu_tensors: List[torch.Tensor] = None
@@ -45,13 +56,20 @@ class Task:
     label: str = None
     tensor_key: str = None
     chunk_labels: List[str] = None
+    load_pins: Optional[_LoadPins] = None
 
     def __repr__(self):
         return f"Task(label={self.label!r}, tensor_key={self.tensor_key!r}, chunk_labels={self.chunk_labels})"
 
 
 class KVFlow:
-    def __init__(self, persist_dir: str, cache_size_gb: float = 8.0, rank: int = 0):
+    def __init__(
+        self,
+        persist_dir: str,
+        cache_size_gb: float = 8.0,
+        rank: int = 0,
+        entries_per_group: int = 0,
+    ):
 
         self.enable_compression = envs.IAXL_KV_COMPRESSION
         base_dir = envs.IAXL_CACHE_DIR
@@ -60,6 +78,7 @@ class KVFlow:
         os.makedirs(self.persist_dir, exist_ok=True)
 
         self.cache_size_gb = cache_size_gb
+        self.entries_per_group = entries_per_group
         if cache_size_gb == 0:
             self.has_only_mode = True
         else:
@@ -108,12 +127,23 @@ class KVFlow:
             storage=self.storage,
             record=self.record,
         )
+        self.mem.set_evict_watermark(envs.IAXL_DDR_POOL_EVICT_WATERMARK)
+        # With entries_per_group set, Mem records a group itself once all its entries are
+        # stored, so put_finish() must not record it earlier.
+        self.mem.set_entries_per_group(entries_per_group)
+
+        # Chunk indices whose load failed since the last pop_load_failures().
+        self._load_failed: set = set()
+        self._load_failed_total = 0
 
         logger.info(
-            "Initialized: persist_dir=%s, cache_size_gb=%.2f, compression=%s",
+            "Initialized: persist_dir=%s, cache_size_gb=%.2f, compression=%s, "
+            "evict_watermark=%.2f, entries_per_group=%d",
             persist_dir,
             cache_size_gb,
             self.enable_compression,
+            envs.IAXL_DDR_POOL_EVICT_WATERMARK,
+            entries_per_group,
         )
 
         self._persist_count = 0
@@ -163,8 +193,27 @@ class KVFlow:
     def _finish_get(self, task: Task):
         task.ctx.unzip_wait()
         task.ctx.xfer_wait()
+        failed = set(task.ctx.unzip_failed_indices())
+        if task.load_pins is not None:
+            failed -= task.load_pins.reported
+            task.load_pins.reported |= failed
+        if failed:
+            self._load_failed.update(failed)
+            self._load_failed_total += len(failed)
+            logger.warning(
+                "Load of %s/%s: %d block(s) not in the DDR pool, reported as failed loads",
+                task.label, task.tensor_key, len(failed),
+            )
+        if task.load_pins is not None:
+            self._release_load_pins(task.load_pins, 1)
+            task.load_pins = None
         task.ctx = None
         self._release_task(task)
+
+    def _release_load_pins(self, pins: _LoadPins, count: int):
+        pins.remaining -= count
+        if pins.remaining == 0 and pins.group_keys:
+            self.mem.unpin_groups(pins.group_keys)
 
     def _finish_task(self, task: Task, is_put: bool):
         if is_put:
@@ -365,33 +414,53 @@ class KVFlow:
         chunk_shape = tuple(chunk_shape)
         self._ensure_pool(chunk_shape, first_t.dtype)
 
+        group_keys = [f"{label}:{chunk_label}" for chunk_label in chunk_labels]
+        states = self.mem.pin_groups(group_keys)  # 0 = absent, 1 = incomplete, 2 = complete
+        load_pins = _LoadPins(
+            group_keys=[key for key, state in zip(group_keys, states) if state],
+            remaining=len(tensors),
+        )
+        # A block with only some layers in memory would fail only on its missing layers, possibly
+        # after an async load was promoted early. Report it now; vLLM recomputes it anyway.
+        incomplete = {index for index, state in zip(chunk_indices, states) if state == 1}
+        if incomplete:
+            load_pins.reported |= incomplete
+            self._load_failed |= incomplete
+            self._load_failed_total += len(incomplete)
+
         first_tensor = True
-        for tensor_key, tensor in tensors.items():
-            cpu_tensors = self._allocate(num_chunks)
+        try:
+            for tensor_key, tensor in tensors.items():
+                cpu_tensors = self._allocate(num_chunks)
 
-            ctx = self._create_ctx(
-                tensor,
-                chunk_dim,
-                GpuTransferDirection.H2D,
-                description,
-                work_stream=self.get_stream,
-            )
-            if first_tensor:
-                if stream_sync_on_get and self.device_type is not None:
-                    ctx.xfer_wait_cur_stream()
-                first_tensor = False
-            ctx.unzip_from_mem(
-                self.mem, label, tensor_key, chunk_labels, chunk_indices, cpu_tensors
-            )
+                ctx = self._create_ctx(
+                    tensor,
+                    chunk_dim,
+                    GpuTransferDirection.H2D,
+                    description,
+                    work_stream=self.get_stream,
+                )
+                if first_tensor:
+                    if stream_sync_on_get and self.device_type is not None:
+                        ctx.xfer_wait_cur_stream()
+                    first_tensor = False
+                ctx.unzip_from_mem(
+                    self.mem, label, tensor_key, chunk_labels, chunk_indices, cpu_tensors
+                )
 
-            results[tensor_key] = Task(
-                ctx=ctx,
-                cpu_tensors=cpu_tensors,
-                label=label,
-                tensor_key=tensor_key,
-                chunk_labels=chunk_labels,
-            )
-            self._inflight[id(results[tensor_key])] = (results[tensor_key], False)
+                results[tensor_key] = Task(
+                    ctx=ctx,
+                    cpu_tensors=cpu_tensors,
+                    label=label,
+                    tensor_key=tensor_key,
+                    chunk_labels=chunk_labels,
+                    load_pins=load_pins,
+                )
+                self._inflight[id(results[tensor_key])] = (results[tensor_key], False)
+        except BaseException:
+            # Tasks never created would never release their share of the pins.
+            self._release_load_pins(load_pins, len(tensors) - len(results))
+            raise
 
         return results
 
@@ -445,7 +514,17 @@ class KVFlow:
     @profile_func(lambda self, label, chunk_labels: f"(count={len(chunk_labels)})")
     def put_finish(self, label: str, chunk_labels: List[str]) -> None:
         assert self.record is not None
+        if self.entries_per_group > 0:
+            return  # Mem records each group once all of its entries are stored
         self.record.submit(label, chunk_labels)
+
+    def pop_load_failures(self) -> set:
+        """Chunk indices (block ids) that failed to load since the last call: the block was
+        not in the pool (e.g. evicted after the lookup), so its destination was not written."""
+        if self.has_only_mode or not self._load_failed:
+            return set()
+        failed, self._load_failed = self._load_failed, set()
+        return failed
 
     @profile_func(lambda self, label, chunk_labels: f"(count={len(chunk_labels)})")
     def has(self, label: str, chunk_labels: List[str]) -> List[bool]:
@@ -503,6 +582,9 @@ class KVFlow:
             "misses": self.mem.misses,
             "puts": self.mem.puts,
             "evictions": self.mem.evictions,
+            "evicted_bytes": self.mem.evicted_bytes,
+            "evict_watermark": self.mem.evict_watermark,
+            "load_failed_blocks_total": self._load_failed_total,
             "total_unzip_bytes": self.mem.total_unzip_bytes,
             "total_zip_bytes": self.mem.total_zip_bytes,
             "compression_ratio (unzip/zip, higher=better)": round(

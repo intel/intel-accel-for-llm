@@ -56,8 +56,9 @@ class KVStoreRemote:
         self.rank = rank
         self.tp_size = tp_size
         self.has_only_mode = kv_caches is None
-        self._pending: Dict[int, list] = {}  # job_id -> [tasks, remaining]
+        self._pending: Dict[int, list] = {}  # job_id -> [tasks, remaining, is_get]
         self._early_done: Dict[int, set] = {}  # done notifications that beat the job_id response
+        self._get_done_since_pop = False  # a get layer finished since the last pop_load_failures()
 
         if self.has_only_mode:
             name, self.peer = "client_sched", "daemon_sched"
@@ -107,7 +108,7 @@ class KVStoreRemote:
         payload = rpc.pack_blocks(block_indices, block_hashs, [self.layer_idx[n] for n in names], description)
         job_id = int.from_bytes(self.rpc.call(method, payload), "little")
         tasks = {n: RemoteTask(job_id, n) for n in names}
-        self._pending[job_id] = [tasks, len(tasks)]
+        self._pending[job_id] = [tasks, len(tasks), method == rpc.GET]
         for layer_idx in self._early_done.pop(job_id, set()):
             self._mark_done(job_id, layer_idx)
         return tasks
@@ -137,6 +138,16 @@ class KVStoreRemote:
     def get_wait(self, get_results, layer_names=None, wait=True) -> bool:
         return self._wait(get_results, layer_names, wait, "get_wait")
 
+    def pop_load_failures(self) -> set:
+        """Block indices the daemon could not load since the last call (see KVStoreLocal)."""
+        if self.has_only_mode:
+            return set()
+        self.rpc.drain()
+        if not self._get_done_since_pop:
+            return set()  # failures are recorded before the daemon pushes `done`
+        self._get_done_since_pop = False
+        return set(rpc.unpack_json(self.rpc.call(rpc.LOAD_FAILURES)) or [])
+
     def _on_done(self, job_id: int, layer_idx: int):
         entry = self._pending.get(job_id)
         if entry is None:
@@ -151,6 +162,8 @@ class KVStoreRemote:
             return
         task.done = True
         entry[1] -= 1
+        if entry[2]:
+            self._get_done_since_pop = True
         if entry[1] == 0:
             del self._pending[job_id]
 

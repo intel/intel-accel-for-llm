@@ -115,6 +115,11 @@ class Context {
     void unzip_wait();
     bool unzip_is_complete();
 
+    // Chunk indices that the last unzip_from_mem could not find in the pool (valid after
+    // unzip_wait()). Those GPU blocks were not written and must be treated as failed loads.
+    const std::vector<int64_t> &unzip_failed_indices() const { return unzip_failed_; }
+    void set_unzip_failed(std::vector<int64_t> indices) { unzip_failed_ = std::move(indices); }
+
     void reset_async_state() { event_recorded_.store(false, std::memory_order_release); }
 
     unsigned long long stream_id() const { return stream_id_; }
@@ -148,6 +153,7 @@ class Context {
             name_ = std::move(other.name_);
             zip_future_ = std::move(other.zip_future_);
             unzip_future_ = std::move(other.unzip_future_);
+            unzip_failed_ = std::move(other.unzip_failed_);
 
             other.xctx_ = nullptr;
             other.event_ = nullptr;
@@ -177,6 +183,7 @@ class Context {
     std::string name_;
     std::future<void> zip_future_;
     std::future<void> unzip_future_;
+    std::vector<int64_t> unzip_failed_;
 };
 
 inline void gpu_transfer_batch_pytorch(torch::Tensor &gpu_tensor, int chunk_dim,

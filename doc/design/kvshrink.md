@@ -69,6 +69,25 @@ The scheduler returns both the number of externally cached tokens and whether th
 
 With early-layer promotion, the worker reports a load complete after the first configured layers are ready. vLLM can then begin prefill while IAXL continues loading later layers; `wait_for_layer_load()` enforces the dependency immediately before each layer consumes its KV data.
 
+## DDR Pool Capacity and Lookup Consistency
+
+`IAXL_DDR_POOL_SIZE_GB` is a hard budget for each worker's host cache. When a store pushes the pool past it, IAXL evicts least-recently-used blocks down to `IAXL_DDR_POOL_EVICT_WATERMARK` (default 0.95) of the budget. Blocks of an in-progress load are pinned from submission until the last layer has been loaded, and are never evicted. `POST /v1/cache/evict` uses the same eviction path.
+
+The scheduler's lookup reads the per-rank SQLite record, not DRAM, so the record follows the pool:
+
+- A block is recorded only after the compressed data for **all** of its layers is stored, not when the save is submitted.
+- Evicting a block removes its record entry, unless the block was persisted to storage; persisted blocks reload from disk on the next load.
+
+A lookup can still go stale between the scheduler's check and the worker's load. For example, the block may be evicted in that window, or another tensor-parallel rank may have evicted it first, because each rank evicts independently and the scheduler checks only rank 0. In that case the load does not abort. The missing blocks are not written; the connector reports them through `get_block_ids_with_load_errors()`, and the request falls back to vLLM's `kv_load_failure_policy`. Use `"recompute"` (as `examples/kvshrink-vllm-serve.sh` does) to recompute those blocks; the default `"fail"` fails only the affected requests.
+
+The connector also keeps the recovery bounded:
+
+- Each failed block is reported once per load, not once per layer.
+- An asynchronous load with failed blocks is not promoted early. It is reported finished only after all of its layers are done, so no load is still writing into blocks that vLLM rolls back or frees.
+- The scheduler treats a failed block as a miss until it has been saved again. Otherwise the lookup would keep matching it, and every retry would fail the same way.
+
+> **vLLM model runner:** with vLLM 0.29, `kv_load_failure_policy="recompute"` produces corrupted output under the V2 model runner (the default), which does not realign its token state after the scheduler discards a failed step. Set `VLLM_USE_V2_MODEL_RUNNER=0` when recompute may be triggered; `examples/kvshrink-vllm-serve.sh` does this by default.
+
 ## Layer-Pipelined Load
 
 A load request covers all layers, but each layer moves through the stages independently: decompress into pinned CPU buffers, transfer into the KV tensor, then mark the layer ready. Each stage is serial within its own lane, while the lanes run concurrently on different layers.

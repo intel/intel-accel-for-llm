@@ -44,6 +44,11 @@ def _float_or_none(name: str) -> Optional[float]:
         return None
 
 
+def _ratio(name: str, default: float) -> float:
+    v = _float_or_none(name)
+    return v if v is not None and 0.0 < v <= 1.0 else default
+
+
 class Envs:
     def __init__(self) -> None:
         self.IAXL_DEBUG = _bool("IAXL_DEBUG")
@@ -67,6 +72,8 @@ class Envs:
         )
 
         self.IAXL_DDR_POOL_SIZE_GB = _float_or_none("IAXL_DDR_POOL_SIZE_GB")
+        # Over IAXL_DDR_POOL_SIZE_GB, LRU groups are evicted down to this fraction of it.
+        self.IAXL_DDR_POOL_EVICT_WATERMARK = _ratio("IAXL_DDR_POOL_EVICT_WATERMARK", 0.95)
         self.IAXL_SCRATCH_POOL_SIZE_GB = _int("IAXL_SCRATCH_POOL_SIZE_GB", 8)
 
         self.IAXL_PREALLOC_LIMIT = _int("IAXL_PREALLOC_LIMIT", 0)

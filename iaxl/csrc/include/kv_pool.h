@@ -121,9 +121,13 @@ class Record {
 
     void submit(const std::string &label, const std::vector<std::string> &chunk_labels);
 
+    // Same as submit(), but takes ready-made group keys ("label:chunk_id").
+    void submit_group_keys(const std::vector<std::string> &group_keys);
+
     void mark_persisted(const std::vector<std::string> &chunk_labels);
 
-    void remove(const std::vector<std::string> &chunk_labels);
+    // wait=false only enqueues the delete; FIFO order with earlier submits is preserved.
+    void remove(const std::vector<std::string> &chunk_labels, bool wait = true);
 
     std::vector<bool> is_persisted(const std::vector<std::string> &chunk_labels);
 
@@ -174,6 +178,22 @@ class Mem {
     std::vector<std::pair<const char *, size_t>> get_unlocked(const std::vector<std::string> &keys,
                                                               bool allow_using_omp = false);
 
+    // Like get(), but pins the group of every hit so no eviction path frees it until unpin().
+    // Appends one handle per hit to `pins`; pass them all to unpin() exactly once.
+    using PinHandle = const void *;
+    std::vector<std::pair<const char *, size_t>> get_pinned(const std::vector<std::string> &keys,
+                                                            std::vector<PinHandle> &pins,
+                                                            bool allow_using_omp = false);
+    void unpin(const std::vector<PinHandle> &pins);
+
+    // Pins whole groups ("label:chunk_id") present in memory for a multi-layer load and returns
+    // each group's state. Pass the keys that were pinned (state != kGroupAbsent) to unpin_groups().
+    static constexpr uint8_t kGroupAbsent = 0;
+    static constexpr uint8_t kGroupIncomplete = 1; // present, but not every entry is stored
+    static constexpr uint8_t kGroupComplete = 2;
+    std::vector<uint8_t> pin_groups(const std::vector<std::string> &group_keys);
+    void unpin_groups(const std::vector<std::string> &group_keys);
+
     std::vector<bool> has(const std::vector<std::string> &keys);
 
     size_t remove(const std::string &key);
@@ -187,6 +207,16 @@ class Mem {
 
     void set_evict_enabled(bool enabled);
     bool is_evict_enabled() const;
+
+    // When > 0, a group is recorded only once it holds this many entries (one per tensor/layer),
+    // i.e. after its data is actually stored. 0 keeps the record fully caller-managed.
+    void set_entries_per_group(size_t count);
+    size_t entries_per_group() const;
+
+    // Once current_bytes() exceeds capacity_bytes(), LRU groups are evicted down to
+    // capacity_bytes() * ratio. ratio is clamped to (0, 1].
+    void set_evict_watermark(double ratio);
+    double evict_watermark() const;
 
     void lock();
     void unlock();
@@ -214,6 +244,7 @@ class Mem {
     uint64_t misses() const;
     uint64_t puts() const;
     uint64_t evictions() const;
+    uint64_t evicted_bytes() const;
     uint64_t total_unzip_bytes() const;
     uint64_t total_zip_bytes() const;
     double compression_ratio() const;

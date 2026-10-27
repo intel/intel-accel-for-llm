@@ -102,6 +102,8 @@ class KVStoreLocal:
             persist_dir=final_persist_dir,
             cache_size_gb=pool_size_gb,
             rank=rank,
+            # A block is recorded (visible to has()) only once every layer is stored.
+            entries_per_group=0 if self.has_only_mode else len(self.layer_names),
         )
         start_profiling()
 
@@ -186,10 +188,6 @@ class KVStoreLocal:
             skip_compression_count=local_skip,
         )
 
-        if self.layer_names[-1] in layer_names:
-            self.tensorzip.put_finish(self.LABEL, block_hashs)
-            self.tensorzip.record_flush()
-
         return result
 
     def put_wait(
@@ -254,6 +252,13 @@ class KVStoreLocal:
             tensor_dict_keys=layer_names,
             wait=wait,
         )
+
+    def pop_load_failures(self) -> set:
+        """Block indices whose load failed (block missing from the pool) since the last call.
+        Their KV was not written; the caller must recompute them."""
+        if self.has_only_mode:
+            return set()
+        return self.tensorzip.pop_load_failures()
 
     def has(self, block_hashs: Optional[List[str]] = None) -> List[bool]:
         if not block_hashs:

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 CTRL_BYTES = 4 << 20
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
-    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER = range(14)
+    PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER, LOAD_FAILURES = range(15)
 
 REQ_FMT, RESP_FMT, PUSH_FMT = "<cBIQ", "<cIB", "<cIH"
 REQ_SIZE, RESP_SIZE, PUSH_SIZE = (struct.calcsize(f) for f in (REQ_FMT, RESP_FMT, PUSH_FMT))
@@ -248,6 +248,9 @@ class KVStoreService:
         hashes, _ = unpack_hashes(payload)
         return np.asarray(self.kvstore.has(hashes), dtype=np.uint8).tobytes()
 
+    def _load_failures(self, peer, payload):
+        return pack_json(sorted(self.kvstore.pop_load_failures()))
+
     def _stop(self, peer, payload):
         if self.kvstore is not None:
             self.kvstore.stop()
@@ -281,6 +284,7 @@ class KVStoreService:
         EVICT_CANDIDATES: _json_call("get_evict_candidates"),
         STOP: _stop,
         UNREGISTER: _unregister,
+        LOAD_FAILURES: _load_failures,
     }
 
     # -- completion polling --------------------------------------------------
