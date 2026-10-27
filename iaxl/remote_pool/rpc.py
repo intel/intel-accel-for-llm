@@ -14,17 +14,20 @@ import json
 import logging
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Set
 
 import numpy as np
 import torch
 
+from ..envs import envs
 from ..utils import cuda_available
 
 logger = logging.getLogger(__name__)
 
 CTRL_BYTES = 4 << 20
+MAX_PENDING_PUTS = envs.IAXL_MAX_RDMA_PENDING_PUTS
 
 HELLO, REGISTER_KV_CACHES, REGISTER_LAYERS, PUT, GET, HAS, STATUS, METRICS, PERSIST, EVICT, \
     PERSIST_CANDIDATES, EVICT_CANDIDATES, STOP, UNREGISTER = range(14)
@@ -177,9 +180,11 @@ class RpcChannel:
 @dataclass
 class Job:
     peer: str
-    tasks: dict
+    tasks: dict | None
     is_put: bool
     not_done: Set[str] = field(default_factory=set)
+    pending_put: tuple | None = None
+    reply_seq: int | None = None
 
 
 class KVStoreService:
@@ -196,10 +201,14 @@ class KVStoreService:
         self.layer_idx: Dict[str, int] = {}
         self.remote_bases: Dict[int, tuple] = {}
         self.jobs: Dict[int, Job] = {}
+        self.pending_puts = deque()
         self._next_job = 0
+        self.put_backpressure_enabled = envs.IAXL_RDMA_PUT_BACKPRESSURE
 
     # -- dispatch ------------------------------------------------------------
-    def dispatch(self, peer: str, method: int, payload: bytes) -> bytes:
+    def dispatch(self, peer: str, method: int, payload: bytes, seq: int | None = None) -> bytes | None:
+        if method == PUT:
+            return self._put(peer, payload, seq)
         return self._HANDLERS[method](self, peer, payload)
 
     def _hello(self, peer, payload):
@@ -254,17 +263,63 @@ class KVStoreService:
         self.layer_names = list(names)
         self.layer_idx = {n: i for i, n in enumerate(self.layer_names)}
 
-    def _xfer(self, peer, payload, is_put):
+    def _xfer(self, peer, payload, is_put, seq=None):
         indices, hashes, layer_idx, desc, label = unpack_blocks(payload)
         names = [self.layer_names[i] for i in layer_idx] or None
-        fn = self.kvstore.put if is_put else self.kvstore.get
-        tasks = fn(indices, hashes, names, desc, label=label or None)
         self._next_job = job_id = (self._next_job + 1) & 0xFFFFFFFF
-        self.jobs[job_id] = Job(peer, tasks, is_put, set(tasks.keys()))
+        if is_put:
+            job = Job(peer, None, True, pending_put=(indices, hashes, names, desc, label or None))
+            self.jobs[job_id] = job
+            if self.put_backpressure_enabled and (self._has_active_gets() or self.pending_puts):
+                self.pending_puts.append(job_id)
+                if len(self.pending_puts) > MAX_PENDING_PUTS and seq is not None:
+                    job.reply_seq = seq
+                    logger.warning(
+                        "PUT backlog exceeded %d jobs; delaying RPC response for job %d",
+                        MAX_PENDING_PUTS,
+                        job_id,
+                    )
+                    return None
+            else:
+                try:
+                    self._start_put(job_id)
+                except Exception:
+                    self.jobs.pop(job_id, None)
+                    raise
+        else:
+            tasks = self.kvstore.get(indices, hashes, names, desc, label=label or None)
+            self.jobs[job_id] = Job(peer, tasks, False, set(tasks.keys()))
         return struct.pack("<I", job_id)
 
-    def _put(self, peer, payload):
-        return self._xfer(peer, payload, True)
+    def _has_active_gets(self):
+        return any(not job.is_put for job in self.jobs.values())
+
+    def _start_put(self, job_id):
+        job = self.jobs[job_id]
+        indices, hashes, names, desc, label = job.pending_put
+        tasks = self.kvstore.put(indices, hashes, names, desc, label=label)
+        job.tasks = tasks
+        job.not_done = set(tasks.keys())
+        job.pending_put = None
+
+    def start_pending_puts(self, max_jobs: int | None = None):
+        """Submit queued PUTs only after all currently active GET jobs have drained."""
+        if self._has_active_gets():
+            return []
+        responses = []
+        submitted = 0
+        while self.pending_puts and (max_jobs is None or submitted < max_jobs):
+            job_id = self.pending_puts.popleft()
+            job = self.jobs[job_id]
+            self._start_put(job_id)
+            submitted += 1
+            if job.reply_seq is not None:
+                responses.append((job.peer, job.reply_seq, struct.pack("<I", job_id)))
+                job.reply_seq = None
+        return responses
+
+    def _put(self, peer, payload, seq=None):
+        return self._xfer(peer, payload, True, seq)
 
     def _get(self, peer, payload):
         return self._xfer(peer, payload, False)
@@ -316,6 +371,8 @@ class KVStoreService:
         kv = self.kvstore
         for job_id in list(self.jobs):
             job = self.jobs[job_id]
+            if job.pending_put is not None:
+                continue
             wait = kv.put_wait if job.is_put else kv.get_wait
             for name in list(job.not_done):
                 if wait(job.tasks, [name], wait=False):
@@ -330,21 +387,33 @@ def serve(xfer, service: KVStoreService, idle_spin: int = 2000, idle_sleep: floa
     idle = 0
     while True:
         busy = False
-        for peer, msg in xfer.iter_notifs():
+        notifs = list(xfer.iter_notifs())
+        # Process GET requests before PUTs within the same batch so an active
+        # GET is registered before PUTs arrived in the same poll window.
+        if len(notifs) > 1:
+            notifs.sort(key=lambda item: 0 if struct.unpack_from(REQ_FMT, item[1])[1] == GET else 1)
+        for peer, msg in notifs:
             busy = True
             kind, method, seq, n = struct.unpack_from(REQ_FMT, msg)
             payload = service.ctrl_np[:n].tobytes() if kind == b"Q" else msg[REQ_SIZE:REQ_SIZE + n]
             try:
-                ok, body = True, service.dispatch(peer, method, payload)
+                ok, body = True, service.dispatch(peer, method, payload, seq)
             except Exception as e:  # report to the caller, keep serving
                 logger.exception("rpc: method %d from %s failed", method, peer)
                 ok, body = False, str(e).encode()
-            xfer.send_notif(peer, struct.pack(RESP_FMT, b"R", seq, ok) + body)
+            if body is not None:
+                xfer.send_notif(peer, struct.pack(RESP_FMT, b"R", seq, ok) + body)
             if method == STOP:
                 return
+            if service.jobs:
+                for job_id, layer_idx, done_peer in service.poll_done():
+                    xfer.send_notif(done_peer, struct.pack(PUSH_FMT, b"D", job_id, layer_idx))
         for job_id, layer_idx, peer in service.poll_done():
             busy = True
             xfer.send_notif(peer, struct.pack(PUSH_FMT, b"D", job_id, layer_idx))
+        for peer, seq, body in service.start_pending_puts(max_jobs=1):
+            busy = True
+            xfer.send_notif(peer, struct.pack(RESP_FMT, b"R", seq, True) + body)
         if busy or service.jobs:
             idle = 0
         elif idle < idle_spin:
