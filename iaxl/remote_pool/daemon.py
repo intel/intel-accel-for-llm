@@ -29,7 +29,10 @@ def serve_rank(rank: int, tp_size: int, ips: list[str], port: int):
     from .nixl_impl import configure_ucx_env, rdma_xfer_cpp
 
     setup_root_logger()
-    bind_cpu_affinity(rank, tp_size, os.getenv("VLLM_CPU_OMP_THREADS_BIND"))
+    cpu_spec = os.getenv("VLLM_CPU_OMP_THREADS_BIND", "")
+    bind_cpu_affinity(rank, tp_size, cpu_spec)
+    # libiomp can reset affinity; native workers rebind from this per-rank value.
+    os.environ["IAXL_CPU_OMP_THREADS_BIND"] = cpu_spec.split("|")[rank]
     bind_intel_accel(rank)
     configure_ucx_env(ips, rank=rank)
     xfer = rdma_xfer_cpp(f"daemon{rank}", port)

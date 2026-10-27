@@ -178,6 +178,8 @@ export IAXL_RDMA_DAEMON_NIC_IPS=${IAXL_RDMA_DAEMON_NIC_IPS:-} # Daemon RDMA NIC 
 export IAXL_RDMA_CLIENT_NIC_IPS=${IAXL_RDMA_CLIENT_NIC_IPS:-} # Client RDMA NIC IPs per rank (a single IP is allowed); first is also the scheduler IP (required on client)
 export IAXL_RDMA_DAEMON_PORT=${IAXL_RDMA_DAEMON_PORT:-5555}   # Scheduler port; rank r listens on port+1+r
 export IAXL_RDMA_TP_SIZE=${IAXL_RDMA_TP_SIZE:-$TP_SIZE}       # Daemon rank process count (must equal client TP)
+export IAXL_RDMA_PUT_BACKPRESSURE=${IAXL_RDMA_PUT_BACKPRESSURE:-1}
+export IAXL_MAX_RDMA_PENDING_PUTS=${IAXL_MAX_RDMA_PENDING_PUTS:-128}
 
 HOST_IP=$(ip route get 1 | awk '{print $7}' | tr -d '\n')
 export no_proxy=localhost,127.0.0.1,localaddress,.localdomain.com,.local,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,${HOST_IP}

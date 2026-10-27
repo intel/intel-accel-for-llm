@@ -83,6 +83,8 @@ class Envs:
         self.IAXL_RDMA_CLIENT_NIC_IPS = _str("IAXL_RDMA_CLIENT_NIC_IPS", "")
         self.IAXL_RDMA_DAEMON_PORT = _int("IAXL_RDMA_DAEMON_PORT", 5555)
         self.IAXL_RDMA_TP_SIZE = _int("IAXL_RDMA_TP_SIZE", 1)
+        self.IAXL_RDMA_PUT_BACKPRESSURE = _bool("IAXL_RDMA_PUT_BACKPRESSURE", True)
+        self.IAXL_MAX_RDMA_PENDING_PUTS = max(1, _int("IAXL_MAX_RDMA_PENDING_PUTS", 128))
 
         self.IAXL_PROFILE_MODE = _str("IAXL_PROFILE_MODE", "").strip().lower()
         self.IAXL_METRICS_ENABLED = _bool("IAXL_METRICS_ENABLED")
