@@ -457,7 +457,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = KVShrinkConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_save=self._reqs_to_save,
-            scheduled_req_ids=set(scheduler_output.num_scheduled_tokens),
+            # scheduler_output.num_scheduled_tokens is a dict keyed by req id.
+            scheduled_req_ids=set(scheduler_output.num_scheduled_tokens.keys()),
         )
         self._reqs_to_load = RequestMetadata()
         self._reqs_to_save = RequestMetadata()

@@ -85,8 +85,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Call unzip_wait() + xfer_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
              py::arg("chunk_indices"), py::arg("cpu_tensors"),
-             py::arg("priority") = TaskQueue::PRIORITY_HIGH, py::arg("bundle_id") = 0,
-             py::arg("sort_key") = -1, py::call_guard<py::gil_scoped_release>())
+             py::arg("priority") = static_cast<int>(TaskQueue::PRIORITY_HIGH),
+             py::arg("bundle_id") = 0, py::arg("sort_key") = -1,
+             py::call_guard<py::gil_scoped_release>())
         .def("zip_wait", &Context::zip_wait, "Wait for zip_to_mem to complete",
              py::call_guard<py::gil_scoped_release>())
         .def("zip_is_complete", &Context::zip_is_complete,

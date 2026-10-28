@@ -23,13 +23,15 @@
 class TaskQueue {
   public:
     // Levels, most urgent first; the worker takes the front task of the most urgent non-empty one.
-    static constexpr int PRIORITY_P0 = 0;
-    static constexpr int PRIORITY_P1 = 1;
-    static constexpr int PRIORITY_P2 = 2;
-    static constexpr int PRIORITY_P3 = 3;
-    static constexpr int NUM_PRIORITIES = 4;
-    static constexpr int PRIORITY_HIGH = PRIORITY_P0;
-    static constexpr int PRIORITY_LOW = PRIORITY_P3;
+    enum {
+        PRIORITY_P0 = 0,
+        PRIORITY_P1,
+        PRIORITY_P2,
+        PRIORITY_P3,
+        NUM_PRIORITIES,
+        PRIORITY_HIGH = PRIORITY_P0,
+        PRIORITY_LOW = PRIORITY_P3
+    };
 
     explicit TaskQueue(const char *name) : name_(name) {}
 
