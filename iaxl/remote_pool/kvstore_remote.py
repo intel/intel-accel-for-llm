@@ -67,8 +67,13 @@ class KVStoreRemote:
         self.xfer = rdma_xfer(name, client_ips, rank=None if self.has_only_mode else rank)
         self.rpc = RpcChannel(self.xfer, self.peer, self._on_done)
         if kv_caches is not None:
-            for t in kv_caches.values():  # rkeys ride along with our metadata
-                self.xfer.register_memory(t)
+            # rkeys ride along with our metadata. Hybrid layers of different groups
+            # share one buffer: register it once, as the daemon loads each region once.
+            registered = set()
+            for t in kv_caches.values():
+                if t.data_ptr() not in registered:
+                    registered.add(t.data_ptr())
+                    self.xfer.register_memory(t)
         self.xfer.connect(self.peer, ip, port, timeout_s=envs.IAXL_API_TIMEOUT)
         self.rpc.handshake()
 
