@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <sys/prctl.h>
@@ -264,8 +265,49 @@ struct Metrics {
     };
 
     Counter compress, decompress;
-    // Time the xfer path blocks (copy submission on the H2D/D2H thread + xfer_wait).
-    Counter h2d, d2h;
+
+    // Transfer throughput = bytes / time at least one transfer was in flight (first copy op
+    // started -> xfer_wait returned). Overlapping transfers are merged, so this is the real
+    // engine throughput rather than a sum of per-context latencies. wait_ns is the total time
+    // callers were blocked inside xfer_wait.
+    struct Xfer {
+        std::atomic<uint64_t> bytes{0};
+        std::atomic<uint64_t> ns{0};
+        std::atomic<uint64_t> wait_ns{0};
+
+        void begin() {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (active_++ == 0)
+                window_start_ = std::chrono::steady_clock::now();
+        }
+        void end() {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (active_ > 0 && --active_ == 0)
+                ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - window_start_)
+                                 .count(),
+                             std::memory_order_relaxed);
+        }
+        void reset() {
+            bytes.store(0, std::memory_order_relaxed);
+            ns.store(0, std::memory_order_relaxed);
+            wait_ns.store(0, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(mu_);
+            active_ = 0;
+        }
+        double gbps() const {
+            uint64_t t = ns.load(std::memory_order_relaxed);
+            return t ? static_cast<double>(bytes.load(std::memory_order_relaxed)) / t : 0.0;
+        }
+
+      private:
+        std::mutex mu_;
+        int active_ = 0;
+        std::chrono::steady_clock::time_point window_start_;
+    };
+
+    Xfer h2d, d2h;
+    Xfer &xfer(bool is_h2d) { return is_h2d ? h2d : d2h; }
 
     void reset() {
         compress.reset();
@@ -308,12 +350,16 @@ using profiler::g_metrics;
 
 #define METRICS_ADD_COMPRESS(var, bytes) METRICS_ADD(var, compress, bytes)
 #define METRICS_ADD_DECOMPRESS(var, bytes) METRICS_ADD(var, decompress, bytes)
-#define METRICS_ADD_XFER(var, is_h2d, bytes)                                                       \
+
+// Adds the time since METRICS_TIMER_START(var) to the given std::atomic<uint64_t>.
+#define METRICS_ADD_NS(var, counter_ns)                                                            \
     do {                                                                                           \
-        if (is_h2d)                                                                                \
-            METRICS_ADD(var, h2d, bytes);                                                          \
-        else                                                                                       \
-            METRICS_ADD(var, d2h, bytes);                                                          \
+        if (KVCLIP_UNLIKELY((var).enabled))                                                        \
+            (counter_ns)                                                                           \
+                .fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(                   \
+                               std::chrono::steady_clock::now() - (var).t0)                        \
+                               .count(),                                                           \
+                           std::memory_order_relaxed);                                             \
     } while (0)
 
 #ifdef KVCLIP_PROFILER_DISABLED

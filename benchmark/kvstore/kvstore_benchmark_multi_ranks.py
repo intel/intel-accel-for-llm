@@ -89,6 +89,8 @@ def aggregate(statuses: list, metrics: list) -> tuple:
         total[f"{op}_bytes"] = num_bytes
         total[f"{op}_ns"] = ns
         total[f"{op}_gbps"] = num_bytes / ns if ns else 0.0
+    for op in ("h2d", "d2h"):
+        total[f"{op}_wait_ns"] = sum(m[f"{op}_wait_ns"] for m in metrics)
     return status, total
 
 
@@ -122,17 +124,20 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
         return total_bytes / seconds / (1024**3)
 
     print(f"\nPer rank ({kb.format_bytes(total_bytes)} each)")
-    print("-" * 100)
+    print("-" * 120)
     print(
         f"{'Rank':>4} {'PUT GiB/s':>10} {'GET GiB/s':>10} "
-        f"{'Verify':>6} {'Ratio':>7} {'Zip GB/s':>9} {'Unzip GB/s':>10} {'D2H GB/s':>9} {'H2D GB/s':>9}"
+        f"{'Verify':>6} {'Ratio':>7} {'Zip GB/s':>9} {'Unzip GB/s':>10} "
+        f"{'D2H GB/s':>9} {'D2H wait ms':>11} {'H2D GB/s':>9} {'H2D wait ms':>11}"
     )
     for rank in range(tp_size):
+        m = metrics[rank]
         print(
             f"{rank:>4} {gibps(put_times[rank]):10.3f} {gibps(get_times[rank]):10.3f} "
             f"{'pass' if verified[rank] else 'FAIL':>6} {statuses[rank][RATIO_KEY]:7.3f} "
-            f"{metrics[rank]['compress_gbps']:9.3f} {metrics[rank]['decompress_gbps']:10.3f} "
-            f"{metrics[rank]['d2h_gbps']:9.3f} {metrics[rank]['h2d_gbps']:9.3f}"
+            f"{m['compress_gbps']:9.3f} {m['decompress_gbps']:10.3f} "
+            f"{m['d2h_gbps']:9.3f} {m['d2h_wait_ns'] / 1e6:11.1f} "
+            f"{m['h2d_gbps']:9.3f} {m['h2d_wait_ns'] / 1e6:11.1f}"
         )
     print(
         f"{'Sum':>4} {sum(map(gibps, put_times)):10.3f} {sum(map(gibps, get_times)):10.3f} "
@@ -140,7 +145,9 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
         f"{sum(m['compress_gbps'] for m in metrics):9.3f} "
         f"{sum(m['decompress_gbps'] for m in metrics):10.3f} "
         f"{sum(m['d2h_gbps'] for m in metrics):9.3f} "
-        f"{sum(m['h2d_gbps'] for m in metrics):9.3f}"
+        f"{sum(m['d2h_wait_ns'] for m in metrics) / 1e6:11.1f} "
+        f"{sum(m['h2d_gbps'] for m in metrics):9.3f} "
+        f"{sum(m['h2d_wait_ns'] for m in metrics) / 1e6:11.1f}"
     )
 
     status, total = aggregate(statuses, metrics)

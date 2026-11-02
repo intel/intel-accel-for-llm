@@ -526,7 +526,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         []() {
             py::dict d;
             d["enabled"] = profiler::g_metrics_enabled;
-            auto put = [&d](const char *name, const profiler::Metrics::Counter &c) {
+            auto put = [&d](const char *name, const auto &c) {
                 d[(std::string(name) + "_bytes").c_str()] = c.bytes.load(std::memory_order_relaxed);
                 d[(std::string(name) + "_ns").c_str()] = c.ns.load(std::memory_order_relaxed);
                 d[(std::string(name) + "_gbps").c_str()] = c.gbps();
@@ -535,10 +535,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             put("decompress", profiler::g_metrics.decompress);
             put("h2d", profiler::g_metrics.h2d);
             put("d2h", profiler::g_metrics.d2h);
+            d["h2d_wait_ns"] = profiler::g_metrics.h2d.wait_ns.load(std::memory_order_relaxed);
+            d["d2h_wait_ns"] = profiler::g_metrics.d2h.wait_ns.load(std::memory_order_relaxed);
             return d;
         },
         "Read accumulated compression/decompression and H2D/D2H xfer throughput metrics "
-        "(GB/s is decimal)");
+        "(GB/s is decimal; *_wait_ns is the total time blocked in xfer_wait)");
 
     m.def(
         "task_queue_set_bundles_priority",
