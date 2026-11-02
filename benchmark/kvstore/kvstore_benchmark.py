@@ -613,6 +613,18 @@ def print_report(
         f"Decompress throughput: {metrics['decompress_gbps']:.3f} GB/s "
         f"({format_bytes(metrics['decompress_bytes'])} in {metrics['decompress_ns'] / 1e6:.1f} ms)"
     )
+    # xfer ns = time at least one transfer was in flight (copy start -> xfer_wait return);
+    # wait = total time callers were blocked in xfer_wait.
+    print(
+        f"D2H xfer throughput:   {metrics['d2h_gbps']:.3f} GB/s "
+        f"({format_bytes(metrics['d2h_bytes'])} in {metrics['d2h_ns'] / 1e6:.1f} ms, "
+        f"blocked {metrics['d2h_wait_ns'] / 1e6:.1f} ms in xfer_wait)"
+    )
+    print(
+        f"H2D xfer throughput:   {metrics['h2d_gbps']:.3f} GB/s "
+        f"({format_bytes(metrics['h2d_bytes'])} in {metrics['h2d_ns'] / 1e6:.1f} ms, "
+        f"blocked {metrics['h2d_wait_ns'] / 1e6:.1f} ms in xfer_wait)"
+    )
 
 
 def run_benchmark(args: argparse.Namespace) -> bool:

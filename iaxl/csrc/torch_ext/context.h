@@ -52,6 +52,7 @@ class Context {
             inner_size *= tensor.size(d);
         int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
         int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
+        ctx.chunk_bytes_ = outer_dims * inner_size;
 
         ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
                                             chunk_stride, outer_dims, inner_size, outer_block_size,
@@ -84,6 +85,7 @@ class Context {
         for (size_t d = chunk_dim + 1; d < shape.size(); d++)
             inner_size *= shape[d];
         int64_t outer_block_size = shape[chunk_dim] * inner_size;
+        ctx.chunk_bytes_ = outer_dims * inner_size;
 
         ctx.xctx_ = kv_xfer::rdma_context_create((char *)base, inner_size, outer_dims, inner_size,
                                                  outer_block_size);
@@ -132,6 +134,7 @@ class Context {
     Context() = default;
     ~Context() {
         check_no_pending_work();
+        xfer_metrics_end();
         ops_->event_release(event_);
         ops_->context_destroy(xctx_);
     }
@@ -139,12 +142,14 @@ class Context {
     Context &operator=(Context &&other) noexcept {
         if (this != &other) {
             check_no_pending_work();
+            xfer_metrics_end();
             ops_->event_release(event_);
             ops_->context_destroy(xctx_);
 
             ops_ = other.ops_;
             xctx_ = other.xctx_;
             stream_id_ = other.stream_id_;
+            chunk_bytes_ = other.chunk_bytes_;
             gpu_tensor_ = std::move(other.gpu_tensor_);
             direction_ = other.direction_;
             queue_ = other.queue_;
@@ -152,6 +157,8 @@ class Context {
             xfer_last_future_ = std::move(other.xfer_last_future_);
             event_recorded_.store(other.event_recorded_.load(std::memory_order_relaxed),
                                   std::memory_order_relaxed);
+            xfer_metrics_active_.store(other.xfer_metrics_active_.exchange(false),
+                                       std::memory_order_relaxed);
             name_ = std::move(other.name_);
             zip_future_ = std::move(other.zip_future_);
             unzip_future_ = std::move(other.unzip_future_);
@@ -172,15 +179,32 @@ class Context {
         IAXL_CHECK(!unzip_future_.valid(), "Context destroyed before unzip_wait completed");
     }
 
+    // Called on the H2D/D2H thread as each copy op starts; the first one opens this
+    // context's transfer window in g_metrics.
+    void xfer_metrics_begin(uint64_t bytes) {
+        if (KVCLIP_LIKELY(!g_metrics_enabled))
+            return;
+        auto &m = g_metrics.xfer(direction_ == GpuTransferDirection::H2D);
+        m.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (!xfer_metrics_active_.exchange(true))
+            m.begin();
+    }
+    void xfer_metrics_end() {
+        if (xfer_metrics_active_.exchange(false))
+            g_metrics.xfer(direction_ == GpuTransferDirection::H2D).end();
+    }
+
     const kv_xfer::Ops *ops_ = &kv_xfer::gpu_ops();
     kv_xfer::context_t xctx_ = nullptr;
     unsigned long long stream_id_ = 0;
+    int64_t chunk_bytes_ = 0;
     torch::Tensor gpu_tensor_;
     GpuTransferDirection direction_ = GpuTransferDirection::H2D;
     TaskQueue *queue_ = nullptr;
     kv_xfer::event_t event_ = nullptr;
     std::future<void> xfer_last_future_;
     std::atomic<bool> event_recorded_{false};
+    std::atomic<bool> xfer_metrics_active_{false};
     std::string name_;
     std::future<void> zip_future_;
     std::future<void> unzip_future_;

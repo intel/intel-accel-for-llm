@@ -137,9 +137,19 @@ struct XferContext {
     int64_t outer_dims;
     int64_t inner_size;
     int64_t outer_block_size;
+#if defined(DSA_SUPPORT)
+    // Latest DSA ticket issued through this context. Each Context (i.e. each layer in flight)
+    // waits for its own ticket instead of draining the whole engine, so the D2H submitter can
+    // keep later layers queued while the compressor consumes an earlier one.
+    uint64_t dsa_ticket = 0;
+#endif
 };
 
 static inline XferContext *as_ctx(context_t c) { return static_cast<XferContext *>(c); }
+
+#if defined(DSA_SUPPORT)
+void dsa_copy_wait(context_t ctx) { dsa_wait_ticket(as_ctx(ctx)->dsa_ticket); }
+#endif
 
 event_t event_acquire() { return GpuEventPool::instance().acquire(); }
 
@@ -255,7 +265,7 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
 #if defined(DSA_SUPPORT)
 
     if (dsa_copy_chunks_batch(gpu_base_ptr, chunk_stride, outer_dims, inner_size, outer_block_size,
-                              h2d, chunk_indices, cpu_ptrs)) {
+                              h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
             fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");

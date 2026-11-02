@@ -90,6 +90,8 @@ TESTS        += zip_compat_test
 TEST_TARGETS += test-zip-compat
 TESTS        += zip_throughput_test
 TEST_TARGETS += test-zip-throughput
+TESTS        += dsa_memcpy_test
+TEST_TARGETS += test-dsa-memcpy
 
 .PHONY: all test clean qat-userspace qpl-userspace $(TEST_TARGETS)
 
@@ -194,6 +196,14 @@ zip_throughput_test: test/zip_throughput_test.c $(LIBDIR)/libqat_zip.so $(LIBDIR
 
 test-zip-throughput: zip_throughput_test
 	(cd test && numactl --cpunodebind=0 --membind=0 ../zip_throughput_test $(ARGS))
+
+
+# Needs only the DSA WQs (no CUDA/gdrapi), so it is built regardless of DEVICE.
+dsa_memcpy_test: test/dsa_memcpy_test.c dsa_gd/dsa_memcpy.c common/envs.c $(wildcard $(INCDIR)/*.h)
+	$(CC) $(CFLAGS) $(dsa_gd_CFLAGS) -o $@ test/dsa_memcpy_test.c dsa_gd/dsa_memcpy.c common/envs.c $(LDFLAGS)
+
+test-dsa-memcpy: dsa_memcpy_test
+	numactl --cpunodebind=0 --membind=0 ./dsa_memcpy_test $(ARGS)
 
 
 qat-userspace: $(QATLIBS)

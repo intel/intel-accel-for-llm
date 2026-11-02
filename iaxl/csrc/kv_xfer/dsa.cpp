@@ -9,27 +9,33 @@
 
 #include "kv_xfer.h"
 #include "env.h"
+#include "iaxl_common.h"
 
 extern "C" {
 #include "dsa_gd.h"
 }
 
-extern "C" int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[],
-                                size_t count);
+extern "C" int64_t dsa_memcpy_batch_async(void *const dest[], const void *const src[],
+                                          const size_t n[], size_t count);
+extern "C" int dsa_memcpy_batch_wait(uint64_t ticket);
 
 namespace kv_xfer {
 
+// Serialises dsa_gd registration and batch submission. The wait path deliberately does not
+// take it: dsa_memcpy_batch_wait() is thread-safe on its own, and a waiter queued behind a
+// submitter that is blocked on a saturated WQ would lose the copy/compress overlap.
 static std::mutex dsa_context_mutex;
 
 void dsa_context_reset() {
     std::lock_guard<std::mutex> lock(dsa_context_mutex);
+    dsa_memcpy_batch_wait(UINT64_MAX); // drain every in-flight batch before tearing down
     dsa_gd_default_reset();
 }
 
 bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
                            int64_t inner_size, int64_t outer_block_size, bool is_h2d,
                            const std::vector<int64_t> &chunk_indices,
-                           const std::vector<char *> &cpu_ptrs) {
+                           const std::vector<char *> &cpu_ptrs, uint64_t &ticket) {
 
     if (!envs.IAXL_DSA_GD_ENABLE)
         return false;
@@ -85,8 +91,20 @@ bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_d
         }
     }
 
-    return dsa_memcpy_batch(dest.data(), const_cast<const void *const *>(src.data()), nbytes.data(),
-                            count) == 0;
+    const int64_t t = dsa_memcpy_batch_async(
+        dest.data(), const_cast<const void *const *>(src.data()), nbytes.data(), count);
+    if (t < 0)
+        return false;
+    // Tickets are monotonic, so remembering the latest one is enough to cover every batch
+    // this context has issued.
+    ticket = static_cast<uint64_t>(t);
+    return true;
+}
+
+void dsa_wait_ticket(uint64_t ticket) {
+    if (!envs.IAXL_DSA_GD_ENABLE || ticket == 0)
+        return;
+    IAXL_CHECK(dsa_memcpy_batch_wait(ticket) == 0, "dsa_wait_ticket: DSA batch failed");
 }
 
 } // namespace kv_xfer

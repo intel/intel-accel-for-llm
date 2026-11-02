@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <sys/prctl.h>
@@ -244,37 +245,75 @@ inline const char *get_profile_mode_string() {
 namespace profiler {
 
 struct Metrics {
-    std::atomic<uint64_t> compress_bytes{0};
-    std::atomic<uint64_t> compress_ns{0};
-    std::atomic<uint64_t> decompress_bytes{0};
-    std::atomic<uint64_t> decompress_ns{0};
+    // bytes / ns accumulated per operation; gbps() = bytes / ns (decimal GB/s).
+    struct Counter {
+        std::atomic<uint64_t> bytes{0};
+        std::atomic<uint64_t> ns{0};
 
-    void add_compress(uint64_t bytes, uint64_t ns) {
-        compress_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        compress_ns.fetch_add(ns, std::memory_order_relaxed);
-    }
+        void add(uint64_t b, uint64_t t) {
+            bytes.fetch_add(b, std::memory_order_relaxed);
+            ns.fetch_add(t, std::memory_order_relaxed);
+        }
+        void reset() {
+            bytes.store(0, std::memory_order_relaxed);
+            ns.store(0, std::memory_order_relaxed);
+        }
+        double gbps() const {
+            uint64_t t = ns.load(std::memory_order_relaxed);
+            return t ? static_cast<double>(bytes.load(std::memory_order_relaxed)) / t : 0.0;
+        }
+    };
 
-    void add_decompress(uint64_t bytes, uint64_t ns) {
-        decompress_bytes.fetch_add(bytes, std::memory_order_relaxed);
-        decompress_ns.fetch_add(ns, std::memory_order_relaxed);
-    }
+    Counter compress, decompress;
+
+    // Transfer throughput = bytes / time at least one transfer was in flight (first copy op
+    // started -> xfer_wait returned). Overlapping transfers are merged, so this is the real
+    // engine throughput rather than a sum of per-context latencies. wait_ns is the total time
+    // callers were blocked inside xfer_wait.
+    struct Xfer {
+        std::atomic<uint64_t> bytes{0};
+        std::atomic<uint64_t> ns{0};
+        std::atomic<uint64_t> wait_ns{0};
+
+        void begin() {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (active_++ == 0)
+                window_start_ = std::chrono::steady_clock::now();
+        }
+        void end() {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (active_ > 0 && --active_ == 0)
+                ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - window_start_)
+                                 .count(),
+                             std::memory_order_relaxed);
+        }
+        void reset() {
+            bytes.store(0, std::memory_order_relaxed);
+            ns.store(0, std::memory_order_relaxed);
+            wait_ns.store(0, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(mu_);
+            active_ = 0;
+        }
+        double gbps() const {
+            uint64_t t = ns.load(std::memory_order_relaxed);
+            return t ? static_cast<double>(bytes.load(std::memory_order_relaxed)) / t : 0.0;
+        }
+
+      private:
+        std::mutex mu_;
+        int active_ = 0;
+        std::chrono::steady_clock::time_point window_start_;
+    };
+
+    Xfer h2d, d2h;
+    Xfer &xfer(bool is_h2d) { return is_h2d ? h2d : d2h; }
 
     void reset() {
-        compress_bytes.store(0, std::memory_order_relaxed);
-        compress_ns.store(0, std::memory_order_relaxed);
-        decompress_bytes.store(0, std::memory_order_relaxed);
-        decompress_ns.store(0, std::memory_order_relaxed);
-    }
-
-    double compress_gbps() const {
-        uint64_t ns = compress_ns.load(std::memory_order_relaxed);
-        return ns ? static_cast<double>(compress_bytes.load(std::memory_order_relaxed)) / ns : 0.0;
-    }
-
-    double decompress_gbps() const {
-        uint64_t ns = decompress_ns.load(std::memory_order_relaxed);
-        return ns ? static_cast<double>(decompress_bytes.load(std::memory_order_relaxed)) / ns
-                  : 0.0;
+        compress.reset();
+        decompress.reset();
+        h2d.reset();
+        d2h.reset();
     }
 };
 
@@ -297,10 +336,11 @@ using profiler::g_metrics;
     if (KVCLIP_UNLIKELY(var.enabled))                                                              \
     var.t0 = std::chrono::steady_clock::now()
 
-#define METRICS_ADD_COMPRESS(var, bytes)                                                           \
+// Adds `bytes` and the time since METRICS_TIMER_START(var) to g_metrics.<counter>.
+#define METRICS_ADD(var, counter, bytes)                                                           \
     do {                                                                                           \
         if (KVCLIP_UNLIKELY((var).enabled)) {                                                      \
-            ::profiler::g_metrics.add_compress(                                                    \
+            ::profiler::g_metrics.counter.add(                                                     \
                 static_cast<uint64_t>(bytes),                                                      \
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(        \
                                           std::chrono::steady_clock::now() - (var).t0)             \
@@ -308,15 +348,18 @@ using profiler::g_metrics;
         }                                                                                          \
     } while (0)
 
-#define METRICS_ADD_DECOMPRESS(var, bytes)                                                         \
+#define METRICS_ADD_COMPRESS(var, bytes) METRICS_ADD(var, compress, bytes)
+#define METRICS_ADD_DECOMPRESS(var, bytes) METRICS_ADD(var, decompress, bytes)
+
+// Adds the time since METRICS_TIMER_START(var) to the given std::atomic<uint64_t>.
+#define METRICS_ADD_NS(var, counter_ns)                                                            \
     do {                                                                                           \
-        if (KVCLIP_UNLIKELY((var).enabled)) {                                                      \
-            ::profiler::g_metrics.add_decompress(                                                  \
-                static_cast<uint64_t>(bytes),                                                      \
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(        \
-                                          std::chrono::steady_clock::now() - (var).t0)             \
-                                          .count()));                                              \
-        }                                                                                          \
+        if (KVCLIP_UNLIKELY((var).enabled))                                                        \
+            (counter_ns)                                                                           \
+                .fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(                   \
+                               std::chrono::steady_clock::now() - (var).t0)                        \
+                               .count(),                                                           \
+                           std::memory_order_relaxed);                                             \
     } while (0)
 
 #ifdef KVCLIP_PROFILER_DISABLED
