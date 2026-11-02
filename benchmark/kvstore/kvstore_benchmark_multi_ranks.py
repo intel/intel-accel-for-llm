@@ -82,7 +82,7 @@ def aggregate(statuses: list, metrics: list) -> tuple:
     zip_bytes = status["total_zip_bytes"]
     status[RATIO_KEY] = status["total_unzip_bytes"] / zip_bytes if zip_bytes else 0.0
     total = {}
-    for op in ("compress", "decompress"):
+    for op in ("compress", "decompress", "h2d", "d2h"):
         # Same bytes / accumulated-ns definition as a single rank's *_gbps.
         num_bytes = sum(m[f"{op}_bytes"] for m in metrics)
         ns = sum(m[f"{op}_ns"] for m in metrics)
@@ -122,22 +122,25 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
         return total_bytes / seconds / (1024**3)
 
     print(f"\nPer rank ({kb.format_bytes(total_bytes)} each)")
-    print("-" * 80)
+    print("-" * 100)
     print(
         f"{'Rank':>4} {'PUT GiB/s':>10} {'GET GiB/s':>10} "
-        f"{'Verify':>6} {'Ratio':>7} {'Zip GB/s':>9} {'Unzip GB/s':>10}"
+        f"{'Verify':>6} {'Ratio':>7} {'Zip GB/s':>9} {'Unzip GB/s':>10} {'D2H GB/s':>9} {'H2D GB/s':>9}"
     )
     for rank in range(tp_size):
         print(
             f"{rank:>4} {gibps(put_times[rank]):10.3f} {gibps(get_times[rank]):10.3f} "
             f"{'pass' if verified[rank] else 'FAIL':>6} {statuses[rank][RATIO_KEY]:7.3f} "
-            f"{metrics[rank]['compress_gbps']:9.3f} {metrics[rank]['decompress_gbps']:10.3f}"
+            f"{metrics[rank]['compress_gbps']:9.3f} {metrics[rank]['decompress_gbps']:10.3f} "
+            f"{metrics[rank]['d2h_gbps']:9.3f} {metrics[rank]['h2d_gbps']:9.3f}"
         )
     print(
         f"{'Sum':>4} {sum(map(gibps, put_times)):10.3f} {sum(map(gibps, get_times)):10.3f} "
         f"{'':>6} {'':>7} "
         f"{sum(m['compress_gbps'] for m in metrics):9.3f} "
-        f"{sum(m['decompress_gbps'] for m in metrics):10.3f}"
+        f"{sum(m['decompress_gbps'] for m in metrics):10.3f} "
+        f"{sum(m['d2h_gbps'] for m in metrics):9.3f} "
+        f"{sum(m['h2d_gbps'] for m in metrics):9.3f}"
     )
 
     status, total = aggregate(statuses, metrics)

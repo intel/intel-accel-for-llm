@@ -526,17 +526,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         []() {
             py::dict d;
             d["enabled"] = profiler::g_metrics_enabled;
-            d["compress_bytes"] =
-                profiler::g_metrics.compress_bytes.load(std::memory_order_relaxed);
-            d["compress_ns"] = profiler::g_metrics.compress_ns.load(std::memory_order_relaxed);
-            d["compress_gbps"] = profiler::g_metrics.compress_gbps();
-            d["decompress_bytes"] =
-                profiler::g_metrics.decompress_bytes.load(std::memory_order_relaxed);
-            d["decompress_ns"] = profiler::g_metrics.decompress_ns.load(std::memory_order_relaxed);
-            d["decompress_gbps"] = profiler::g_metrics.decompress_gbps();
+            auto put = [&d](const char *name, const profiler::Metrics::Counter &c) {
+                d[(std::string(name) + "_bytes").c_str()] = c.bytes.load(std::memory_order_relaxed);
+                d[(std::string(name) + "_ns").c_str()] = c.ns.load(std::memory_order_relaxed);
+                d[(std::string(name) + "_gbps").c_str()] = c.gbps();
+            };
+            put("compress", profiler::g_metrics.compress);
+            put("decompress", profiler::g_metrics.decompress);
+            put("h2d", profiler::g_metrics.h2d);
+            put("d2h", profiler::g_metrics.d2h);
             return d;
         },
-        "Read accumulated compression/decompression throughput metrics (GB/s is decimal)");
+        "Read accumulated compression/decompression and H2D/D2H xfer throughput metrics "
+        "(GB/s is decimal)");
 
     m.def(
         "task_queue_set_bundles_priority",

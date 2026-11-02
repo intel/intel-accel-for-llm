@@ -16,7 +16,9 @@ void Context::xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx) {
     queue_->submit([=, this]() {
         PROFILE_SCOPE_FMT("xfer_chunk(%s,stream=%llu,idx=%ld)", name_.c_str(), stream_id_,
                           chunk_idx);
+        METRICS_TIMER_START(metrics_xfer);
         ops->copy_chunk(x, cpu_base, chunk_idx, h2d);
+        METRICS_ADD_XFER(metrics_xfer, h2d, chunk_bytes_);
     });
 }
 
@@ -39,7 +41,9 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     queue_->submit([=, this, chunk_indices = std::move(chunk_indices_copy)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, chunk_indices.size(), chunk_indices[0]);
+        METRICS_TIMER_START(metrics_xfer);
         ops->copy_chunks_batch(x, chunk_indices, cpu_ptrs, h2d);
+        METRICS_ADD_XFER(metrics_xfer, h2d, chunk_indices.size() * chunk_bytes_);
     });
 }
 
@@ -70,7 +74,9 @@ void Context::xfer_chunks_batch_fast(const torch::Tensor &chunk_indices,
     queue_->submit([=, this, indices = std::move(indices), ptrs = std::move(ptrs)]() {
         PROFILE_SCOPE_FMT("xfer_chunks_batch_fast(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, indices.size(), indices[0]);
+        METRICS_TIMER_START(metrics_xfer);
         ops->copy_chunks_batch(x, indices, ptrs, h2d);
+        METRICS_ADD_XFER(metrics_xfer, h2d, indices.size() * chunk_bytes_);
     });
 }
 
@@ -95,6 +101,8 @@ void Context::xfer_wait() {
         xfer_last_future_.get();
         xfer_last_future_ = std::future<void>();
     }
+    const bool h2d = (direction_ == GpuTransferDirection::H2D);
+    METRICS_TIMER_START(metrics_xfer);
     if (ops_->copy_wait) {
         PROFILE_SCOPE_FMT("copy_wait(%s,stream=%llu)", name_.c_str(), stream_id_);
         ops_->copy_wait(xctx_);
@@ -102,8 +110,9 @@ void Context::xfer_wait() {
     {
         PROFILE_SCOPE_FMT("event_wait(%s,stream=%llu)", name_.c_str(), stream_id_);
         ops_->event_synchronize(event_);
+        METRICS_ADD_XFER(metrics_xfer, h2d, 0);
 
-        if (direction_ == GpuTransferDirection::H2D && !ops_->context_same_stream(xctx_)) {
+        if (h2d && !ops_->context_same_stream(xctx_)) {
             ops_->context_cur_wait_event(xctx_, event_);
         }
     }

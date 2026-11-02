@@ -52,6 +52,7 @@ class Context {
             inner_size *= tensor.size(d);
         int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
         int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
+        ctx.chunk_bytes_ = outer_dims * inner_size;
 
         ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
                                             chunk_stride, outer_dims, inner_size, outer_block_size,
@@ -84,6 +85,7 @@ class Context {
         for (size_t d = chunk_dim + 1; d < shape.size(); d++)
             inner_size *= shape[d];
         int64_t outer_block_size = shape[chunk_dim] * inner_size;
+        ctx.chunk_bytes_ = outer_dims * inner_size;
 
         ctx.xctx_ = kv_xfer::rdma_context_create((char *)base, inner_size, outer_dims, inner_size,
                                                  outer_block_size);
@@ -145,6 +147,7 @@ class Context {
             ops_ = other.ops_;
             xctx_ = other.xctx_;
             stream_id_ = other.stream_id_;
+            chunk_bytes_ = other.chunk_bytes_;
             gpu_tensor_ = std::move(other.gpu_tensor_);
             direction_ = other.direction_;
             queue_ = other.queue_;
@@ -175,6 +178,7 @@ class Context {
     const kv_xfer::Ops *ops_ = &kv_xfer::gpu_ops();
     kv_xfer::context_t xctx_ = nullptr;
     unsigned long long stream_id_ = 0;
+    int64_t chunk_bytes_ = 0;
     torch::Tensor gpu_tensor_;
     GpuTransferDirection direction_ = GpuTransferDirection::H2D;
     TaskQueue *queue_ = nullptr;
