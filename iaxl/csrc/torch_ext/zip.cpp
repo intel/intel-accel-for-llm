@@ -36,24 +36,27 @@ static inline uint64_t metrics_sum_tensor_bytes(const std::vector<torch::Tensor>
 struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
     Context *ctx;
     kv_pool::Mem *mem;
-    std::vector<std::string> chunk_labels;
+    std::string label;
+    std::string tensor_key;
+    std::vector<std::string> chunk_ids;
     std::vector<int64_t> chunk_indices;
     std::vector<torch::Tensor> cpu_tensors;
     std::shared_ptr<std::promise<void>> promise;
 
     void execute(bool is_retry) {
-        PROFILE_SCOPE_FMT("unzip_from_mem_work(%s,retry=%d,l=<%zu,l0=%s>,i=<%zu,i0=%ld>)",
-                          ctx->name().c_str(), is_retry, chunk_labels.size(),
-                          chunk_labels[0].c_str(), chunk_indices.size(), chunk_indices[0]);
+        PROFILE_SCOPE_FMT("unzip_from_mem_work(%s,retry=%d,l=<%zu,l0=%s:%s:%s>,i=<%zu,i0=%ld>)",
+                          ctx->name().c_str(), is_retry, chunk_ids.size(), label.c_str(),
+                          chunk_ids[0].c_str(), tensor_key.c_str(), chunk_indices.size(),
+                          chunk_indices[0]);
 
-        const size_t n = chunk_labels.size();
+        const size_t n = chunk_ids.size();
 
         mem->acquire_deletion_guard();
 
         std::vector<const char *> data_ptrs(n);
         {
             PROFILE_SCOPE("cache_get");
-            auto results = mem->get(chunk_labels, true);
+            auto results = mem->get(label, tensor_key, chunk_ids, true);
 
             for (size_t i = 0; i < n; i++) {
                 const auto &[ptr, size] = results[i];
@@ -63,7 +66,8 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
 
                     if (!is_retry) {
                         std::cout << "[KVClip] cache miss on unzip (will retry): "
-                                  << chunk_labels[i] << "\n";
+                                  << kv_pool::make_chunk_label(label, tensor_key, chunk_ids[i])
+                                  << "\n";
                         auto self = shared_from_this();
                         omp_queue().submit(
                             [self]() {
@@ -163,9 +167,6 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                              uint64_t bundle_id, int64_t sort_key) {
     PROFILE_SCOPE_FMT("unzip_from_mem %s/%s", label.c_str(), tensor_key.c_str());
 
-    auto full_chunk_labels = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels);
-    const size_t n = full_chunk_labels.size();
-
     reset_async_state();
 
     auto promise = std::make_shared<std::promise<void>>();
@@ -174,7 +175,9 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
     auto work = std::make_shared<UnzipFromMemWork>();
     work->ctx = this;
     work->mem = &mem;
-    work->chunk_labels = std::move(full_chunk_labels);
+    work->label = label;
+    work->tensor_key = tensor_key;
+    work->chunk_ids = chunk_labels;
     work->chunk_indices = chunk_indices;
     work->cpu_tensors = cpu_tensors;
     work->promise = promise;

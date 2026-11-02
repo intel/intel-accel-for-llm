@@ -176,6 +176,12 @@ class Mem {
     std::vector<std::pair<const char *, size_t>> get(const std::vector<std::string> &keys,
                                                      bool allow_using_omp = false);
 
+    // Looks up label:chunk_id:tensor_key for every chunk_id without building full labels.
+    std::vector<std::pair<const char *, size_t>> get(const std::string &label,
+                                                     const std::string &tensor_key,
+                                                     const std::vector<std::string> &chunk_ids,
+                                                     bool allow_using_omp = false);
+
     std::vector<std::pair<const char *, size_t>> get_unlocked(const std::vector<std::string> &keys,
                                                               bool allow_using_omp = false);
 
