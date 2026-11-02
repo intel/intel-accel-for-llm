@@ -106,6 +106,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "scales with this value.",
     )
     parser.add_argument(
+        "-iter",
+        "--iterations",
+        type=int,
+        default=1,
+        help="Number of measured PUT/GET rounds; each PUT uses fresh keys. "
+        "Use >1 for steady-state throughput and prewarm comparisons.",
+    )
+    parser.add_argument(
         "--data-source",
         choices=("mock", "model", "file"),
         default=None,
@@ -158,6 +166,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("all --kv-cache-shape dimensions must be greater than 0")
     if args.num_layers <= 0:
         parser.error("--num-layers must be greater than 0")
+    if args.iterations <= 0:
+        parser.error("--iterations must be a positive integer")
     if args.dtype == "int4" and shape[-1] % 2:
         parser.error("--dtype int4 requires an even HEAD_DIM")
     if args.data_source is None:
@@ -624,17 +634,25 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     bench.print_config()
     bench.setup()
     bench.warmup()
-    put_time = bench.put()
-    get_time = bench.get()
+    base_hashes = bench.block_hashes
+    put_time = 0.0
+    get_time = 0.0
+    for iteration in range(args.iterations):
+        if iteration:
+            bench.block_hashes = [f"iter{iteration}_{h}" for h in base_hashes]
+        put_time += bench.put()
+        get_time += bench.get()
     verified = bench.verify()
+    if args.iterations > 1:
+        print(f"\nIterations: {args.iterations}")
     print_report(
         put_time,
         get_time,
         verified,
         bench.status(),
         bench.metrics(),
-        bench.total_blocks,
-        bench.total_bytes,
+        bench.total_blocks * args.iterations,
+        bench.total_bytes * args.iterations,
     )
     return verified
 
