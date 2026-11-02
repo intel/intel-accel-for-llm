@@ -88,8 +88,10 @@ static int blocks_init(struct blocks *b, size_t total, size_t block) {
     if (mlock(b->sbuf, b->total) || mlock(b->dbuf, b->total))
         perror("mlock (continuing)");
 
+    /* Unique content per cache line so a block landing at the wrong offset is caught. */
+    memset(b->sbuf, 0, b->total);
     for (i = 0; i < b->total; i += 64)
-        b->sbuf[i] = (unsigned char)(i * 131 + 7);
+        *(size_t *)(b->sbuf + i) = i;
 
     b->dest = malloc(b->count * sizeof(*b->dest));
     b->src = malloc(b->count * sizeof(*b->src));
