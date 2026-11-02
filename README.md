@@ -50,7 +50,15 @@ export IAXL_QATLIB=intree   # before sourcing setvars.sh / building
 
 `POLICY=0` gives every process one virtual function from each QAT device, which `IAXL_QAT_DEVICES` / `KVSHRINK_QAT_DEVICES` index. With `POLICY=1` each process only sees device `0`.
 
-With `IAXL_QATLIB=intree` the build links the system `libqat` / `libusdm` found by `pkg-config qatlib` instead of downloading and building the out-of-tree package into `_lib`. Without a system qatlib (as in the dev container), it builds qatlib `IAXL_QATLIB_VERSION` (default `26.02.0`; match the host `qatmgr`) into `_lib`, and `start.sh` mounts the host `/run/qat`.
+With `IAXL_QATLIB=intree` the build links the system `libqat` / `libusdm` found by `pkg-config qatlib` instead of downloading and building the out-of-tree package into `_lib`. Without a system qatlib (as in the dev container), it builds qatlib `IAXL_QATLIB_VERSION` (default `26.02.0`) into `_lib`.
+
+With `IAXL_QATLIB=intree`, `start.sh` runs the container in qatlib standalone mode, which qatlib recommends for containers: the container gets its own QAT VFs instead of the host `qatmgr`, and runs without `--privileged`, `--pid host` or the host `/dev`. Ranks in one container would race for the VFs, so each container runs one rank (`TP_SIZE=1`) and takes the CPUs, QAT VFs and DSA WQ of its GPU's rank. The rank uses every instance of its VFs (`IAXL_QAT_INSTANCE_NUM`) on at most 8 threads (`IAXL_OMP_THREAD_NUM`). Start one container per GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 ./start.sh   # container iaxl.vllm.gpu2, vLLM port 8002 (XPU: ZE_AFFINITY_MASK)
+```
+
+Set `IAXL_DSA_GD_ENABLE=1` (or `IAXL_RDMA_ENABLE=1`) before `start.sh` to pass the DSA and GDRCopy (or InfiniBand) devices. The host still needs the VFs bound to `vfio-pci`, which `qat.service` does at boot; clients of a running `qatmgr` can take the same VFs, so after boot `systemctl stop qat` (the VFs stay bound). Several ranks in one container (`TP_SIZE` > 1) need the out-of-tree driver.
 
 3. Install the GDRCopy driver and configure DSA:
 

@@ -22,7 +22,24 @@ export IAXL_QATLIB=intree # in-tree 驱动（qat_4xxx，VF 绑定到 vfio-pci）
 - `DEVICE=cpu` 会在开发镜像中跳过 UCX 和 NIXL，以不带 GPU 参数的方式启动容器，并在容器启动时以 `DEVICE=cpu` 构建 IAXL。
 - `IAXL_DEV_DOCKER_IMAGE` 让 CPU 镜像与 GPU 镜像分开。`start.sh` 会复用已存在的同名镜像，不设置时 CPU 运行会复用 GPU 镜像（使用 `--rebuild` 时则会覆盖它）。
 - 示例和 benchmark 脚本会把 `IAXL_LD_PRELOAD` 加到 `LD_PRELOAD` 前面。vLLM CPU 后端需要预加载 libtcmalloc 和 libiomp5，而 CPU 镜像的 libiomp5 位于 `/opt/venv/lib`，不在默认的 `/usr/local/lib`。
-- 设置 `IAXL_QATLIB=intree` 时，如果 `pkg-config` 找不到系统 qatlib（Ubuntu 22.04 的 CPU 镜像没有），构建会从源码编译 qatlib 到 `_lib`；`start.sh` 会挂载宿主机的 `/run/qat`，各 rank 通过宿主机 `qatmgr` 获取 QAT instance。如果宿主机 qatlib 不是 `26.02.0`，运行 `./start.sh --rebuild` 前 `export IAXL_QATLIB_VERSION=<宿主机版本>`。没有 `qatmgr` 时，第一个进程会占用全部 QAT 设备，因此多 rank 运行需要 `qatmgr`。
+- 设置 `IAXL_QATLIB=intree` 时，如果 `pkg-config` 找不到系统 qatlib（Ubuntu 22.04 的 CPU 镜像没有），构建会从源码编译 qatlib 到 `_lib`。如果宿主机 qatlib 不是 `26.02.0`，运行 `./start.sh --rebuild` 前 `export IAXL_QATLIB_VERSION=<宿主机版本>`。
+
+### qatlib Standalone 模式（`IAXL_QATLIB=intree`）
+
+使用 in-tree 驱动时，`start.sh` 以 qatlib standalone 模式运行每个容器（见 [README](../../README.zh-CN.md)），这也是 qatlib 推荐的容器用法：容器拿到自己的 QAT VF 并自行打开，不需要宿主机 `qatmgr`，也不需要 `--privileged`。同一容器内的多个 rank 会争抢 VF，因此每个容器只运行一个 rank（`TP_SIZE=1`），例如每个 NUMA 节点一个 vLLM 实例：
+
+```bash
+# 先设置第 1 节中的 export
+VLLM_CPU_OMP_THREADS_BIND=32-63 ./start.sh    # 容器 iaxl.vllm.numa1，vLLM 端口 8001
+```
+
+- `VLLM_CPU_OMP_THREADS_BIND` 的第一个 CPU 决定 NUMA 节点；不设置时默认为节点 0 每个物理核一个 CPU。启动容器时设置它（需要时一并设置 `KVSHRINK_CPU_OMP_THREADS_BIND`）：两者都会传入容器，并确定容器的 QAT 设备。
+- 容器获得该节点上每个 QAT PF 的最后一个 VF、`/dev/vfio/vfio`、`QAT_POLICY`、不限量的 memlock、4 GiB 的 `/dev/shm`，以及 vLLM NUMA 绑定（`migrate_pages`）所需的 `SYS_NICE` 和 `seccomp=unconfined`，取代 `--privileged`、`--pid host` 和宿主机 `/dev`。不传入 IAA 和 DSA 设备。
+- `KVSHRINK_QAT_DEVICES` 默认使用容器内全部 VF 及其全部实例（`IAXL_QAT_INSTANCE_NUM`），最多 8 个线程（`IAXL_OMP_THREAD_NUM`）；`PORT`、`IAXL_API_CONTROLLER_PORT` 和 `IAXL_API_WORKER_BASE_PORT` 按节点号偏移（节点 1 为 8001、18701 和 18801）。
+- 宿主机仍需把 VF 绑定到 `vfio-pci` 并启用 `dc` 服务，`qat.service` 在开机时会完成这一步。宿主机 `qatmgr` 运行时，其客户端可能占用相同的 VF，因此每台宿主机只使用一种模式：开机后执行 `systemctl stop qat`，停止 `qatmgr` 并保持 VF 绑定。
+- 多个容器共用源码目录，且启动时都会构建 IAXL，因此请依次启动。
+
+使用 out-of-tree 驱动（不设置 `IAXL_QATLIB`）时，容器保留 `--privileged` 和宿主机 `/dev`，一个容器可以运行多个 rank。
 
 > [!NOTE]
 > 不使用 Docker 时，也可以在已安装 CPU 版 vLLM 的环境中构建 IAXL。先安装 `docker/Dockerfile.dev` 中安装的软件包（UCX 和 NIXL 除外），再执行 `python -m pip install -r requirements.txt` 和 `DEVICE=cpu python -m pip install -e . --no-build-isolation`；使用 in-tree 驱动时加上 `IAXL_QATLIB=intree`。
@@ -70,10 +87,25 @@ export IAXL_QATLIB=intree # in-tree 驱动（qat_4xxx，VF 绑定到 vfio-pci）
 
 ## 5. 示例
 
-下面的例子在两个 NUMA 节点上运行两个 rank：节点 0 是 CPU 0-63，节点 1 是 CPU 64-127，每个物理核一个逻辑 CPU。
+下面的例子使用两个 NUMA 节点：节点 0 是 CPU 0-63，节点 1 是 CPU 64-127，每个物理核一个逻辑 CPU。使用 `IAXL_QATLIB=intree` 时，每个 NUMA 节点运行一个容器：
 
 ```bash
 # 先执行第 1 节中的 export
+VLLM_CPU_OMP_THREADS_BIND=0-61 KVSHRINK_CPU_OMP_THREADS_BIND=62-63 ./start.sh   # iaxl.vllm.numa0，端口 8000
+
+# 在 start.sh 打开的容器 shell 中执行
+export IAXL_CPU_ZIP_ENABLE=0
+export IAXL_OMP_THREAD_NUM=2
+./examples/kvshrink-vllm-serve.sh
+
+# 然后在另一个终端中为节点 1 执行同样的步骤（iaxl.vllm.numa1，端口 8001）
+VLLM_CPU_OMP_THREADS_BIND=64-125 KVSHRINK_CPU_OMP_THREADS_BIND=126-127 ./start.sh
+```
+
+使用 out-of-tree 驱动时，一个容器运行两个 rank：
+
+```bash
+# 先执行第 1 节中的 export，不设置 IAXL_QATLIB
 ./start.sh
 
 # 在 start.sh 打开的容器 shell 中执行
@@ -115,3 +147,4 @@ export IAXL_OMP_THREAD_NUM=2
 | `IAXL_OMP_THREAD_NUM (...) + reserved (...) exceeds the smallest rank CPU allocation` | `VLLM_CPU_OMP_THREADS_BIND` 中最小的一项 CPU 太少。调小 `IAXL_RESERVED_CPU_NUM` 或 `IAXL_OMP_THREAD_NUM`。 |
 | vLLM 警告 `LD_PRELOAD` 中没有 libiomp 或 libtcmalloc | 按第 1 节设置 `IAXL_LD_PRELOAD`，并用 `examples/kvshrink-vllm-serve.sh` 启动 vLLM。 |
 | `RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link` | 跨节点 KV cache 复用需要 CUDA 或 XPU 构建。 |
+| `containers with IAXL_QATLIB=intree run one rank each` | 每个 NUMA 节点启动一个 `TP_SIZE=1` 的容器（见第 5 节）。 |

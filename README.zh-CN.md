@@ -48,7 +48,15 @@ export IAXL_QATLIB=intree   # 在 source setvars.sh / 构建之前设置
 
 `POLICY=0` 为每个进程从每个 QAT 设备各分配一个 VF，`IAXL_QAT_DEVICES` / `KVSHRINK_QAT_DEVICES` 按此编号；若为 `POLICY=1`，每个进程只能看到设备 `0`。
 
-设置 `IAXL_QATLIB=intree` 后，构建会链接 `pkg-config qatlib` 找到的系统 `libqat` / `libusdm`，而不再下载并构建 out-of-tree 驱动包到 `_lib`。没有系统 qatlib 时（如开发容器中），会构建 qatlib `IAXL_QATLIB_VERSION`（默认 `26.02.0`，应与宿主机 `qatmgr` 一致）到 `_lib`，`start.sh` 会挂载宿主机的 `/run/qat`。
+设置 `IAXL_QATLIB=intree` 后，构建会链接 `pkg-config qatlib` 找到的系统 `libqat` / `libusdm`，而不再下载并构建 out-of-tree 驱动包到 `_lib`。没有系统 qatlib 时（如开发容器中），会构建 qatlib `IAXL_QATLIB_VERSION`（默认 `26.02.0`）到 `_lib`。
+
+设置 `IAXL_QATLIB=intree` 时，`start.sh` 以 qatlib standalone 模式运行容器，这也是 qatlib 推荐的容器用法：容器使用自己的 QAT VF，不经过宿主机 `qatmgr`，也不需要 `--privileged`、`--pid host` 或宿主机 `/dev`。同一容器内的多个 rank 会争抢 VF，因此每个容器只运行一个 rank（`TP_SIZE=1`），并使用其 GPU 对应 rank 的 CPU、QAT VF 和 DSA WQ。该 rank 使用这些 VF 的全部实例（`IAXL_QAT_INSTANCE_NUM`），最多 8 个线程（`IAXL_OMP_THREAD_NUM`）。每块 GPU 启动一个容器：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 ./start.sh   # 容器 iaxl.vllm.gpu2，vLLM 端口 8002（XPU 使用 ZE_AFFINITY_MASK）
+```
+
+运行 `start.sh` 前设置 `IAXL_DSA_GD_ENABLE=1`（或 `IAXL_RDMA_ENABLE=1`），即可传入 DSA 和 GDRCopy（或 InfiniBand）设备。宿主机仍需把 VF 绑定到 `vfio-pci`，`qat.service` 在开机时会完成；运行中的 `qatmgr` 的客户端可能占用相同的 VF，因此开机后执行 `systemctl stop qat`（VF 仍保持绑定）。一个容器运行多个 rank（`TP_SIZE` > 1）需要使用 out-of-tree 驱动。
 
 3. 安装 GDRCopy 驱动并配置 DSA：
 
