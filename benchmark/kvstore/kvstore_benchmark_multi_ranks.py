@@ -65,9 +65,15 @@ def worker(rank, tp_size, gpu, args, conn, barrier) -> None:
     bench = RankBenchmark(args, rank, tp_size)
     if rank == 0:
         bench.print_config()
+    base_hashes = bench.block_hashes
 
     while (step := conn.recv()) is not None:
         try:
+            if step.startswith("rekey:"):
+                iteration = int(step.split(":", 1)[1])
+                bench.block_hashes = [f"iter{iteration}_{h}" for h in base_hashes]
+                conn.send(("ok", None))
+                continue
             if step in TIMED_STEPS:
                 barrier.wait()
             value = getattr(bench, step)
@@ -92,7 +98,7 @@ def aggregate(statuses: list, metrics: list) -> tuple:
     return status, total
 
 
-def schedule(kb, tp_size: int, conns: list) -> bool:
+def schedule(kb, tp_size: int, conns: list, iterations: int = 1) -> bool:
     def call(step: str, ranks=range(tp_size)) -> list:
         for rank in ranks:
             conns[rank].send(step)
@@ -112,16 +118,31 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
     total_blocks = call("total_blocks", [0])[0]
     total_bytes = call("total_bytes", [0])[0]
     call("warmup")
-    put_times = call("put")
-    get_times = call("get")
+    put_times = [0.0] * tp_size
+    get_times = [0.0] * tp_size
+    put_wall = 0.0
+    get_wall = 0.0
+    for iteration in range(iterations):
+        if iteration:
+            call(f"rekey:{iteration}")
+        seconds = call("put")
+        put_wall += max(seconds)
+        for rank, value in enumerate(seconds):
+            put_times[rank] += value
+        seconds = call("get")
+        get_wall += max(seconds)
+        for rank, value in enumerate(seconds):
+            get_times[rank] += value
     verified = call("verify")
     statuses = call("status")
     metrics = call("metrics")
 
     def gibps(seconds: float) -> float:
-        return total_bytes / seconds / (1024**3)
+        return total_bytes * iterations / seconds / (1024**3)
 
-    print(f"\nPer rank ({kb.format_bytes(total_bytes)} each)")
+    if iterations > 1:
+        print(f"\nIterations: {iterations}")
+    print(f"\nPer rank ({kb.format_bytes(total_bytes * iterations)} each)")
     print("-" * 80)
     print(
         f"{'Rank':>4} {'PUT GiB/s':>10} {'GET GiB/s':>10} "
@@ -142,13 +163,13 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
 
     status, total = aggregate(statuses, metrics)
     kb.print_report(
-        max(put_times),
-        max(get_times),
+        put_wall,
+        get_wall,
         all(verified),
         status,
         total,
-        total_blocks * tp_size,
-        total_bytes * tp_size,
+        total_blocks * tp_size * iterations,
+        total_bytes * tp_size * iterations,
         title=f"Aggregate over {tp_size} ranks (wall time = slowest rank)",
     )
     return all(verified)
@@ -182,7 +203,7 @@ def main() -> None:
         conns.append(parent_conn)
         procs.append(proc)
     try:
-        verified = schedule(kb, tp_size, conns)
+        verified = schedule(kb, tp_size, conns, args.iterations)
     finally:
         for conn in conns:
             try:
