@@ -9,13 +9,15 @@
 
 #include "kv_xfer.h"
 #include "env.h"
+#include "iaxl_common.h"
 
 extern "C" {
 #include "dsa_gd.h"
 }
 
-extern "C" int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[],
-                                size_t count);
+extern "C" int dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
+                                      size_t count);
+extern "C" int dsa_memcpy_batch_wait(void);
 
 namespace kv_xfer {
 
@@ -85,8 +87,15 @@ bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_d
         }
     }
 
-    return dsa_memcpy_batch(dest.data(), const_cast<const void *const *>(src.data()), nbytes.data(),
-                            count) == 0;
+    return dsa_memcpy_batch_async(dest.data(), const_cast<const void *const *>(src.data()),
+                                  nbytes.data(), count) == 0;
+}
+
+void dsa_copy_wait(context_t) {
+    if (!envs.IAXL_DSA_GD_ENABLE)
+        return;
+    std::lock_guard<std::mutex> lock(dsa_context_mutex);
+    IAXL_CHECK(dsa_memcpy_batch_wait() == 0, "dsa_copy_wait: DSA batch failed");
 }
 
 } // namespace kv_xfer

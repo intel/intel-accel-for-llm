@@ -43,6 +43,18 @@ void context_cur_wait_event(context_t ctx, event_t event);
 void context_work_wait_cur(context_t ctx);
 void context_sync_cur(context_t ctx);
 
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+
+void dsa_context_reset();
+
+bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
+                           int64_t inner_size, int64_t outer_block_size, bool is_h2d,
+                           const std::vector<int64_t> &chunk_indices,
+                           const std::vector<char *> &cpu_ptrs);
+// Blocks until every batch submitted by dsa_copy_chunks_batch has completed.
+void dsa_copy_wait(context_t ctx);
+#endif
+
 // Per-context backend: the GPU (cuda/xpu) free functions above, or the RDMA
 // backend in rdma.cpp (kv_xfer_rdma.h). Selected when a Context is created.
 struct Ops {
@@ -60,6 +72,8 @@ struct Ops {
     void (*context_cur_wait_event)(context_t, event_t);
     void (*context_work_wait_cur)(context_t);
     void (*context_sync_cur)(context_t);
+    // Waits for copies that complete outside the stream/event (DSA); nullptr if not needed.
+    void (*copy_wait)(context_t);
 };
 
 inline const Ops &gpu_ops() {
@@ -67,18 +81,14 @@ inline const Ops &gpu_ops() {
                          context_destroy,       context_stream_id,      context_same_stream,
                          copy_chunk,            copy_chunks_batch,      context_record_event,
                          context_work_wait_event, context_cur_wait_event, context_work_wait_cur,
-                         context_sync_cur};
+                         context_sync_cur,
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+                         dsa_copy_wait
+#else
+                         nullptr
+#endif
+    };
     return ops;
 }
-
-#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
-
-void dsa_context_reset();
-
-bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
-                           int64_t inner_size, int64_t outer_block_size, bool is_h2d,
-                           const std::vector<int64_t> &chunk_indices,
-                           const std::vector<char *> &cpu_ptrs);
-#endif
 
 } // namespace kv_xfer

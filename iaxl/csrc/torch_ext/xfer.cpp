@@ -95,6 +95,10 @@ void Context::xfer_wait() {
         xfer_last_future_.get();
         xfer_last_future_ = std::future<void>();
     }
+    if (ops_->copy_wait) {
+        PROFILE_SCOPE_FMT("copy_wait(%s,stream=%llu)", name_.c_str(), stream_id_);
+        ops_->copy_wait(xctx_);
+    }
     {
         PROFILE_SCOPE_FMT("event_wait(%s,stream=%llu)", name_.c_str(), stream_id_);
         ops_->event_synchronize(event_);
