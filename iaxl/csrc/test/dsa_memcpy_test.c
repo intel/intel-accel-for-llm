@@ -6,6 +6,7 @@
 // the sync API drains the WQ at the end of every call, the async API only at the final wait.
 
 #include <getopt.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,9 +16,9 @@
 #include "env.h"
 
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count);
-int dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
-                           size_t count);
-int dsa_memcpy_batch_wait(void);
+int64_t dsa_memcpy_batch_async(void *const dest[], const void *const src[], const size_t n[],
+                               size_t count);
+int dsa_memcpy_batch_wait(uint64_t ticket);
 
 struct blocks {
     void **dest;
@@ -34,16 +35,20 @@ static double now_sec(void) {
 
 static int copy_all(const struct blocks *b, size_t calls, int async) {
     size_t per_call = (b->count + calls - 1) / calls, done;
+    int64_t ticket = 0;
 
     for (done = 0; done < b->count; done += per_call) {
         size_t cnt = b->count - done < per_call ? b->count - done : per_call;
-        int rc = async ? dsa_memcpy_batch_async(b->dest + done, b->src + done, b->n + done, cnt)
-                       : dsa_memcpy_batch(b->dest + done, b->src + done, b->n + done, cnt);
 
-        if (rc)
-            return rc;
+        if (async)
+            ticket = dsa_memcpy_batch_async(b->dest + done, b->src + done, b->n + done, cnt);
+        else
+            ticket = dsa_memcpy_batch(b->dest + done, b->src + done, b->n + done, cnt);
+        if (ticket < 0)
+            return -1;
     }
-    return async ? dsa_memcpy_batch_wait() : 0;
+    /* Tickets are monotonic: waiting for the last one covers every call above. */
+    return async ? dsa_memcpy_batch_wait((uint64_t)ticket) : 0;
 }
 
 /* Returns average GB/s over iters, or a negative value on failure or data mismatch. */

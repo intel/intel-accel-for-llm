@@ -47,11 +47,15 @@ void context_sync_cur(context_t ctx);
 
 void dsa_context_reset();
 
+// Submits the copies asynchronously and updates `ticket` so dsa_wait_ticket() can later
+// wait for exactly the batches issued through this context.
 bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
                            int64_t inner_size, int64_t outer_block_size, bool is_h2d,
                            const std::vector<int64_t> &chunk_indices,
-                           const std::vector<char *> &cpu_ptrs);
-// Blocks until every batch submitted by dsa_copy_chunks_batch has completed.
+                           const std::vector<char *> &cpu_ptrs, uint64_t &ticket);
+// Blocks until every batch up to and including `ticket` has completed.
+void dsa_wait_ticket(uint64_t ticket);
+// Ops::copy_wait for the GPU backend: waits for the context's own ticket only.
 void dsa_copy_wait(context_t ctx);
 #endif
 
