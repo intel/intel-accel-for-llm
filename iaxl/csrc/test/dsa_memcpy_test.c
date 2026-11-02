@@ -143,6 +143,14 @@ int main(int argc, char **argv) {
     if (calls > b.count)
         calls = b.count;
 
+    /* Warm-up: dsa_init, OMP thread pool, IOMMU/TLB fills for both buffers. */
+    for (opt = 0; opt < 3; opt++) {
+        if (copy_all(&b, calls, 0) || copy_all(&b, calls, 1)) {
+            fprintf(stderr, "warm-up failed\n");
+            return 1;
+        }
+    }
+
     printf("DDR2DDR: %zu MiB as %zu x %zu KiB blocks, WQs=%s, %d iters\n", b.total >> 20, b.count,
            block >> 10, envs.IAXL_DSA_WQS(), iters);
     printf("  %-24s %6s %10s %8s\n", "API", "calls", "avg(ms)", "GB/s");
