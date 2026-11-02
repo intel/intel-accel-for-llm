@@ -46,21 +46,18 @@ static int copy_all(const struct blocks *b, size_t calls, int async) {
     return async ? dsa_memcpy_batch_wait() : 0;
 }
 
-/* Returns average GB/s over iters, or a negative value on failure. */
+/* Returns average GB/s over iters, or a negative value on failure or data mismatch. */
 static double measure(const struct blocks *b, size_t calls, int async, int iters) {
     const char *name = async ? "dsa_memcpy_batch_async" : "dsa_memcpy_batch";
-    double t0, elapsed;
-    int it;
+    double t0, elapsed, gbps;
+    int it, verified;
 
     memset(b->dbuf, 0, b->total);
     if (copy_all(b, calls, async)) {
         fprintf(stderr, "%s: copy failed\n", name);
         return -1;
     }
-    if (memcmp(b->dbuf, b->sbuf, b->total)) {
-        fprintf(stderr, "%s: verification FAILED\n", name);
-        return -1;
-    }
+    verified = memcmp(b->dbuf, b->sbuf, b->total) == 0;
 
     t0 = now_sec();
     for (it = 0; it < iters; it++) {
@@ -70,9 +67,11 @@ static double measure(const struct blocks *b, size_t calls, int async, int iters
         }
     }
     elapsed = (now_sec() - t0) / iters;
+    gbps = (double)b->total / elapsed / 1e9;
 
-    printf("  %-24s %6zu %10.3f %8.2f\n", name, calls, elapsed * 1e3, (double)b->total / elapsed / 1e9);
-    return (double)b->total / elapsed / 1e9;
+    printf("  %-24s %6zu %10.3f %8.2f %8s\n", name, calls, elapsed * 1e3, gbps,
+           verified ? "OK" : "FAIL");
+    return verified ? gbps : -1;
 }
 
 static int blocks_init(struct blocks *b, size_t total, size_t block) {
@@ -155,7 +154,7 @@ int main(int argc, char **argv) {
 
     printf("DDR2DDR: %zu MiB as %zu x %zu KiB blocks, WQs=%s, %d iters\n", b.total >> 20, b.count,
            block >> 10, envs.IAXL_DSA_WQS(), iters);
-    printf("  %-24s %6s %10s %8s\n", "API", "calls", "avg(ms)", "GB/s");
+    printf("  %-24s %6s %10s %8s %8s\n", "API", "calls", "avg(ms)", "GB/s", "verify");
 
     if (measure(&b, 1, 0, iters) < 0 || measure(&b, 1, 1, iters) < 0)
         return 1;
