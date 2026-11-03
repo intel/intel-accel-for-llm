@@ -83,6 +83,37 @@ compress_cpu_list() {
     '
 }
 
+# NUMA node of CPU $1.
+cpu_numa_node() {
+    local -a nodes=("/sys/devices/system/cpu/cpu$1"/node[0-9]*)
+
+    if [[ ! "$1" =~ ^[0-9]+$ || ! -e "${nodes[0]}" ]]; then
+        echo "ERROR: cannot find the NUMA node of CPU '$1'" >&2
+        return 1
+    fi
+    echo "${nodes[0]##*node}"
+}
+
+# One logical CPU per physical core on NUMA node $1, as a CPU list.
+numa_physical_cpus() {
+    local node_path=/sys/devices/system/node/node$1
+    local cpu siblings
+    local -a cpu_ids=()
+    local -A seen_cores=()
+
+    if [[ ! -r "$node_path/cpulist" ]]; then
+        echo "ERROR: cannot read CPU list for NUMA node $1" >&2
+        return 1
+    fi
+    while read -r cpu; do
+        siblings=$(<"/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list")
+        [[ -n "${seen_cores[$siblings]:-}" ]] && continue
+        seen_cores[$siblings]=1
+        cpu_ids+=("$cpu")
+    done < <(expand_cpu_list "$(<"$node_path/cpulist")")
+    compress_cpu_list "${cpu_ids[@]}"
+}
+
 # Fallback for GPU-less hosts: split every physical core evenly across the ranks.
 cpu_even_split() {
     local tp_size=$1
@@ -200,26 +231,73 @@ cpu_auto_detect() {
     echo "$result"
 }
 
-qat_auto_detect() {
-    local tp_size=${1:-${TP_SIZE:-}}
-    local path driver devices_per_rank extra_devices next_device rank count offset pci numa group result
-    local -a qat_devices=() indices=() pci_devices=() rank_groups=()
+# QAT PFs bound to a supported driver, sorted by PCI address.
+qat_pfs() {
+    local path driver
 
-    validate_tp_size "$tp_size" || return 1
     for path in /sys/bus/pci/devices/*; do
         [[ -r "$path/class" && -L "$path/driver" ]] || continue
         [[ "$(<"$path/class")" == "0x0b4000" ]] || continue
         driver=$(basename "$(readlink -f "$path/driver")")
         [[ "$driver" != *vf* ]] || continue
         [[ "$driver" =~ (qat|4xxx|420xx|c6xx|c3xxx|200xx|dh895xcc) ]] || continue
-        qat_devices+=("${path##*/}")
+        echo "${path##*/}"
+    done | LC_ALL=C sort
+}
+
+# qatlib standalone mode inside the container: prints "<vf> <iommu group>" for each VF passed in.
+qat_container_vfs() {
+    local dev
+    local -a members
+
+    for dev in /dev/vfio/[0-9]*; do
+        [[ -e "$dev" ]] || continue
+        members=("/sys/kernel/iommu_groups/${dev##*/}/devices"/*)
+        echo "${members[0]##*/} ${dev##*/}"
     done
+    if [[ ! -e "${dev:-}" ]]; then
+        echo "ERROR: no QAT VF was passed into this container (/dev/vfio); restart it with start.sh" >&2
+        return 1
+    fi
+}
+
+# qatlib standalone mode: prints "<vf> <iommu group>" for one VF of each QAT PF on NUMA node $1: VF $2 counted
+# from the last (one per container on the node), as far as possible from the first VFs the host qatmgr hands out.
+qat_standalone_vfs() {
+    local numa=$1
+    local slot=${2:-0}
+    local pf vf num_vfs found=0
+
+    for pf in $(qat_pfs); do
+        [[ "$(<"/sys/bus/pci/devices/$pf/numa_node")" == "$numa" ]] || continue
+        num_vfs=$(<"/sys/bus/pci/devices/$pf/sriov_numvfs")
+        vf=/sys/bus/pci/devices/$pf/virtfn$((num_vfs - 1 - slot))
+        if ((slot >= num_vfs)) || [[ "$(basename "$(readlink -f "$vf/driver")")" != vfio-pci ]]; then
+            echo "ERROR: QAT PF $pf has no VF $((num_vfs - 1 - slot)) bound to vfio-pci (run qat_init or start the qat service)" >&2
+            return 1
+        fi
+        vf=$(readlink -f "$vf")
+        echo "${vf##*/} $(basename "$(readlink -f "$vf/iommu_group")")"
+        found=1
+    done
+    if ((found == 0)); then
+        echo "ERROR: no QAT PF found on NUMA node $numa" >&2
+        return 1
+    fi
+}
+
+qat_auto_detect() {
+    local tp_size=${1:-${TP_SIZE:-}}
+    local devices_per_rank extra_devices next_device rank count offset pci numa group result
+    local -a qat_devices=() indices=() pci_devices=() rank_groups=()
+
+    validate_tp_size "$tp_size" || return 1
+    mapfile -t qat_devices < <(qat_pfs)
 
     if ((${#qat_devices[@]} == 0)); then
         echo "ERROR: no QAT devices bound to a supported PF driver were found" >&2
         return 1
     fi
-    mapfile -t qat_devices < <(printf '%s\n' "${qat_devices[@]}" | LC_ALL=C sort)
     if ((${#qat_devices[@]} < tp_size)); then
         echo "ERROR: TP_SIZE=$tp_size requires at least $tp_size QAT devices, but only ${#qat_devices[@]} were found" >&2
         return 1

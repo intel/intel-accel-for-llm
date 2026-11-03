@@ -22,7 +22,24 @@ export IAXL_QATLIB=intree # in-tree driver (qat_4xxx, VFs bound to vfio-pci); le
 - `DEVICE=cpu` skips UCX and NIXL in the dev image, starts the container without GPU arguments, and builds IAXL with `DEVICE=cpu` on entry.
 - `IAXL_DEV_DOCKER_IMAGE` keeps the CPU image apart from the GPU one. `start.sh` reuses an existing image with that tag, so without it the CPU run would reuse the GPU image (or overwrite it with `--rebuild`).
 - `IAXL_LD_PRELOAD` is what the example and benchmark scripts prepend to `LD_PRELOAD`. vLLM's CPU backend wants libtcmalloc and libiomp5 preloaded, and the CPU image ships libiomp5 in `/opt/venv/lib` instead of the default `/usr/local/lib`.
-- With `IAXL_QATLIB=intree`, the build compiles qatlib from source into `_lib` when `pkg-config` finds no system qatlib (the Ubuntu 22.04 CPU image has none), and `start.sh` mounts the host `/run/qat`, so each rank gets its QAT instances from the host `qatmgr`. If the host qatlib is not `26.02.0`, `export IAXL_QATLIB_VERSION=<host version>` before `./start.sh --rebuild`. Without `qatmgr`, the first process reserves all QAT devices, so runs with more than one rank need it.
+- With `IAXL_QATLIB=intree`, the build compiles qatlib from source into `_lib` when `pkg-config` finds no system qatlib (the Ubuntu 22.04 CPU image has none). If the host qatlib is not `26.02.0`, `export IAXL_QATLIB_VERSION=<host version>` before `./start.sh --rebuild`.
+
+### qatlib Standalone Mode (`IAXL_QATLIB=intree`)
+
+With the in-tree driver, `start.sh` runs each container in qatlib standalone mode (see the [README](../../README.md)), which qatlib recommends for containers: the container gets its own QAT VFs and opens them itself, with no host `qatmgr` and no `--privileged`. Ranks in one container would race for the VFs, so each container runs one rank (`TP_SIZE=1`), for example one vLLM instance per NUMA node:
+
+```bash
+# With the exports from section 1
+VLLM_CPU_OMP_THREADS_BIND=32-63 ./start.sh    # container iaxl.vllm.numa1, vLLM port 8001
+```
+
+- The first CPU of `VLLM_CPU_OMP_THREADS_BIND` selects the NUMA node; unset, it defaults to one CPU per core of node 0. Set it, and `KVSHRINK_CPU_OMP_THREADS_BIND` if needed, when starting the container: both are passed in and fix the container's QAT devices.
+- The container gets the last VF of each QAT PF on that node, `/dev/vfio/vfio`, `QAT_POLICY`, an unlimited memlock limit, a 4 GiB `/dev/shm`, and `SYS_NICE` with `seccomp=unconfined` for vLLM's NUMA binding (`migrate_pages`), instead of `--privileged`, `--pid host` and the host `/dev`. IAA and DSA devices are not passed.
+- `KVSHRINK_QAT_DEVICES` defaults to all of the container's VFs, with every instance (`IAXL_QAT_INSTANCE_NUM`) on at most 8 threads (`IAXL_OMP_THREAD_NUM`), and `PORT`, `IAXL_API_CONTROLLER_PORT` and `IAXL_API_WORKER_BASE_PORT` are offset by the node number (8001, 18701 and 18801 for node 1).
+- The host still needs the VFs bound to `vfio-pci` with the `dc` service enabled, which `qat.service` does at boot. Clients of a running host `qatmgr` can take the same VFs, so use one mode per host: after boot, `systemctl stop qat` stops `qatmgr` and keeps the VFs bound.
+- Containers share the source tree and each builds IAXL on entry, so start them one after another.
+
+With the out-of-tree driver (`IAXL_QATLIB` unset), the container keeps `--privileged` and the host `/dev`, and one container can run several ranks.
 
 > [!NOTE]
 > Without Docker, IAXL also builds in an environment that already has CPU vLLM installed. Install the packages that `docker/Dockerfile.dev` installs (except UCX and NIXL), then run `python -m pip install -r requirements.txt` and `DEVICE=cpu python -m pip install -e . --no-build-isolation`, with `IAXL_QATLIB=intree` for the in-tree driver.
@@ -70,10 +87,25 @@ When choosing CPUs:
 
 ## 5. Example
 
-This example runs two ranks on a host where NUMA node 0 has CPUs 0-63 and node 1 has CPUs 64-127, with one logical CPU per core:
+This example uses a host where NUMA node 0 has CPUs 0-63 and node 1 has CPUs 64-127, with one logical CPU per core. With `IAXL_QATLIB=intree`, run one container per NUMA node:
 
 ```bash
 # With the exports from section 1
+VLLM_CPU_OMP_THREADS_BIND=0-61 KVSHRINK_CPU_OMP_THREADS_BIND=62-63 ./start.sh   # iaxl.vllm.numa0, port 8000
+
+# In the container shell opened by start.sh
+export IAXL_CPU_ZIP_ENABLE=0
+export IAXL_OMP_THREAD_NUM=2
+./examples/kvshrink-vllm-serve.sh
+
+# Then the same in a second terminal for node 1 (iaxl.vllm.numa1, port 8001)
+VLLM_CPU_OMP_THREADS_BIND=64-125 KVSHRINK_CPU_OMP_THREADS_BIND=126-127 ./start.sh
+```
+
+With the out-of-tree driver, one container runs both ranks:
+
+```bash
+# With the exports from section 1, without IAXL_QATLIB
 ./start.sh
 
 # In the container shell opened by start.sh
@@ -115,3 +147,4 @@ The script sources `setvars.sh` and prepends `IAXL_LD_PRELOAD` (libtcmalloc and 
 | `IAXL_OMP_THREAD_NUM (...) + reserved (...) exceeds the smallest rank CPU allocation` | The smallest `VLLM_CPU_OMP_THREADS_BIND` entry is too small. Lower `IAXL_RESERVED_CPU_NUM` or `IAXL_OMP_THREAD_NUM`. |
 | vLLM warns that libiomp or libtcmalloc is not in `LD_PRELOAD` | Start vLLM with `examples/kvshrink-vllm-serve.sh`, with `IAXL_LD_PRELOAD` set as in section 1. |
 | `RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link` | Cross-node KV cache reuse needs a CUDA or XPU build. |
+| `containers with IAXL_QATLIB=intree run one rank each` | Start one container per NUMA node with `TP_SIZE=1` (section 5). |

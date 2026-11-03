@@ -33,15 +33,70 @@ export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=${KVSHRINK_VLLM_KV_ASYNC_LOAD_
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP:-0-3:0,4-6:8,7-:16}" # Contiguous START-END:LAYERS rules from 0; 0 layers means sync and the final range is open-ended
 
 # ---- vLLM ------------------------------------------------------------------
+# qatlib standalone mode: containers (start.sh) with the in-tree driver open their own QAT VFs, one rank per container.
+# Inside, start.sh's QAT_POLICY marks such a container.
+QAT_STANDALONE=
+[[ "${IAXL_QATLIB:-}" == intree ]] && [[ -n "${IAXL_START_SH:-}" || (-f /.dockerenv && -n "${QAT_POLICY:-}") ]] && QAT_STANDALONE=1
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
-export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count
+export TP_SIZE="${TP_SIZE:-$([[ -n "$QAT_STANDALONE" ]] && echo 1 || echo 2)}" # Tensor-parallel worker count (1 in qatlib standalone mode)
 export DP_SIZE="${DP_SIZE:-1}"            # Data-parallel group count
 # Total workers = one per (dp, tp) pair; CPU/QAT/DSA specs are indexed per worker.
 NUM_WORKERS=$((TP_SIZE * DP_SIZE))
+QAT_STANDALONE_VFS=
+QAT_GPU=
+if [[ -n "$QAT_STANDALONE" ]]; then
+    if ((NUM_WORKERS != 1)); then
+        echo "ERROR: containers with IAXL_QATLIB=intree run one rank each (qatlib standalone mode); got TP_SIZE=$TP_SIZE DP_SIZE=$DP_SIZE." \
+            "Start one container per GPU (CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK) or, on CPU, per NUMA node instead." >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    case "$DEVICE" in
+        cuda) QAT_GPU=${CUDA_VISIBLE_DEVICES:-0} ;;
+        xpu) QAT_GPU=${ZE_AFFINITY_MASK:-0} ;;
+    esac
+    if [[ -n "$QAT_GPU" && ! "$QAT_GPU" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: set CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK to the index of the container's one GPU, got '$QAT_GPU'" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    if [[ "$DEVICE" == cuda && "$NVIDIA_RUNTIME" != none ]] && command -v nvidia-smi >/dev/null; then
+        # Each GPU container gets the CPUs and DSA WQ of its GPU's rank in a single container with all GPUs.
+        QAT_NUM_GPUS=$(nvidia-smi -L | wc -l)
+        if ((QAT_GPU >= QAT_NUM_GPUS)); then
+            echo "ERROR: CUDA_VISIBLE_DEVICES=$QAT_GPU, but only $QAT_NUM_GPUS GPUs were found" >&2
+            return 1 2>/dev/null || exit 1
+        fi
+        if [[ -z "${VLLM_CPU_OMP_THREADS_BIND:-}" ]]; then
+            QAT_ALL_RANKS=$(cpu_auto_detect "$QAT_NUM_GPUS") || return 1 2>/dev/null || exit 1
+            VLLM_CPU_OMP_THREADS_BIND=$(cut -d'|' -f$((QAT_GPU + 1)) <<<"$QAT_ALL_RANKS")
+        fi
+        if env_truthy "$IAXL_DSA_GD_ENABLE" && [[ -z "${KVSHRINK_DSA_DEVICES:-}" ]]; then
+            QAT_ALL_RANKS=$(dsa_auto_detect "$QAT_NUM_GPUS") || return 1 2>/dev/null || exit 1
+            KVSHRINK_DSA_DEVICES=$(cut -d'|' -f$((QAT_GPU + 1)) <<<"$QAT_ALL_RANKS")
+        fi
+        IAXL_DDR_POOL_TOTAL_SIZE_GB="${IAXL_DDR_POOL_TOTAL_SIZE_GB:-$(($(ddr_pool_total_size_gb "$QAT_NUM_GPUS") / QAT_NUM_GPUS))}" || return 1 2>/dev/null || exit 1
+    fi
+    VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(numa_physical_cpus 0)}" || return 1 2>/dev/null || exit 1
+fi
 VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
 export VLLM_CPU_OMP_THREADS_BIND # Per-worker CPU affinity (one entry per global rank)
 export KVSHRINK_CPU_OMP_THREADS_BIND="${KVSHRINK_CPU_OMP_THREADS_BIND:-$VLLM_CPU_OMP_THREADS_BIND}" # Per-worker CPUs for iaxl threads (one entry per global rank)
 rank_cpu_counts "$VLLM_CPU_OMP_THREADS_BIND" "$NUM_WORKERS" || return 1 2>/dev/null || exit 1
+if [[ -n "$QAT_STANDALONE" ]]; then
+    QAT_NUMA=$(cpu_numa_node "${VLLM_CPU_OMP_THREADS_BIND%%[^0-9]*}") || return 1 2>/dev/null || exit 1
+    if [[ -n "${IAXL_START_SH:-}" ]]; then
+        QAT_STANDALONE_VFS=$(qat_standalone_vfs "$QAT_NUMA" "${QAT_GPU:-0}") || return 1 2>/dev/null || exit 1
+    else
+        QAT_STANDALONE_VFS=$(qat_container_vfs) || return 1 2>/dev/null || exit 1
+    fi
+    # The container sees only these VFs, so device indices count from 0.
+    KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(seq -s, 0 $(($(wc -l <<<"$QAT_STANDALONE_VFS") - 1)))}"
+    # Containers share the host network, so each GPU (or NUMA node on CPU) gets its own ports.
+    QAT_PORT_OFFSET=${QAT_GPU:-$QAT_NUMA}
+    export PORT="${PORT:-$((8000 + QAT_PORT_OFFSET))}"
+    export IAXL_API_CONTROLLER_PORT="${IAXL_API_CONTROLLER_PORT:-$((18700 + QAT_PORT_OFFSET))}"
+    export IAXL_API_WORKER_BASE_PORT="${IAXL_API_WORKER_BASE_PORT:-$((18800 + QAT_PORT_OFFSET))}"
+    [[ -S /run/qat/qatmgr.sock ]] && echo "WARNING: the host qatmgr is running; its clients can take the VFs this container uses. Use one QAT mode per host (systemctl stop qat keeps the VFs bound)." >&2
+fi
 case "${IAXL_QAT_ZIP_ENABLE,,}" in
     1|true|yes|on)
         KVSHRINK_QAT_DEVICES="${KVSHRINK_QAT_DEVICES:-$(qat_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
@@ -74,7 +129,7 @@ printf '%s\n' \
     "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
     "  KVSHRINK_CPU_OMP_THREADS_BIND=$KVSHRINK_CPU_OMP_THREADS_BIND" \
-    "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
+    "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}${QAT_STANDALONE_VFS:+ (qatlib standalone, NUMA $QAT_NUMA VFs: $(cut -d' ' -f1 <<<"$QAT_STANDALONE_VFS" | paste -sd,))}" \
     "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=$KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED" \
     "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS" \
@@ -110,6 +165,10 @@ export IAXL_DDR_POOL_EVICT_LEASE_S=${IAXL_DDR_POOL_EVICT_LEASE_S:-300}          
 export IAXL_DDR_POOL_EVICT_INTERVAL_S=${IAXL_DDR_POOL_EVICT_INTERVAL_S:-30}          # How often the scheduler checks DDR pool usage
 
 # ---- Intel QAT (compression accelerator) ------------------------------------
+if [[ -n "$QAT_STANDALONE" && -n "${KVSHRINK_QAT_DEVICES:-}" ]]; then
+    # qatlib standalone mode: the container's one rank uses every QAT device it was given, with all of their instances.
+    export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-$KVSHRINK_QAT_DEVICES}
+fi
 export IAXL_QAT_DEVICES=${IAXL_QAT_DEVICES:-0}                                   # Comma-separated QAT device indices, e.g. "0,1"
 export IAXL_QAT_ZIP_INSTANCES_PER_DEVICE=${IAXL_QAT_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per device
 # QAT driving threads = number of devices x instances-per-device (override to force).
@@ -143,7 +202,18 @@ esac
 if env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE" "$IAXL_CPU_ZIP_ENABLE"; then
     # Defaults to one thread per zip worker; fewer threads each poll several workers (1 = caller only),
     # more threads split a worker's in-flight requests (up to one thread per request).
-    export IAXL_OMP_THREAD_NUM=${IAXL_OMP_THREAD_NUM:-$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM")} || return 1 2>/dev/null || exit 1
+    if [[ -z "$IAXL_OMP_THREAD_NUM" ]]; then
+        IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
+        # qatlib standalone mode gives the rank every instance of its QAT devices. Each thread can poll several, and in
+        # kvstore_benchmark 16 instances ran fastest on 8 threads: more slowed the host<->GPU copies. Also keep within
+        # the rank's CPUs.
+        if [[ -n "$QAT_STANDALONE" ]]; then
+            QAT_MAX_THREADS=$((MIN_RANK_CPU_COUNT - IAXL_RESERVED_CPU_NUM))
+            ((QAT_MAX_THREADS <= 8)) || QAT_MAX_THREADS=8
+            ((QAT_MAX_THREADS < 1 || IAXL_OMP_THREAD_NUM <= QAT_MAX_THREADS)) || IAXL_OMP_THREAD_NUM=$QAT_MAX_THREADS
+        fi
+    fi
+    export IAXL_OMP_THREAD_NUM
 else
     # No zip worker: OpenMP threads only copy raw KV blocks on the host; cap at 4.
     if [[ -z "$IAXL_OMP_THREAD_NUM" ]]; then
@@ -201,6 +271,9 @@ export https_proxy=$http_proxy
 
 # docker
 CONTAINER_NAME=iaxl.vllm
+if [[ -n "$QAT_STANDALONE_VFS" ]]; then
+    CONTAINER_NAME+=$([[ -n "$QAT_GPU" ]] && echo ".gpu$QAT_GPU" || echo ".numa$QAT_NUMA")
+fi
 ENV_VARS=(
     no_proxy
     http_proxy
@@ -211,6 +284,7 @@ ENV_VARS=(
     DEVICE
     IAXL_QATLIB
     IAXL_QATLIB_VERSION
+    PORT
     IAXL_VERSION
     IAXL_LD_PRELOAD
 )
@@ -220,11 +294,12 @@ case "$DEVICE" in
         if [[ "$NVIDIA_RUNTIME" == "none" ]]; then
             DOCKER_RUN_ARGS=()
         else
-            DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "all")
+            DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "${QAT_GPU:+device=}${QAT_GPU:-all}")
         fi
         ;;
     xpu)
         DOCKER_RUN_ARGS=("--device" "/dev/dri")
+        [[ -n "$QAT_GPU" ]] && DOCKER_RUN_ARGS+=("-e" "ZE_AFFINITY_MASK=$QAT_GPU")
         ;;
     cpu)
         DOCKER_RUN_ARGS=()
@@ -239,9 +314,29 @@ for var in "${ENV_VARS[@]}"; do
 done
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
-# qatlib (in-tree driver) shares the host's QAT VFs through the host qatmgr socket.
-if [[ -d /run/qat ]]; then
-    DOCKER_RUN_ARGS+=("-v" "/run/qat:/run/qat")
+if [[ -n "$QAT_STANDALONE_VFS" ]]; then
+    # No --privileged: qatlib opens only these VFs; vLLM's CPU backend needs SYS_NICE + seccomp=unconfined (migrate_pages).
+    # The CPU binding picks the container's NUMA node, so it and the ports are fixed at start.
+    DOCKER_RUN_ARGS+=("--device" "/dev/vfio/vfio" "--ulimit" "memlock=-1:-1" "--shm-size" "4g"
+        "--cap-add" "SYS_NICE" "--security-opt" "seccomp=unconfined"
+        "-e" "QAT_POLICY=$(wc -l <<<"$QAT_STANDALONE_VFS")"
+        "-e" "VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND"
+        "-e" "KVSHRINK_CPU_OMP_THREADS_BIND=$KVSHRINK_CPU_OMP_THREADS_BIND"
+        "-e" "IAXL_API_CONTROLLER_PORT=$IAXL_API_CONTROLLER_PORT"
+        "-e" "IAXL_API_WORKER_BASE_PORT=$IAXL_API_WORKER_BASE_PORT"
+        "-e" "IAXL_DDR_POOL_TOTAL_SIZE_GB=$IAXL_DDR_POOL_TOTAL_SIZE_GB")
+    mapfile -t -O "${#DOCKER_RUN_ARGS[@]}" DOCKER_RUN_ARGS < <(awk '{print "--device"; print "/dev/vfio/" $2}' <<<"$QAT_STANDALONE_VFS")
+    if [[ -n "${KVSHRINK_DSA_DEVICES:-}" && -d /dev/dsa ]]; then
+        DOCKER_RUN_ARGS+=("--device" "/dev/dsa" "-e" "KVSHRINK_DSA_DEVICES=$KVSHRINK_DSA_DEVICES" "-e" "IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE")
+        [[ -e /dev/gdrdrv ]] && DOCKER_RUN_ARGS+=("--device" "/dev/gdrdrv")
+    fi
+    env_truthy "$IAXL_RDMA_ENABLE" && [[ -d /dev/infiniband ]] && DOCKER_RUN_ARGS+=("--device" "/dev/infiniband" "-e" "IAXL_RDMA_ENABLE=$IAXL_RDMA_ENABLE")
+else
+    DOCKER_RUN_ARGS+=("--privileged" "--pid" "host" "-v" "/dev:/dev")
+    # qatlib (in-tree driver) shares the host's QAT VFs through the host qatmgr socket.
+    if [[ -d /run/qat ]]; then
+        DOCKER_RUN_ARGS+=("-v" "/run/qat:/run/qat")
+    fi
 fi
 if [[ -d "$MODEL" ]]; then
     MODEL_DIR=$(realpath "$MODEL")
