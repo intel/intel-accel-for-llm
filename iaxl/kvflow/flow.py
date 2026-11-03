@@ -166,12 +166,12 @@ class KVFlow:
     def _register_kv_caches(self, kv_caches: Dict[str, Union[torch.Tensor, RemoteTensor]], block_dim: int):
         """Register every layer as a KV pool keyed by layer name, plus the "scratch" staging pool.
         RemoteTensor layers are registered by rpc.py (Remote pools) under the same names."""
+        assert not self._in_place or block_dim == 0, "CPU KV blocks must be chunked on axis 0"
         for name, t in kv_caches.items():
             if isinstance(t, RemoteTensor):
                 continue
-            if self._in_place:
-                assert block_dim == 0, "CPU KV blocks must be chunked on axis 0"
-                _iqt.register_kv_pool_cpu(name, t, 0)
+            if t.is_cpu:
+                _iqt.register_kv_pool_cpu(name, t, block_dim)
             else:
                 _iqt.register_kv_pool_gpu(name, t, block_dim)
             self._registered.append(name)
