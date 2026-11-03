@@ -118,8 +118,6 @@ static const SegmentEntry *segment_table(const char *block) {
     return reinterpret_cast<const SegmentEntry *>(block + sizeof(BlockHeader));
 }
 
-static size_t tensor_bytes(const torch::Tensor &t) { return t.numel() * t.element_size(); }
-
 enum class ZipBackend { QAT, IAA, CPU };
 
 // Backend entry points, indexed by ZipBackend.
@@ -269,18 +267,13 @@ struct ZipBlock {
     std::atomic<uint32_t> pending{0};
 };
 
-void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vector<char *> &out_bufs,
-                           std::vector<size_t> &out_sizes, std::vector<size_t> &orig_sizes,
-                           bool compress) {
-    const size_t n = tensors.size();
-    for (size_t i = 0; i < n; i++) {
-        const auto &t = tensors[i];
-        IAXL_CHECK(t.is_contiguous() && t.device().type() == c10::DeviceType::CPU,
-                   "kv_zip: tensor must be a contiguous CPU tensor");
-        orig_sizes[i] = tensor_bytes(t);
-        IAXL_CHECK(orig_sizes[i] <= static_cast<size_t>(INT_MAX),
-                   "kv_zip: tensor byte size exceeds zip integer length range");
-    }
+void kv_zip_compress_batch(const kv_pool::KVPool &pool, const std::vector<int64_t> &block_indices,
+                           std::vector<char *> &out_bufs, std::vector<size_t> &out_sizes,
+                           std::vector<size_t> &orig_sizes, bool compress) {
+    IAXL_CHECK(pool.device == kv_pool::PoolDevice::CPU, "kv_zip: pool must be in CPU memory");
+    IAXL_CHECK(pool.block_bytes <= INT_MAX, "kv_zip: block byte size exceeds zip integer length range");
+    const size_t n = block_indices.size();
+    std::fill_n(orig_sizes.begin(), n, static_cast<size_t>(pool.block_bytes));
     if (n > 0) {
         static std::once_flag logged;
         std::call_once(logged, [&] {
@@ -302,7 +295,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
             for (uint32_t k = 0; k < h.segments; k++)
                 table[k] = {static_cast<uint32_t>(start + size_t(k) * h.segment_size),
                             segment_length(h, k), kSegmentStored};
-            memcpy(buf + start, tensors[i].data_ptr(), h.orig_size);
+            memcpy(buf + start, pool.block_ptr(block_indices[i]), h.orig_size);
             out_bufs[i] = buf;
             out_sizes[i] = start + h.orig_size;
         });
@@ -312,12 +305,11 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     std::vector<ZipBlock> blocks(n);
     std::vector<SegmentRef> segs;
     segs.reserve(n);
+    const bool shuffle = data_shuffle_enabled() && pool.dtype == static_cast<int32_t>(at::kBFloat16);
     for (size_t i = 0; i < n; i++) {
-        const auto &t = tensors[i];
         ZipBlock &b = blocks[i];
-        b.data = static_cast<char *>(t.data_ptr());
-        b.mask = lossy_mask(static_cast<int>(t.element_size()));
-        const bool shuffle = data_shuffle_enabled() && t.dtype() == torch::kBFloat16;
+        b.data = pool.block_ptr(block_indices[i]);
+        b.mask = lossy_mask(static_cast<int>(pool.elem_size));
         const uint16_t shuffled = envs.IAXL_ZIP_EXPONENT_ONLY
                                       ? kBlockShuffled | kBlockExponentOnly
                                       : kBlockShuffled;
@@ -413,8 +405,10 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
 }
 
 void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
-                             const std::vector<torch::Tensor> &tensors) {
-    const size_t n = tensors.size();
+                             const kv_pool::KVPool &pool,
+                             const std::vector<int64_t> &block_indices) {
+    IAXL_CHECK(pool.device == kv_pool::PoolDevice::CPU, "kv_zip: pool must be in CPU memory");
+    const size_t n = block_indices.size();
     IAXL_CHECK(data_ptrs.size() == n, "kv_zip: decompression inputs must have matching lengths");
 
     // IAA-produced segments must go back to IAA, the other compressed ones to QAT/CPU.
@@ -423,8 +417,8 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         const BlockHeader &h = block_header(data_ptrs[i]);
         IAXL_CHECK(h.magic == kBlockMagic && h.version == kBlockVersion,
                    "kv_zip: unknown block format, e.g. a KV cache persisted by an older iaxl");
-        IAXL_CHECK(h.orig_size == tensor_bytes(tensors[i]),
-                   "kv_zip: block size does not match tensor byte size");
+        IAXL_CHECK(h.orig_size == static_cast<uint32_t>(pool.block_bytes),
+                   "kv_zip: block size does not match pool block byte size");
         IAXL_CHECK(h.segment_size > 0 && h.segments == segment_count(h.orig_size, h.segment_size),
                    "kv_zip: invalid segment table");
         IAXL_CHECK(!(h.flags & kBlockExponentOnly) || (h.flags & kBlockShuffled),
@@ -453,8 +447,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         const char *head = static_cast<const char *>(src);
         const char *tail = split ? data_ptrs[r.block] + e.offset + e.length - (full - len)
                                  : head + full / 2;
-        char *dst = static_cast<char *>(tensors[r.block].data_ptr()) +
-                    size_t(r.index) * h.segment_size;
+        char *dst = pool.block_ptr(block_indices[r.block]) + size_t(r.index) * h.segment_size;
         if (h.flags & kBlockShuffled)
             shuffle_copy(dst, head, tail, full);
         else

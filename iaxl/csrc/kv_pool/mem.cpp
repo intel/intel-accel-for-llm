@@ -39,6 +39,17 @@ double now_timestamp() {
     return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
+// Lets unordered_map::find take a string_view without building a std::string.
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
+template <typename V>
+using StringMap = std::unordered_map<std::string, V, StringHash, std::equal_to<>>;
+
 struct SubEntry {
     char *data = nullptr;
     size_t size = 0;
@@ -86,7 +97,7 @@ struct EntryGroup {
     double created_at = 0.0;
     double last_access = 0.0;
 
-    std::unordered_map<std::string, SubEntry> entries;
+    StringMap<SubEntry> entries;
 
     size_t total_bytes() const {
         size_t total = 0;
@@ -98,12 +109,12 @@ struct EntryGroup {
     size_t entry_count() const { return entries.size(); }
 
     SubEntry *find(std::string_view tensor_key) {
-        auto it = entries.find(std::string(tensor_key));
+        auto it = entries.find(tensor_key);
         return it != entries.end() ? &it->second : nullptr;
     }
 
     const SubEntry *find(std::string_view tensor_key) const {
-        auto it = entries.find(std::string(tensor_key));
+        auto it = entries.find(tensor_key);
         return it != entries.end() ? &it->second : nullptr;
     }
 
@@ -225,6 +236,14 @@ class Mem::Impl {
         return get_unlocked(keys, allow_using_omp);
     }
 
+    std::vector<std::pair<const char *, size_t>> get(const std::string &label,
+                                                     const std::string &tensor_key,
+                                                     const std::vector<std::string> &chunk_ids,
+                                                     bool allow_using_omp) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return get_unlocked(label, tensor_key, chunk_ids, allow_using_omp);
+    }
+
     std::vector<bool> has(const std::vector<std::string> &keys) {
         std::lock_guard<std::mutex> lock(mutex_);
         return has_unlocked(keys);
@@ -243,7 +262,7 @@ class Mem::Impl {
 
     // Unlinks the groups now; their buffers are freed on free_queue_'s thread.
     void evict_labels(const std::vector<std::string> &group_keys) {
-        std::vector<std::unordered_map<std::string, SubEntry>> detached;
+        std::vector<StringMap<SubEntry>> detached;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (const auto &group_key : group_keys) {
@@ -290,8 +309,6 @@ class Mem::Impl {
         double now = now_timestamp();
 
         std::vector<size_t> miss_indices;
-        miss_indices.reserve(keys.size());
-
         for (size_t i = 0; i < keys.size(); ++i) {
             results[i] = get_one_unlocked(keys[i], now);
             if (results[i].first == nullptr) {
@@ -299,13 +316,55 @@ class Mem::Impl {
             }
         }
 
-        if (miss_indices.empty()) {
-            return results;
+        if (!miss_indices.empty())
+            load_misses_unlocked(keys, miss_indices, results, now, allow_using_omp);
+        return results;
+    }
+
+    // Same lookup as get_unlocked(keys) for label:chunk_id:tensor_key without building or
+    // re-parsing one full label per chunk; the group key is assembled in a reused buffer.
+    std::vector<std::pair<const char *, size_t>>
+    get_unlocked(const std::string &label, const std::string &tensor_key,
+                 const std::vector<std::string> &chunk_ids, bool allow_using_omp) {
+        validate_label_component(label);
+        validate_label_component(tensor_key);
+
+        std::vector<std::pair<const char *, size_t>> results(chunk_ids.size());
+        double now = now_timestamp();
+
+        std::string group_key = label + LABEL_SEP;
+        const size_t prefix = group_key.size();
+
+        std::vector<size_t> miss_indices;
+        for (size_t i = 0; i < chunk_ids.size(); ++i) {
+            validate_label_component(chunk_ids[i]);
+            group_key.resize(prefix);
+            group_key.append(chunk_ids[i]);
+            results[i] = get_one_unlocked(group_key, tensor_key, now);
+            if (results[i].first == nullptr) {
+                miss_indices.push_back(i);
+            }
         }
 
+        if (!miss_indices.empty()) {
+            // The storage path works on full labels; only the missed ones are needed.
+            std::vector<std::string> keys(chunk_ids.size());
+            for (size_t idx : miss_indices)
+                keys[idx] = make_chunk_label(label, tensor_key, chunk_ids[idx]);
+            load_misses_unlocked(keys, miss_indices, results, now, allow_using_omp);
+        }
+        return results;
+    }
+
+    // Fills results[miss_indices] from storage when the groups are persisted; keys[i] must be
+    // the full label of results[i] for every missed index.
+    void load_misses_unlocked(const std::vector<std::string> &keys,
+                              const std::vector<size_t> &miss_indices,
+                              std::vector<std::pair<const char *, size_t>> &results, double now,
+                              bool allow_using_omp) {
         if (!storage_) {
             misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
-            return results;
+            return;
         }
 
         std::vector<size_t> storage_indices;
@@ -332,11 +391,11 @@ class Mem::Impl {
         } else {
 
             misses_.fetch_add(miss_indices.size(), std::memory_order_relaxed);
-            return results;
+            return;
         }
 
         if (storage_indices.empty()) {
-            return results;
+            return;
         }
 
         struct LoadedData {
@@ -371,7 +430,7 @@ class Mem::Impl {
                 hits_in_storage_.fetch_add(1, std::memory_order_relaxed);
 
                 auto [group_key_sv, tensor_key_sv] = parse_full_label(keys[item.index]);
-                auto it = cache_.find(std::string(group_key_sv));
+                auto it = cache_.find(group_key_sv);
                 SubEntry *sub = it->second.find(tensor_key_sv);
                 results[item.index] = {sub->data, sub->size};
             } else {
@@ -379,8 +438,6 @@ class Mem::Impl {
                 misses_.fetch_add(1, std::memory_order_relaxed);
             }
         }
-
-        return results;
     }
 
     std::vector<bool> has_unlocked(const std::vector<std::string> &keys) const {
@@ -388,7 +445,7 @@ class Mem::Impl {
         results.reserve(keys.size());
         for (const auto &key : keys) {
             auto [group_key_sv, tensor_key_sv] = parse_full_label(key);
-            auto it = cache_.find(std::string(group_key_sv));
+            auto it = cache_.find(group_key_sv);
             if (it != cache_.end()) {
                 if (tensor_key_sv.empty()) {
                     results.push_back(true);
@@ -445,7 +502,7 @@ class Mem::Impl {
     void mark_persisted_unlocked(const std::vector<std::string> &keys) {
         for (const auto &key : keys) {
             auto [group_key_sv, _] = parse_full_label(key);
-            auto it = cache_.find(std::string(group_key_sv));
+            auto it = cache_.find(group_key_sv);
             if (it != cache_.end()) {
                 EntryGroup &group = it->second;
                 if (!group.is_persisted) {
@@ -500,7 +557,7 @@ class Mem::Impl {
 
     size_t remove_unlocked(const std::string &key) {
         auto [group_key_sv, _] = parse_full_label(key);
-        auto it = cache_.find(std::string(group_key_sv));
+        auto it = cache_.find(group_key_sv);
         if (it != cache_.end()) {
             EntryGroup &group = it->second;
             size_t bytes = group.total_bytes();
@@ -679,7 +736,12 @@ class Mem::Impl {
 
     std::pair<const char *, size_t> get_one_unlocked(const std::string &full_label, double now) {
         auto [group_key_sv, tensor_key_sv] = parse_full_label(full_label);
-        auto it = cache_.find(std::string(group_key_sv));
+        return get_one_unlocked(group_key_sv, tensor_key_sv, now);
+    }
+
+    std::pair<const char *, size_t> get_one_unlocked(std::string_view group_key_sv,
+                                                     std::string_view tensor_key_sv, double now) {
+        auto it = cache_.find(group_key_sv);
         if (it != cache_.end()) {
             EntryGroup &group = it->second;
             SubEntry *sub = group.find(tensor_key_sv);
@@ -856,7 +918,7 @@ class Mem::Impl {
         unpersisted_head_.unpersisted_prev = group;
     }
 
-    std::unordered_map<std::string, EntryGroup> cache_;
+    StringMap<EntryGroup> cache_;
 
     EntryGroup lru_head_;
     EntryGroup unpersisted_head_;
@@ -900,6 +962,13 @@ void Mem::put(const std::vector<std::string> &keys, std::vector<char *> &&data_p
 std::vector<std::pair<const char *, size_t>> Mem::get(const std::vector<std::string> &keys,
                                                       bool allow_using_omp) {
     return impl_->get(keys, allow_using_omp);
+}
+
+std::vector<std::pair<const char *, size_t>> Mem::get(const std::string &label,
+                                                      const std::string &tensor_key,
+                                                      const std::vector<std::string> &chunk_ids,
+                                                      bool allow_using_omp) {
+    return impl_->get(label, tensor_key, chunk_ids, allow_using_omp);
 }
 
 std::vector<std::pair<const char *, size_t>> Mem::get_unlocked(const std::vector<std::string> &keys,

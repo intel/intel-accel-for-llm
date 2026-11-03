@@ -21,28 +21,78 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .value("H2D", GpuTransferDirection::H2D)
         .value("D2H", GpuTransferDirection::D2H);
 
+    // ---- KVPool registry: every tensor the data path touches is registered once by name ----
+    py::class_<kv_pool::KVPool>(m, "KVPool", "A registered memory region cut into blocks")
+        .def_readonly("name", &kv_pool::KVPool::name)
+        .def_readonly("base", &kv_pool::KVPool::base)
+        .def_readonly("shape", &kv_pool::KVPool::shape)
+        .def_readonly("chunk_dim", &kv_pool::KVPool::chunk_dim)
+        .def_readonly("elem_size", &kv_pool::KVPool::elem_size)
+        .def_readonly("num_blocks", &kv_pool::KVPool::num_blocks)
+        .def_readonly("block_bytes", &kv_pool::KVPool::block_bytes)
+        .def_readonly("total_bytes", &kv_pool::KVPool::total_bytes)
+        .def_property_readonly("dtype",
+                               [](const kv_pool::KVPool &p) { return static_cast<at::ScalarType>(p.dtype); })
+        .def("block_ptr",
+             [](const kv_pool::KVPool &p, int64_t idx, int64_t o) {
+                 return reinterpret_cast<uintptr_t>(p.block_ptr(idx, o));
+             },
+             py::arg("idx"), py::arg("o") = 0)
+        .def("block_index",
+             [](const kv_pool::KVPool &p, uintptr_t ptr) {
+                 return p.block_index(reinterpret_cast<const void *>(ptr));
+             },
+             py::arg("ptr"));
+
+    m.def("register_kv_pool_cpu", &kv_pool::register_kv_pool_cpu, py::arg("name"), py::arg("tensor"),
+          py::arg("chunk_dim") = 0, py::return_value_policy::reference);
+    m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"), py::arg("tensor"),
+          py::arg("chunk_dim"), py::return_value_policy::reference);
+    m.def(
+        "register_kv_pool_remote",
+        [](std::string name, const std::string &peer, uintptr_t base, const std::vector<int64_t> &shape,
+           int64_t elem_size, at::ScalarType dtype, int dev_id, int chunk_dim) -> const kv_pool::KVPool & {
+            return kv_pool::register_kv_pool_remote(std::move(name), peer, base, shape, elem_size,
+                                                    static_cast<int32_t>(dtype), dev_id, chunk_dim);
+        },
+        py::arg("name"), py::arg("peer"), py::arg("base"), py::arg("shape"), py::arg("elem_size"),
+        py::arg("dtype"), py::arg("dev_id"), py::arg("chunk_dim"), py::return_value_policy::reference);
+    m.def("unregister_kv_pool", &kv_pool::unregister_kv_pool, py::arg("name"));
+    m.def("get_kv_pool", &kv_pool::get_kv_pool, py::arg("name"), py::return_value_policy::reference);
+    m.def("find_kv_pool", &kv_pool::find_kv_pool, py::arg("name"), py::return_value_policy::reference);
+    m.def(
+        "block_tensor",
+        [](const torch::Tensor &t, const std::string &name, int64_t idx) {
+            return kv_pool::block_tensor(t, kv_pool::get_kv_pool(name), idx);
+        },
+        "Block idx of pool `name` as a view of `tensor` (the one it was registered with)",
+        py::arg("tensor"), py::arg("name"), py::arg("idx"));
+    m.def(
+        "block_index_of",
+        [](const std::string &name, const torch::Tensor &block) {
+            return kv_pool::block_index_of(kv_pool::get_kv_pool(name), block);
+        },
+        py::arg("name"), py::arg("block"));
+
     py::class_<Context>(m, "Context")
         .def_static(
             "create",
-            [](const torch::Tensor &tensor, int chunk_dim, GpuTransferDirection direction,
+            [](const std::string &pool_name, const std::string &cpu_pool, GpuTransferDirection direction,
                const std::string &name, py::object work_stream) -> Context {
                 kv_xfer::stream_t gpu_work_stream = nullptr;
                 if (!work_stream.is_none()) {
                     gpu_work_stream = kv_xfer::extract_stream(work_stream);
                 }
-                return Context::create(tensor, chunk_dim, direction, name, gpu_work_stream);
+                return Context::create(pool_name, cpu_pool, direction, name, gpu_work_stream);
             },
-            "Create transfer context from GPU tensor.\n"
+            "Create a transfer context between two registered pools.\n"
+            "pool_name: GPU / remote / CPU-in-place KV pool (= tensor_key); cpu_pool: the CPU pool\n"
+            "its blocks are staged in.\n"
             "work_stream: GPU stream for memcpy (put_stream or get_stream). None = use current "
             "stream.",
-            py::arg("tensor"), py::arg("chunk_dim"),
+            py::arg("pool_name"), py::arg("cpu_pool"),
             py::arg("direction") = GpuTransferDirection::H2D, py::arg("name") = "gpu_xfer",
             py::arg("work_stream") = py::none())
-        .def_static("create_remote", &Context::create_remote,
-                    "Create transfer context for a client tensor registered via rdma_register_remote.",
-                    py::arg("base"), py::arg("dev_id"), py::arg("shape"), py::arg("elem_size"),
-                    py::arg("chunk_dim"), py::arg("direction") = GpuTransferDirection::H2D,
-                    py::arg("name") = "rdma_xfer")
         .def("xfer_wait_cur_stream", &Context::xfer_wait_cur_stream,
              "Make work_stream wait for cur_stream's pending work (GPU-side, async).\n"
              "sync_cur_stream: if True, additionally CPU-blocking wait until cur_stream's\n"
@@ -53,16 +103,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Wait for stream to complete current work before starting transfers.\n"
              "CUDA: async (returns True), XPU: sync blocking (returns False)",
              py::arg("cur_stream"))
-        .def("xfer_chunk", &Context::xfer_chunk, "Transfer single chunk (async)",
-             py::arg("cpu_tensor"), py::arg("chunk_idx"), py::call_guard<py::gil_scoped_release>())
-        .def("xfer_chunks_batch", &Context::xfer_chunks_batch, "Transfer batch of chunks (async)",
-             py::arg("chunk_indices"), py::arg("cpu_tensors"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("xfer_chunks_batch_fast", &Context::xfer_chunks_batch_fast,
-             "Transfer batch of chunks (async).\n"
-             "Same as xfer_chunks_batch, but chunk_indices and cpu_ptrs are int64 CPU tensors,\n"
-             "cpu_ptrs holding the address of each chunk (keep the CPU tensors alive).",
-             py::arg("chunk_indices"), py::arg("cpu_ptrs"),
+        .def("xfer_chunks_batch", &Context::xfer_chunks_batch,
+             "Transfer pool[chunk_indices[i]] <-> cpu_pool[cpu_block_indices[i]] (async)",
+             py::arg("chunk_indices"), py::arg("cpu_block_indices"),
              py::call_guard<py::gil_scoped_release>())
         .def("xfer_finish", &Context::xfer_finish, "Record GPU event after all transfers (async)",
              py::call_guard<py::gil_scoped_release>())
@@ -72,19 +115,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Check if raw transfers complete (non-blocking)",
              py::call_guard<py::gil_scoped_release>())
         .def("zip_to_mem", &Context::zip_to_mem,
-             "Compress CPU tensors and store in cache (async via omp_queue).\n"
+             "Compress CPU pool blocks and store in cache (async via omp_queue).\n"
              "Call zip_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
-             py::arg("cpu_tensors"), py::arg("compress") = true,
+             py::arg("cpu_block_indices"), py::arg("compress") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("unzip_from_mem", &Context::unzip_from_mem,
-             "Retrieve from cache, decompress, and H2D transfer (async).\n"
+             "Retrieve from cache, decompress into CPU pool blocks, and H2D transfer (async).\n"
              "priority: OMP-Main level 0..3 (0 = most urgent); bundle_id: for\n"
              "task_queue_set_bundles_priority(), sort_key: for task_queue_sort_priority_level()\n"
              "(0 / -1 = none).\n"
              "Call unzip_wait() + xfer_wait() to block until done.",
              py::arg("cache"), py::arg("label"), py::arg("tensor_key"), py::arg("chunk_labels"),
-             py::arg("chunk_indices"), py::arg("cpu_tensors"),
+             py::arg("chunk_indices"), py::arg("cpu_block_indices"),
              py::arg("priority") = static_cast<int>(TaskQueue::PRIORITY_HIGH),
              py::arg("bundle_id") = 0, py::arg("sort_key") = -1,
              py::call_guard<py::gil_scoped_release>())
@@ -562,15 +605,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rdma_wait_peer", &kv_xfer::rdma_wait_peer, py::arg("peer"), py::arg("timeout_s") = 60.0,
           py::call_guard<py::gil_scoped_release>());
     m.def("rdma_remove_peer", &kv_xfer::rdma_remove_peer, py::arg("peer"),
-          py::call_guard<py::gil_scoped_release>());
-    m.def("rdma_register_mem", &kv_xfer::rdma_register_mem, py::arg("base"), py::arg("bytes"),
-          py::call_guard<py::gil_scoped_release>());
-    m.def("rdma_register_local", &kv_xfer::rdma_register_local, py::arg("base"), py::arg("bytes"),
-          py::arg("block_bytes"), py::call_guard<py::gil_scoped_release>());
-    m.def("rdma_register_remote", &kv_xfer::rdma_register_remote, py::arg("peer"), py::arg("base"),
-          py::arg("shape"), py::arg("elem_size"), py::arg("dev_id"), py::arg("chunk_dim"),
-          py::call_guard<py::gil_scoped_release>());
-    m.def("rdma_unregister_remote", &kv_xfer::rdma_unregister_remote, py::arg("base"),
           py::call_guard<py::gil_scoped_release>());
     m.def(
         "rdma_send_notif",

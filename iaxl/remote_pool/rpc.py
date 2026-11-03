@@ -139,7 +139,7 @@ class RpcChannel:
         self.buf = _ctrl_buffer(pin=True)
         self.buf_np = self.buf.numpy()
         self.buf_ptr = self.buf.data_ptr()
-        xfer.register_memory(self.buf)
+        xfer.register_memory(self.buf, "rpc.buf")
         self.remote_base = 0
         self.remote_bytes = 0
         self._seq = 0
@@ -198,11 +198,11 @@ class KVStoreService:
         self.xfer, self.role, self.rank, self.tp_size = xfer, role, rank, tp_size
         self.ctrl = _ctrl_buffer(pin=cuda_available())
         self.ctrl_np = self.ctrl.numpy()
-        xfer.register_memory(self.ctrl)
+        xfer.register_memory(self.ctrl, "rpc.ctrl")
         self.kvstore = None
         self.layer_names: List[str] = []
         self.layer_idx: Dict[str, int] = {}
-        self.remote_bases: Dict[int, tuple] = {}
+        self.remote_names: List[str] = []  # Remote KV pools registered for the current client
         self.jobs: Dict[int, Job] = {}
         self._next_job = 0
 
@@ -236,11 +236,10 @@ class KVStoreService:
             dtype = getattr(torch, t["dtype"])
             shape = tuple(t["shape"])
             rt = RemoteTensor(peer, t["base"], shape, dtype, t["dev_id"])
-            # Hybrid layers of different groups share one buffer: register it once.
-            if rt.base not in self.remote_bases:
-                torch_ext.rdma_register_remote(peer, rt.base, list(shape), rt.element_size(), rt.dev_id, block_dim)
-                self.remote_bases[rt.base] = (shape, dtype)
-            assert self.remote_bases[rt.base] == (shape, dtype), name
+            # One Remote pool per layer name; hybrid layers sharing a buffer share its RDMA dlist.
+            torch_ext.register_kv_pool_remote(name, peer, rt.base, list(shape), rt.element_size(),
+                                              dtype, rt.dev_id, block_dim)
+            self.remote_names.append(name)
             kv_caches[name] = rt
         self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,
                                     rank=self.rank, tp_size=self.tp_size)
@@ -299,12 +298,12 @@ class KVStoreService:
         return b""
 
     def _release_remote(self):
-        if self.remote_bases:
+        if self.remote_names:
             from iaxl import torch_ext
 
-            for base in self.remote_bases:
-                torch_ext.rdma_unregister_remote(base)
-            self.remote_bases.clear()
+            for name in self.remote_names:
+                torch_ext.unregister_kv_pool(name)
+            self.remote_names.clear()
 
     def _unregister(self, peer, payload):
         self._release_remote()

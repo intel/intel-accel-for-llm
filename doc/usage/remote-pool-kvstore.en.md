@@ -257,5 +257,5 @@ default 60s).
 - `no network interface owns 10.10.10.10`: the IP is not assigned to a local interface. Check with `ip -j -4 addr` before importing NIXL or initializing RDMA.
 - `<netdev> (10.10.10.10) is not an RDMA-capable NIC`: the interface exists but has no RDMA device under `/sys/class/net/*/device/infiniband/`. Verify that the interface supports RDMA and that MLNX_OFED or rdma-core is installed on the host.
 - `client tp_size N != daemon tp_size M`: vLLM's `-tp` and daemon's `--tp-size` must match exactly.
-- `rdma_register_local called twice`: each rank should register the pool once. This can indicate that the KVStore was created more than once.
+- `kv_pool "scratch" already registered with a different base/shape`: each rank should create the scratch pool once. This can indicate that the KVStore was created more than once.
 - Cannot connect to REST on daemon port `18700`: check the daemon firewall and ensure `IAXL_API_CONTROLLER_PORT` matches the client URL.
