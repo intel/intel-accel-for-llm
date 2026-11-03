@@ -131,6 +131,8 @@ class KVStoreLocal:
             persist_dir=final_persist_dir,
             cache_size_gb=pool_size_gb,
             rank=rank,
+            kv_caches=kv_caches,
+            block_dim=block_dim,
         )
         start_profiling()
 
@@ -228,8 +230,6 @@ class KVStoreLocal:
         if layer_names is None:
             layer_names = self.layer_names
 
-        tensors = {name: self.kv_caches[name] for name in layer_names}
-
         # skip_compression_count counts GLOBAL layers, but put() may be called with
         # a single layer / subset (layerwise async), where flow compares against the
         # per-call tensor index. Rebase onto this call's first layer so "skip the
@@ -239,8 +239,7 @@ class KVStoreLocal:
 
         result = self.tensorzip.put(
             label=label or self.LABEL,
-            tensors=tensors,
-            chunk_dim=self.block_dim,
+            tensor_keys=layer_names,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,
@@ -290,15 +289,13 @@ class KVStoreLocal:
         if layer_names is None:
             layer_names = self.layer_names
 
-        tensors = {name: self.kv_caches[name] for name in layer_names}
         sort_keys: Dict[str, int] = {}
         for name in layer_names:
             sort_keys[name] = self._layer_order[name]
 
         return self.tensorzip.get(
             label=label or self.LABEL,
-            tensors=tensors,
-            chunk_dim=self.block_dim,
+            tensor_keys=layer_names,
             chunk_indices=block_indices,
             chunk_labels=block_hashs,
             description=description,

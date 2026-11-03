@@ -15,7 +15,106 @@
 #include <utility>
 #include <vector>
 
+// The torch-side helpers below only name torch::Tensor; the implementation (pool.cpp)
+// and the torch_ext sources include <torch/extension.h> themselves.
+namespace at {
+class Tensor;
+}
+namespace torch {
+using at::Tensor;
+}
+
 namespace kv_pool {
+
+// ---------------------------------------------------------------------------
+// KVPool: a registered memory region cut into num_blocks blocks along chunk_dim.
+// Block idx consists of outer_dims segments; segment o starts at
+// base + o * outer_block_size + idx * chunk_stride and spans inner_size bytes.
+// A CPU pool (chunk_dim == 0) has outer_dims == 1, so a block is block_bytes contiguous bytes.
+// ---------------------------------------------------------------------------
+
+enum class PoolDevice : uint8_t { CPU, GPU, Remote };
+
+struct KVPool {
+    std::string name;   // registry key: KV cache layer -> tensor_key, ScratchPool -> "scratch"
+    uintptr_t base = 0;
+    PoolDevice device = PoolDevice::CPU;
+    int dev_id = -1;    // GPU device index (the client's for Remote)
+    std::string peer;   // NIXL agent name (Remote only)
+    std::vector<int64_t> shape;
+    int chunk_dim = 0;
+    int64_t elem_size = 0;
+    int32_t dtype = -1; // c10::ScalarType as an integer; this header stays torch-free
+    bool pinned = false;
+
+    int64_t num_blocks = 0;       // shape[chunk_dim]
+    int64_t outer_dims = 0;       // prod(shape[:chunk_dim])
+    int64_t inner_size = 0;       // elem_size * prod(shape[chunk_dim+1:])
+    int64_t chunk_stride = 0;     // bytes between neighbouring blocks (== inner_size, contiguous)
+    int64_t outer_block_size = 0; // num_blocks * inner_size
+    int64_t block_bytes = 0;      // outer_dims * inner_size
+    size_t total_bytes = 0;
+
+    // Hot path, no bounds checks.
+    char *block_ptr(int64_t idx, int64_t o = 0) const {
+        return reinterpret_cast<char *>(base + o * outer_block_size + idx * chunk_stride);
+    }
+    int64_t block_index(const void *ptr) const {
+        return static_cast<int64_t>(((reinterpret_cast<uintptr_t>(ptr) - base) % outer_block_size) /
+                                    chunk_stride);
+    }
+    bool contains(const void *ptr) const {
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        return p >= base && p < base + total_bytes;
+    }
+    bool is_contiguous_blocks() const { return outer_dims == 1 && chunk_stride == inner_size; }
+
+    // Entry-point checks (caller thread), done once per call.
+    void check_indices(const std::vector<int64_t> &idx) const;
+    void check_same_block_geometry(const KVPool &other) const;
+
+    // ptrs[i] = block_ptr(idx[i]); only at the Ops::copy_chunks_batch boundary.
+    std::vector<char *> block_ptrs(const std::vector<int64_t> &idx) const;
+};
+
+// The only geometry computation; `shape` is laid out contiguously.
+KVPool make_kv_pool(uintptr_t base, PoolDevice device, int dev_id, const std::vector<int64_t> &shape,
+                    int64_t elem_size, int32_t dtype, int chunk_dim);
+
+// Process-wide registry keyed by name. Element addresses are stable, so a Context may
+// keep a `const KVPool *`. Re-registering a name requires the same base and geometry and
+// returns the existing entry; different names may share one base (hybrid layers).
+const KVPool &register_kv_pool(KVPool pool);
+const KVPool &get_kv_pool(std::string_view name);   // aborts if not registered
+const KVPool *find_kv_pool(std::string_view name);  // nullptr if not registered
+const KVPool *find_kv_pool_by_base(uintptr_t base);
+void unregister_kv_pool(std::string_view name);
+
+// Transport backend callbacks; rdma_init() installs the NIXL versions.
+struct PoolHooks {
+    void (*on_register)(const KVPool &) = nullptr;
+    void (*on_unregister)(const KVPool &) = nullptr;
+};
+void set_pool_hooks(const PoolHooks &hooks);
+
+// ---- torch side (pool.cpp) ----
+// cpu/gpu: validates contiguity and device, records pinned, keeps `t` alive until unregistered.
+const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0);
+const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim);
+const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,
+                                      const std::vector<int64_t> &shape, int64_t elem_size,
+                                      int32_t dtype, int dev_id, int chunk_dim);
+
+// Block idx as a view of `t` (the tensor the pool was registered with).
+torch::Tensor block_tensor(const torch::Tensor &t, const KVPool &pool, int64_t idx);
+std::vector<torch::Tensor> block_tensors(const torch::Tensor &t, const KVPool &pool,
+                                         const std::vector<int64_t> &idx);
+// Same, using the tensor kept at registration (Remote pools have none and abort).
+torch::Tensor block_tensor(const KVPool &pool, int64_t idx);
+int64_t block_index_of(const KVPool &pool, const torch::Tensor &block);
+std::vector<int64_t> block_indices_of(const KVPool &pool, const std::vector<torch::Tensor> &blocks);
+int64_t tensor_bytes(const torch::Tensor &t);
+KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_dim);
 
 inline constexpr char LABEL_SEP = ':';
 

@@ -25,22 +25,14 @@ static inline uint64_t metrics_sum_sizes(const std::vector<size_t> &sizes) {
     return total;
 }
 
-static inline uint64_t metrics_sum_tensor_bytes(const std::vector<torch::Tensor> &tensors) {
-    uint64_t total = 0;
-    for (const auto &t : tensors) {
-        total += static_cast<uint64_t>(t.numel()) * t.element_size();
-    }
-    return total;
-}
-
 struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
     Context *ctx;
     kv_pool::Mem *mem;
     std::string label;
     std::string tensor_key;
     std::vector<std::string> chunk_ids;
-    std::vector<int64_t> chunk_indices;
-    std::vector<torch::Tensor> cpu_tensors;
+    std::vector<int64_t> chunk_indices;     // blocks of ctx->pool()
+    std::vector<int64_t> cpu_block_indices; // blocks of ctx->cpu_pool()
     std::shared_ptr<std::promise<void>> promise;
 
     void execute(bool is_retry) {
@@ -92,18 +84,15 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
         {
             PROFILE_SCOPE("decompress");
             METRICS_TIMER_START(metrics_decompress);
-            kv_zip_decompress_batch(data_ptrs, cpu_tensors);
-            METRICS_ADD_DECOMPRESS(metrics_decompress, metrics_sum_tensor_bytes(cpu_tensors));
+            const kv_pool::KVPool &cpu_pool = ctx->cpu_pool();
+            kv_zip_decompress_batch(data_ptrs, cpu_pool, cpu_block_indices);
+            METRICS_ADD_DECOMPRESS(metrics_decompress, n * cpu_pool.block_bytes);
         }
 
         mem->release_deletion_guard();
 
-        {
-
-            ctx->xfer_chunks_batch(chunk_indices, cpu_tensors);
-
-            ctx->xfer_finish();
-        }
+        ctx->xfer_chunks_batch(chunk_indices, cpu_block_indices);
+        ctx->xfer_finish();
 
         promise->set_value();
     }
@@ -113,25 +102,24 @@ struct UnzipFromMemWork : std::enable_shared_from_this<UnzipFromMemWork> {
 
 void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                          const std::vector<std::string> &chunk_labels,
-                         const std::vector<torch::Tensor> &cpu_tensors, bool compress) {
+                         const std::vector<int64_t> &cpu_block_indices, bool compress) {
     PROFILE_SCOPE_FMT("zip_to_mem(%s,l=<%zu,l0=%s>)", name().c_str(), chunk_labels.size(),
                       chunk_labels[0].c_str());
 
-    const size_t n = cpu_tensors.size();
-
-    auto full_chunk_labels = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels);
+    const size_t n = cpu_block_indices.size();
+    IAXL_CHECK(chunk_labels.size() == n, "zip_to_mem: chunk_labels and cpu_block_indices differ");
+    cpu_pool_->check_indices(cpu_block_indices);
 
     reset_async_state();
 
     auto *cache_ptr = &mem;
-    auto chunk_labels_copy = std::move(full_chunk_labels);
-    auto cpu_tensors_copy = cpu_tensors;
     auto *self = this;
 
     zip_future_ = omp_queue().submit(
-        [=]() {
+        [=, chunk_labels = kv_pool::make_chunk_labels(label, tensor_key, chunk_labels),
+         cpu_block_indices = cpu_block_indices]() {
             PROFILE_SCOPE_FMT("zip_to_mem_work(%s,l=<%zu,l0=%s>)", self->name().c_str(),
-                              chunk_labels_copy.size(), chunk_labels_copy[0].c_str());
+                              chunk_labels.size(), chunk_labels[0].c_str());
 
             self->xfer_wait();
 
@@ -143,15 +131,13 @@ void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std:
                 {
                     PROFILE_SCOPE("compress");
                     METRICS_TIMER_START(metrics_compress);
-                    kv_zip_compress_batch(cpu_tensors_copy, compressed_bufs, compressed_sizes,
-                                          unzip_sizes, compress);
+                    kv_zip_compress_batch(self->cpu_pool(), cpu_block_indices, compressed_bufs,
+                                          compressed_sizes, unzip_sizes, compress);
                     METRICS_ADD_COMPRESS(metrics_compress, metrics_sum_sizes(unzip_sizes));
                 }
 
-                {
-                    cache_ptr->put(chunk_labels_copy, std::move(compressed_bufs), compressed_sizes,
-                                   unzip_sizes);
-                }
+                cache_ptr->put(chunk_labels, std::move(compressed_bufs), compressed_sizes,
+                               unzip_sizes);
             } catch (...) {
                 IAXL_CHECK(false, "zip_to_mem: unexpected asynchronous exception");
             }
@@ -163,9 +149,14 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                              const std::string &tensor_key,
                              const std::vector<std::string> &chunk_labels,
                              const std::vector<int64_t> &chunk_indices,
-                             const std::vector<torch::Tensor> &cpu_tensors, int priority,
+                             const std::vector<int64_t> &cpu_block_indices, int priority,
                              uint64_t bundle_id, int64_t sort_key) {
     PROFILE_SCOPE_FMT("unzip_from_mem %s/%s", label.c_str(), tensor_key.c_str());
+    IAXL_CHECK(chunk_labels.size() == chunk_indices.size() &&
+                   chunk_indices.size() == cpu_block_indices.size(),
+               "unzip_from_mem: chunk_labels, chunk_indices and cpu_block_indices differ");
+    pool_->check_indices(chunk_indices);
+    cpu_pool_->check_indices(cpu_block_indices);
 
     reset_async_state();
 
@@ -179,7 +170,7 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
     work->tensor_key = tensor_key;
     work->chunk_ids = chunk_labels;
     work->chunk_indices = chunk_indices;
-    work->cpu_tensors = cpu_tensors;
+    work->cpu_block_indices = cpu_block_indices;
     work->promise = promise;
 
     omp_queue().submit(

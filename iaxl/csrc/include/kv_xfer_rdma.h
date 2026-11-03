@@ -6,39 +6,25 @@
 
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "kv_pool.h"
 #include "kv_xfer.h"
 
 namespace kv_xfer {
 
-// Data-plane entry points used by Context::create_remote.
+// Data-plane entry points used by Context::create for a PoolDevice::Remote pool.
 const Ops &rdma_ops();
-context_t rdma_context_create(char *gpu_base_ptr, int64_t chunk_stride, int64_t outer_dims,
-                              int64_t inner_size, int64_t outer_block_size);
+context_t rdma_context_create(const kv_pool::KVPool &remote, const kv_pool::KVPool &local);
 
+// Creates the agent and installs the kv_pool hooks: CPU/GPU pools are registered with
+// NIXL, Remote pools get a VRAM descriptor list on the peer.
 void rdma_init(const std::string &name, int listen_port);
 void rdma_wait_peer(const std::string &peer, double timeout_s);
 void rdma_remove_peer(const std::string &peer);
-
-// Register a pinned DRAM buffer so peers can RDMA into it (RPC control buffer).
-void rdma_register_mem(uintptr_t base, size_t bytes);
-
-// Register the ScratchPool; the local descriptor list is built lazily from the
-// first context geometry (outer_dims x inner_size sub-descriptors per block).
-void rdma_register_local(uintptr_t base, size_t bytes, int64_t block_bytes);
-
-// Prep a remote (VRAM) descriptor list for a client kv_cache tensor laid out
-// contiguously as `shape`; desc[o * num_blocks + b] covers block b of outer dim o.
-// Returns `base`, which is the gpu_base_ptr to pass to context_create.
-uintptr_t rdma_register_remote(const std::string &peer, uintptr_t base,
-                               const std::vector<int64_t> &shape, int64_t elem_size, int dev_id,
-                               int chunk_dim);
-void rdma_unregister_remote(uintptr_t base);
 
 void rdma_send_notif(const std::string &peer, const std::string &msg);
 std::vector<std::pair<std::string, std::string>> rdma_get_notifs();

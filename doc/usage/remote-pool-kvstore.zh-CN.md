@@ -307,7 +307,7 @@ client 连接会超时（`IAXL_API_TIMEOUT`，默认 60s）。
   MLNX_OFED / rdma-core。
 - `client tp_size N != daemon tp_size M`：显式的 topology 校验，vLLM `-tp` 与
   daemon `--tp-size` 必须严格一致。
-- `rdma_register_local called twice`：一个 rank 进程只应该注册 pool 一次；如果
+- `kv_pool "scratch" already registered with a different base/shape`：一个 rank 进程只应该创建 scratch pool 一次；如果
   出现，通常是 KVStore 被创建了两遍——上层调用错了。
 - 连不上 daemon 上的 `18700` REST：检查 daemon 节点的防火墙，以及
   `IAXL_API_CONTROLLER_PORT` 配置是否一致。

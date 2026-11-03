@@ -99,7 +99,7 @@ class rdma_xfer:
         self.agent.remove_remote_agent(peer)
 
     # -- memory --------------------------------------------------------------
-    def register_memory(self, tensor):
+    def register_memory(self, tensor, name: str = ""):
         h = self.agent.register_memory(tensor)
         self._handles.append(h)
         return h
@@ -160,9 +160,9 @@ class rdma_xfer_cpp:
     def disconnect(self, peer: str):
         self._ext.rdma_remove_peer(peer)
 
-    def register_memory(self, tensor):
-        self._ext.rdma_register_mem(tensor.data_ptr(), tensor.numel() * tensor.element_size())
-        return tensor
+    def register_memory(self, tensor, name: str):
+        """Register a CPU buffer as KV pool `name` (rows along dim 0); the RDMA hook registers it."""
+        return self._ext.register_kv_pool_cpu(name, tensor)
 
     def send_notif(self, peer: str, payload: bytes):
         self._ext.rdma_send_notif(peer, payload)

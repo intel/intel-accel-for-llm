@@ -5,7 +5,7 @@ import os
 import time
 import torch
 import logging
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Any, Union
 from dataclasses import dataclass, field
 
 from ..utils.profiler import (
@@ -44,7 +44,7 @@ def get_accelerator_device() -> str:
 @dataclass
 class Task:
     ctx: Any = None
-    cpu_tensors: List[torch.Tensor] = None
+    block_indices: Optional[List[int]] = None  # scratch blocks to release once done
 
     label: str = None
     tensor_key: str = None
@@ -55,7 +55,14 @@ class Task:
 
 
 class KVFlow:
-    def __init__(self, persist_dir: str, cache_size_gb: float = 8.0, rank: int = 0):
+    def __init__(
+        self,
+        persist_dir: str,
+        cache_size_gb: float = 8.0,
+        rank: int = 0,
+        kv_caches: Optional[Dict[str, Union[torch.Tensor, RemoteTensor]]] = None,
+        block_dim: Optional[int] = None,
+    ):
 
         self.enable_compression = envs.IAXL_KV_COMPRESSION
         base_dir = envs.IAXL_CACHE_DIR
@@ -108,7 +115,8 @@ class KVFlow:
 
         self.cache_size_bytes = int(cache_size_gb * 1024**3)
 
-        self.chunk_pool: Optional[ScratchPool] = None  # created on first put/get, once block shape is known
+        self.chunk_pool: Optional[ScratchPool] = None
+        self._registered: List[str] = []  # KV pools registered by this instance
         self._pending_puts: Dict[int, Task] = {}
         self._pending_gets: Dict[int, Task] = {}
 
@@ -117,6 +125,10 @@ class KVFlow:
             storage=self.storage,
             record=self.record,
         )
+
+        if kv_caches:
+            assert block_dim is not None, "block_dim is required with kv_caches"
+            self._register_kv_caches(kv_caches, block_dim)
 
         logger.info(
             "Initialized: persist_dir=%s, cache_size_gb=%.2f, compression=%s",
@@ -151,18 +163,36 @@ class KVFlow:
         self._streams_initialized = True
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
 
-    def _ensure_pool(self, block_shape: Tuple[int, ...], dtype: torch.dtype):
-        if self.chunk_pool is None:
+    def _register_kv_caches(self, kv_caches: Dict[str, Union[torch.Tensor, RemoteTensor]], block_dim: int):
+        """Register every layer as a KV pool keyed by layer name, plus the "scratch" staging pool.
+        RemoteTensor layers are registered by rpc.py (Remote pools) under the same names."""
+        for name, t in kv_caches.items():
+            if isinstance(t, RemoteTensor):
+                continue
+            if self._in_place:
+                assert block_dim == 0, "CPU KV blocks must be chunked on axis 0"
+                _iqt.register_kv_pool_cpu(name, t, 0)
+            else:
+                _iqt.register_kv_pool_gpu(name, t, block_dim)
+            self._registered.append(name)
+        if not self._in_place:
+            first = next(iter(kv_caches.values()))
+            block_shape = tuple(s for d, s in enumerate(first.shape) if d != block_dim)
             self.chunk_pool = ScratchPool(
-                block_shape, dtype, pin_memory=self.device_type not in (None, "cpu")
+                block_shape, first.dtype, pin_memory=self.device_type not in (None, "cpu")
             )
-            if envs.IAXL_RDMA_ENABLE:
-                pool = self.chunk_pool.pool
-                _iqt.rdma_register_local(pool.data_ptr(), pool.nbytes, self.chunk_pool.block_bytes)
 
-    def _allocate(self, count: int, shape: Tuple[int, ...], dtype: torch.dtype) -> List[torch.Tensor]:
+    def close(self):
+        if self.chunk_pool is not None:
+            self.chunk_pool.close()
+            self.chunk_pool = None
+        for name in self._registered:
+            _iqt.unregister_kv_pool(name)
+        self._registered.clear()
+
+    def _allocate(self, count: int) -> List[int]:
         rounds, start = 0, 0.0
-        while (tensors := self.chunk_pool.allocate(count, shape, dtype)) is None:
+        while (blocks := self.chunk_pool.allocate(count)) is None:
             if not (self._pending_puts or self._pending_gets):
                 raise RuntimeError(f"ScratchPool exhausted: need {count}, {self.chunk_pool.status()}")
             if rounds == 1:
@@ -174,21 +204,17 @@ class KVFlow:
         if rounds > 1:
             logger.warning("ScratchPool exhausted: waited %.3f ms (%d rounds) for %d blocks",
                            (time.perf_counter() - start) * 1e3, rounds, count)
-        return tensors
+        return blocks
 
-    def _create_ctx(self, tensor, chunk_dim, direction, description, work_stream):
-        if isinstance(tensor, RemoteTensor):
-            return Context.create_remote(
-                tensor.base, tensor.dev_id, list(tensor.shape), tensor.element_size(),
-                chunk_dim, direction, description,
-            )
-        return Context.create(tensor, chunk_dim, direction, description, work_stream=work_stream)
+    def _create_ctx(self, tensor_key: str, direction, description, work_stream):
+        # tensor_key must be a registered pool (KVFlow.__init__ or rpc.py); C++ aborts otherwise.
+        cpu_pool = tensor_key if self._in_place else ScratchPool.NAME
+        return Context.create(tensor_key, cpu_pool, direction, description, work_stream=work_stream)
 
     @profile_func(
         lambda self,
         label,
-        tensors,
-        chunk_dim,
+        tensor_keys,
         chunk_indices,
         chunk_labels,
         description="",
@@ -199,74 +225,46 @@ class KVFlow:
     def put(
         self,
         label: str,
-        tensors: Dict[str, torch.Tensor],
-        chunk_dim: int,
+        tensor_keys: List[str],
         chunk_indices: List[int],
         chunk_labels: List[str],
         description: str = "",
         skip_compression_count: int = 0,
     ) -> Dict[str, Task]:
+        """tensor_keys: names of registered KV pools (one per layer)."""
 
         self._ensure_streams()
-        assert chunk_indices is not None and chunk_labels is not None
-        assert tensors, "tensors must not be empty"
+        assert tensor_keys, "tensor_keys must not be empty"
         assert chunk_indices, "chunk_indices must not be empty"
         assert len(chunk_indices) == len(chunk_labels), (
             "chunk_indices and chunk_labels must have the same length"
         )
-        first_t = next(iter(tensors.values()))
-        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
-        for tensor_key, tensor in tensors.items():
-            assert isinstance(tensor, RemoteTensor) or tensor.device.type == self.device_type, (
-                f"Tensor '{tensor_key}' must be on the {self.device_type} device"
-            )
-            assert tensor.device == first_t.device, (
-                "all tensors must be on the same device"
-            )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
-            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
-            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
 
         results = {}
         first_tensor = True
         num_chunks = len(chunk_indices)
-        chunk_shape = list(first_t.shape)
-        del chunk_shape[chunk_dim]
-        chunk_shape = tuple(chunk_shape)
-        if self._in_place:
-            assert chunk_dim == 0, "CPU KV blocks must be chunked on axis 0"
-        else:
-            self._ensure_pool(chunk_shape, first_t.dtype)
 
-        for tensor_index, (tensor_key, tensor) in enumerate(tensors.items()):
-            if self._in_place:
-                cpu_tensors = [tensor[i] for i in chunk_indices]
-            else:
-                cpu_tensors = self._allocate(num_chunks, chunk_shape, tensor.dtype)
-
+        for tensor_index, tensor_key in enumerate(tensor_keys):
             ctx = self._create_ctx(
-                tensor,
-                chunk_dim,
-                GpuTransferDirection.D2H,
-                description,
-                work_stream=self.put_stream,
+                tensor_key, GpuTransferDirection.D2H, description, work_stream=self.put_stream
             )
             if first_tensor:
                 if self.device_type is not None:
                     ctx.xfer_wait_cur_stream(sync_cur_stream=True)
                 first_tensor = False
-            if not self._in_place:
-                ctx.xfer_chunks_batch(chunk_indices, cpu_tensors)
+            if self._in_place:
+                blocks = chunk_indices
+            else:
+                blocks = self._allocate(num_chunks)
+                ctx.xfer_chunks_batch(chunk_indices, blocks)
             ctx.xfer_finish()
 
             compress = tensor_index >= skip_compression_count
-            ctx.zip_to_mem(
-                self.mem, label, tensor_key, chunk_labels, cpu_tensors, compress
-            )
+            ctx.zip_to_mem(self.mem, label, tensor_key, chunk_labels, blocks, compress)
 
             results[tensor_key] = task = Task(
                 ctx=ctx,
-                cpu_tensors=None if self._in_place else cpu_tensors,
+                block_indices=None if self._in_place else blocks,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
@@ -304,23 +302,22 @@ class KVFlow:
             result.ctx.zip_wait()
             result.ctx = None
 
-            if not self._in_place:
-                self.chunk_pool.release(result.cpu_tensors)
-                result.cpu_tensors = None
+            if result.block_indices is not None:
+                self.chunk_pool.release(result.block_indices)
+                result.block_indices = None
                 del self._pending_puts[id(result)]
 
         return True
 
     @profile_func(
-        lambda self, label, tensors, chunk_dim, chunk_indices, chunk_labels, description, **_: (
+        lambda self, label, tensor_keys, chunk_indices, chunk_labels, description, **_: (
             f"({description},count={len(chunk_indices)})"
         )
     )
     def get(
         self,
         label: str,
-        tensors: Dict[str, torch.Tensor],
-        chunk_dim: int,
+        tensor_keys: List[str],
         chunk_indices: List[int],
         chunk_labels: List[str],
         description: str = "",
@@ -328,27 +325,16 @@ class KVFlow:
         bundle_id: int = 0,
         sort_keys: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Task]:
-        """priorities / sort_keys: OMP-Main level / sort key per tensor key (None: 0 / -1)."""
+        """tensor_keys: names of registered KV pools (one per layer).
+        priorities / sort_keys: OMP-Main level / sort key per tensor key (None: 0 / -1)."""
 
         self._ensure_streams()
-        assert chunk_indices is not None and chunk_labels is not None
-        assert tensors, "tensors must not be empty"
+        assert tensor_keys, "tensor_keys must not be empty"
         assert chunk_indices, "chunk_indices must not be empty"
         assert len(chunk_indices) == len(chunk_labels), (
             "chunk_indices and chunk_labels must have the same length"
         )
-        first_t = next(iter(tensors.values()))
-        assert 0 <= chunk_dim < first_t.dim(), "chunk_dim is out of range"
-        for tensor_key, tensor in tensors.items():
-            assert isinstance(tensor, RemoteTensor) or tensor.device.type == self.device_type, (
-                f"Tensor '{tensor_key}' must be on the {self.device_type} device"
-            )
-            assert tensor.device == first_t.device, (
-                "all tensors must be on the same device"
-            )
-            assert tensor.is_contiguous(), "all GPU tensors must be contiguous"
-            assert tensor.shape == first_t.shape, "all tensors must have the same shape"
-            assert tensor.dtype == first_t.dtype, "all tensors must have the same dtype"
+        for tensor_key in tensor_keys:
             if priorities is not None and tensor_key not in priorities:
                 raise ValueError(f"priorities is missing tensor key {tensor_key}")
             if sort_keys is not None and tensor_key not in sort_keys:
@@ -356,32 +342,17 @@ class KVFlow:
 
         results = {}
         num_chunks = len(chunk_indices)
-        chunk_shape = list(first_t.shape)
-        del chunk_shape[chunk_dim]
-        chunk_shape = tuple(chunk_shape)
-        if self._in_place:
-            assert chunk_dim == 0, "CPU KV blocks must be chunked on axis 0"
-        else:
-            self._ensure_pool(chunk_shape, first_t.dtype)
 
         first_tensor = True
-        for tensor_key, tensor in tensors.items():
-            if self._in_place:
-                cpu_tensors = [tensor[i] for i in chunk_indices]
-            else:
-                cpu_tensors = self._allocate(num_chunks, chunk_shape, tensor.dtype)
-
+        for tensor_key in tensor_keys:
             ctx = self._create_ctx(
-                tensor,
-                chunk_dim,
-                GpuTransferDirection.H2D,
-                description,
-                work_stream=self.get_stream,
+                tensor_key, GpuTransferDirection.H2D, description, work_stream=self.get_stream
             )
             if first_tensor:
                 if stream_sync_on_get and self.device_type is not None:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
+            blocks = chunk_indices if self._in_place else self._allocate(num_chunks)
             priority = 0 if priorities is None else priorities[tensor_key]
             sort_key = -1 if sort_keys is None else sort_keys[tensor_key]
             ctx.unzip_from_mem(
@@ -390,7 +361,7 @@ class KVFlow:
                 tensor_key,
                 chunk_labels,
                 chunk_indices,
-                cpu_tensors,
+                blocks,
                 priority=priority,
                 bundle_id=bundle_id,
                 sort_key=sort_key,
@@ -398,7 +369,7 @@ class KVFlow:
 
             results[tensor_key] = task = Task(
                 ctx=ctx,
-                cpu_tensors=None if self._in_place else cpu_tensors,
+                block_indices=None if self._in_place else blocks,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
@@ -459,9 +430,9 @@ class KVFlow:
 
             result.ctx = None
 
-            if result.cpu_tensors is not None:
-                self.chunk_pool.release(result.cpu_tensors)
-                result.cpu_tensors = None
+            if result.block_indices is not None:
+                self.chunk_pool.release(result.block_indices)
+                result.block_indices = None
                 del self._pending_gets[id(result)]
 
         return True
@@ -487,6 +458,8 @@ class KVFlow:
         logger.info("Stopping...")
         assert self.record is not None
         self.record.sync()
+        if not self.has_only_mode:
+            self.close()
         logger.info("Stopped")
 
     def status(self) -> dict:

@@ -335,16 +335,13 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
             results.append(Result("CUDA Kernel", direction, elapsed, total_bytes, valid()))
 
         if "iaxl" in args.methods:
+            gpu_fragments = gpu.view(fragments, frag_elements)
             if h2d:
-                cpu_tensors = list(source_fragments.unbind())
-                iaxl_copier = SliceCopier(
-                    cpu_tensors, 0, dst_indices, out=gpu.view(fragments, frag_elements)
-                )
+                iaxl_copier = SliceCopier(source_fragments, 0, dst_indices, out=gpu_fragments)
             else:
-                host_fragments = host.view(fragments, frag_elements)
-                cpu_tensors = [host_fragments[index] for index in dst_indices]
                 iaxl_copier = SliceCopier(
-                    gpu.view(fragments, frag_elements), 0, src_indices, out=cpu_tensors
+                    gpu_fragments, 0, src_indices,
+                    out=host.view(fragments, frag_elements), cpu_index=dst_indices,
                 )
 
             clear_destination()
@@ -355,6 +352,7 @@ def run(frag_bytes: int, args: argparse.Namespace) -> list[Result]:
                 iterations=args.iterations,
                 label=label + ("IAXL DSA",),
             )
+            iaxl_copier.close()
             results.append(Result("IAXL DSA", direction, elapsed, total_bytes, valid()))
 
     return results

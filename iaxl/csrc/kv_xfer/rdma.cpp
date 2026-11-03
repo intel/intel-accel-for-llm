@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// RDMA flavour of kv_xfer::Ops for the remote_pool daemon (always compiled, used
-// when IAXL_RDMA_ENABLE selects Context::create_remote): the "GPU" is a client's
-// VRAM reached over RDMA through NIXL. put = RDMA READ (d2h), get = RDMA WRITE (h2d).
+// RDMA flavour of kv_xfer::Ops for the remote_pool daemon (always compiled, used when a
+// Context is created on a PoolDevice::Remote pool): the "GPU" is a client's VRAM reached
+// over RDMA through NIXL. put = RDMA READ (d2h), get = RDMA WRITE (h2d).
 // Transfers are posted and polled synchronously on the TaskQueue worker, so
 // copy_chunks_batch returning means the data has landed; events are plain flags.
 
@@ -19,6 +19,7 @@
 #include <nixl.h>
 
 #include "iaxl_common.h"
+#include "kv_pool.h"
 #include "kv_xfer.h"
 #include "kv_xfer_rdma.h"
 
@@ -34,25 +35,17 @@
 
 namespace kv_xfer {
 
+using kv_pool::KVPool;
+using kv_pool::PoolDevice;
+
 namespace {
 
-struct RemoteReg {
-    std::string peer;
-    nixlDlistH *dlist = nullptr;
-    int64_t num_blocks = 0;
-    int64_t outer_dims = 0;
+// NIXL state of one registered buffer; pools sharing a base (hybrid layers) share it.
+struct Reg {
+    nixlDlistH *dlist = nullptr; // Remote: VRAM descs; CPU: DRAM descs, built at first transfer
+    int64_t outer_dims = 0;      // sub-block geometry of a CPU dlist
     int64_t inner_size = 0;
-    int64_t chunk_stride = 0;
-    int64_t outer_block_size = 0;
-};
-
-struct LocalPool {
-    uintptr_t base = 0;
-    size_t bytes = 0;
-    int64_t block_bytes = 0;
-    int64_t outer_dims = 0;
-    int64_t inner_size = 0;
-    nixlDlistH *dlist = nullptr;
+    int refs = 0;
 };
 
 struct Rdma {
@@ -69,41 +62,85 @@ struct Rdma {
     }
 
     std::unique_ptr<nixlAgent> agent_;
-    nixl_opt_args_t opt;                      // pins every call to the UCX backend
-    std::mutex mu;                            // remotes / pool bookkeeping
-    std::unordered_map<uintptr_t, RemoteReg> remotes;
-    std::vector<nixl_reg_dlist_t> regs;       // registrations stay alive for the process lifetime
-    LocalPool pool;
+    nixl_opt_args_t opt;                     // pins every call to the UCX backend
+    std::mutex mu;                           // regs bookkeeping
+    std::unordered_map<uintptr_t, Reg> regs; // by base
+    std::vector<nixl_reg_dlist_t> mem_regs;  // registrations stay alive for the process lifetime
 };
 
 struct XferContext {
-    const RemoteReg *reg;
-    int64_t chunk_stride, outer_dims, inner_size, outer_block_size;
+    const KVPool *remote;
+    const KVPool *local;
+    nixlDlistH *remote_dlist;
+    nixlDlistH *local_dlist;
 };
 
 inline XferContext *as_ctx(context_t c) { return static_cast<XferContext *>(c); }
 inline std::atomic<bool> *as_ev(event_t e) { return static_cast<std::atomic<bool> *>(e); }
 
-// Build the pool descriptor list once the sub-block geometry is known.
-void ensure_pool_dlist(Rdma &r, int64_t outer_dims, int64_t inner_size) {
+// kv_pool hooks: called with the registry lock held, so never call back into kv_pool here.
+void on_register(const KVPool &p) {
+    Rdma &r = Rdma::get();
     std::lock_guard<std::mutex> lock(r.mu);
-    LocalPool &p = r.pool;
-    IAXL_CHECK(p.base != 0, "rdma_register_local must be called before the first transfer");
-    if (p.dlist) {
-        IAXL_CHECK(p.outer_dims == outer_dims && p.inner_size == inner_size,
-                   "scratch pool geometry differs between layers");
+    auto [it, inserted] = r.regs.try_emplace(p.base);
+    it->second.refs++;
+    if (!inserted)
         return;
+    if (p.device == PoolDevice::Remote) {
+        nixl_xfer_dlist_t descs(VRAM_SEG, p.outer_dims * p.num_blocks);
+        for (int64_t o = 0; o < p.outer_dims; o++)
+            for (int64_t b = 0; b < p.num_blocks; b++)
+                descs[o * p.num_blocks + b] = nixlBasicDesc(
+                    reinterpret_cast<uintptr_t>(p.block_ptr(b, o)), p.inner_size, p.dev_id);
+        NIXL_CHECK(r.agent().prepXferDlist(p.peer, descs, it->second.dlist, &r.opt));
+    } else {
+        const bool gpu = p.device == PoolDevice::GPU;
+        nixl_reg_dlist_t mem(gpu ? VRAM_SEG : DRAM_SEG);
+        mem.addDesc(nixlBlobDesc(p.base, p.total_bytes, gpu ? p.dev_id : 0, ""));
+        NIXL_CHECK(r.agent().registerMem(mem, &r.opt));
+        r.mem_regs.push_back(std::move(mem));
     }
-    IAXL_CHECK(outer_dims * inner_size == p.block_bytes, "pool block_bytes != outer_dims * inner_size");
-    const int64_t nblocks = p.bytes / p.block_bytes;
-    nixl_xfer_dlist_t descs(DRAM_SEG, nblocks * outer_dims);
-    for (int64_t b = 0; b < nblocks; b++)
-        for (int64_t o = 0; o < outer_dims; o++)
-            descs[b * outer_dims + o] = nixlBasicDesc(p.base + b * p.block_bytes + o * inner_size, inner_size, 0);
-    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, p.dlist, &r.opt));
-    p.outer_dims = outer_dims;
-    p.inner_size = inner_size;
-    fprintf(stderr, "[kv_xfer/rdma] pool: %ld blocks x %ld descs of %ld B\n", nblocks, outer_dims, inner_size);
+}
+
+void on_unregister(const KVPool &p) {
+    Rdma &r = Rdma::get();
+    std::lock_guard<std::mutex> lock(r.mu);
+    auto it = r.regs.find(p.base);
+    if (it == r.regs.end() || --it->second.refs > 0)
+        return;
+    if (it->second.dlist)
+        NIXL_CHECK(r.agent().releasedDlistH(it->second.dlist));
+    r.regs.erase(it);
+}
+
+Reg &reg_of(Rdma &r, const KVPool &p) {
+    auto it = r.regs.find(p.base);
+    IAXL_CHECK(it != r.regs.end(), "pool was registered before rdma_init");
+    return it->second;
+}
+
+// The CPU pool's descriptor list splits every block into the remote's outer_dims
+// sub-blocks of inner_size bytes, so it is built once the first remote pool is known.
+nixlDlistH *local_dlist(Rdma &r, const KVPool &local, const KVPool &remote) {
+    std::lock_guard<std::mutex> lock(r.mu);
+    Reg &reg = reg_of(r, local);
+    if (reg.dlist) {
+        IAXL_CHECK(reg.outer_dims == remote.outer_dims && reg.inner_size == remote.inner_size,
+                   "scratch pool geometry differs between layers");
+        return reg.dlist;
+    }
+    const int64_t od = remote.outer_dims, is = remote.inner_size;
+    nixl_xfer_dlist_t descs(DRAM_SEG, local.num_blocks * od);
+    for (int64_t b = 0; b < local.num_blocks; b++)
+        for (int64_t o = 0; o < od; o++)
+            descs[b * od + o] =
+                nixlBasicDesc(reinterpret_cast<uintptr_t>(local.block_ptr(b)) + o * is, is, 0);
+    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, reg.dlist, &r.opt));
+    reg.outer_dims = od;
+    reg.inner_size = is;
+    fprintf(stderr, "[kv_xfer/rdma] pool %s: %ld blocks x %ld descs of %ld B\n",
+            local.name.c_str(), local.num_blocks, od, is);
+    return reg.dlist;
 }
 
 } // namespace
@@ -123,6 +160,7 @@ void rdma_init(const std::string &name, int listen_port) {
     nixlBackendH *ucx = nullptr;
     NIXL_CHECK(r.agent_->createBackend("UCX", params, ucx));
     r.opt.backends.push_back(ucx);
+    kv_pool::set_pool_hooks({on_register, on_unregister});
     fprintf(stderr, "[kv_xfer/rdma] agent %s listening on port %d\n", name.c_str(), listen_port);
 }
 
@@ -137,61 +175,6 @@ void rdma_wait_peer(const std::string &peer, double timeout_s) {
 }
 
 void rdma_remove_peer(const std::string &peer) { NIXL_CHECK(Rdma::get().agent().invalidateRemoteMD(peer)); }
-
-void rdma_register_mem(uintptr_t base, size_t bytes) {
-    Rdma &r = Rdma::get();
-    nixl_reg_dlist_t regs(DRAM_SEG);
-    regs.addDesc(nixlBlobDesc(base, bytes, 0, ""));
-    NIXL_CHECK(r.agent().registerMem(regs, &r.opt));
-    std::lock_guard<std::mutex> lock(r.mu);
-    r.regs.push_back(std::move(regs));
-}
-
-void rdma_register_local(uintptr_t base, size_t bytes, int64_t block_bytes) {
-    Rdma &r = Rdma::get();
-    IAXL_CHECK(r.pool.base == 0, "rdma_register_local called twice");
-    rdma_register_mem(base, bytes);
-    std::lock_guard<std::mutex> lock(r.mu);
-    r.pool.base = base;
-    r.pool.bytes = bytes;
-    r.pool.block_bytes = block_bytes;
-}
-
-uintptr_t rdma_register_remote(const std::string &peer, uintptr_t base, const std::vector<int64_t> &shape,
-                               int64_t elem_size, int dev_id, int chunk_dim) {
-    Rdma &r = Rdma::get();
-    RemoteReg reg;
-    reg.peer = peer;
-    reg.outer_dims = 1;
-    for (int d = 0; d < chunk_dim; d++)
-        reg.outer_dims *= shape[d];
-    reg.inner_size = elem_size;
-    for (size_t d = chunk_dim + 1; d < shape.size(); d++)
-        reg.inner_size *= shape[d];
-    reg.num_blocks = shape[chunk_dim];
-    reg.chunk_stride = reg.inner_size; // contiguous
-    reg.outer_block_size = reg.num_blocks * reg.inner_size;
-
-    nixl_xfer_dlist_t descs(VRAM_SEG, reg.outer_dims * reg.num_blocks);
-    for (int64_t o = 0; o < reg.outer_dims; o++)
-        for (int64_t b = 0; b < reg.num_blocks; b++)
-            descs[o * reg.num_blocks + b] =
-                nixlBasicDesc(base + o * reg.outer_block_size + b * reg.chunk_stride, reg.inner_size, dev_id);
-    NIXL_CHECK(r.agent().prepXferDlist(peer, descs, reg.dlist, &r.opt));
-
-    std::lock_guard<std::mutex> lock(r.mu);
-    IAXL_CHECK(r.remotes.emplace(base, std::move(reg)).second, "remote tensor registered twice");
-    return base;
-}
-
-void rdma_unregister_remote(uintptr_t base) {
-    Rdma &r = Rdma::get();
-    std::lock_guard<std::mutex> lock(r.mu);
-    auto it = r.remotes.find(base);
-    IAXL_CHECK(it != r.remotes.end(), "rdma_unregister_remote: unknown base");
-    NIXL_CHECK(r.agent().releasedDlistH(it->second.dlist));
-    r.remotes.erase(it);
-}
 
 void rdma_send_notif(const std::string &peer, const std::string &msg) {
     Rdma &r = Rdma::get();
@@ -236,30 +219,32 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
                        bool h2d) {
     Rdma &r = Rdma::get();
     XferContext *x = as_ctx(ctx);
-    const RemoteReg &reg = *x->reg;
-    const LocalPool &p = r.pool;
+    const KVPool &remote = *x->remote;
+    const KVPool &local = *x->local;
     const size_t n = chunk_indices.size();
     if (n == 0)
         return;
 
-    std::vector<int> local_idx(n * x->outer_dims), remote_idx(n * x->outer_dims);
+    const int64_t od = remote.outer_dims;
+    std::vector<int> local_idx(n * od), remote_idx(n * od);
     for (size_t i = 0, k = 0; i < n; i++) {
-        const int64_t pool_block = (reinterpret_cast<uintptr_t>(cpu_ptrs[i]) - p.base) / p.block_bytes;
-        for (int64_t o = 0; o < x->outer_dims; o++, k++) {
-            local_idx[k] = static_cast<int>(pool_block * x->outer_dims + o);
-            remote_idx[k] = static_cast<int>(o * reg.num_blocks + chunk_indices[i]);
+        const int64_t lb = local.block_index(cpu_ptrs[i]);
+        for (int64_t o = 0; o < od; o++, k++) {
+            local_idx[k] = static_cast<int>(lb * od + o);
+            remote_idx[k] = static_cast<int>(o * remote.num_blocks + chunk_indices[i]);
         }
     }
 
     static std::once_flag noted;
     std::call_once(noted, [&] {
         fprintf(stderr, "[kv_xfer] copy_chunks_batch: using RDMA backend (%ld B x %ld per block)\n",
-                x->inner_size, x->outer_dims);
+                remote.inner_size, od);
     });
 
     nixlAgent &a = r.agent();
     nixlXferReqH *req = nullptr;
-    NIXL_CHECK(a.makeXferReq(h2d ? NIXL_WRITE : NIXL_READ, p.dlist, local_idx, reg.dlist, remote_idx, req, &r.opt));
+    NIXL_CHECK(a.makeXferReq(h2d ? NIXL_WRITE : NIXL_READ, x->local_dlist, local_idx, x->remote_dlist, remote_idx,
+                             req, &r.opt));
     nixl_status_t st = a.postXferReq(req);
     while (st == NIXL_IN_PROG)
         st = a.getXferStatus(req);
@@ -278,28 +263,19 @@ const Ops &rdma_ops() {
                          rdma::context_destroy,       rdma::context_stream_id,      rdma::context_same_stream,
                          rdma::copy_chunk,            rdma::copy_chunks_batch,      rdma::context_record_event,
                          rdma::context_work_wait_event, rdma::context_cur_wait_event, rdma::context_work_wait_cur,
-                         rdma::context_sync_cur};
+                         rdma::context_sync_cur,      nullptr};
     return ops;
 }
 
-context_t rdma_context_create(char *gpu_base_ptr, int64_t chunk_stride, int64_t outer_dims, int64_t inner_size,
-                              int64_t outer_block_size) {
+context_t rdma_context_create(const KVPool &remote, const KVPool &local) {
+    IAXL_CHECK(remote.device == PoolDevice::Remote, "rdma_context_create: pool is not remote");
     Rdma &r = Rdma::get();
-    XferContext *x = new XferContext();
+    XferContext *x = new XferContext{&remote, &local, nullptr, nullptr};
     {
         std::lock_guard<std::mutex> lock(r.mu);
-        auto it = r.remotes.find(reinterpret_cast<uintptr_t>(gpu_base_ptr));
-        IAXL_CHECK(it != r.remotes.end(), "rdma_context_create: tensor not registered with rdma_register_remote");
-        x->reg = &it->second; // unordered_map nodes are address-stable until erased
+        x->remote_dlist = reg_of(r, remote).dlist;
     }
-    IAXL_CHECK(x->reg->chunk_stride == chunk_stride && x->reg->outer_dims == outer_dims &&
-                   x->reg->inner_size == inner_size && x->reg->outer_block_size == outer_block_size,
-               "rdma_context_create: geometry differs from rdma_register_remote");
-    x->chunk_stride = chunk_stride;
-    x->outer_dims = outer_dims;
-    x->inner_size = inner_size;
-    x->outer_block_size = outer_block_size;
-    ensure_pool_dlist(r, outer_dims, inner_size);
+    x->local_dlist = local_dlist(r, local, remote);
     return x;
 }
 

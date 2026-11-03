@@ -19,12 +19,9 @@
 
 using namespace profiler;
 
+#include "kv_pool.h"
 #include "kv_xfer.h"
 #include "kv_xfer_rdma.h"
-
-namespace kv_pool {
-class Mem;
-}
 
 enum class GpuTransferDirection { H2D, D2H };
 
@@ -34,71 +31,45 @@ inline TaskQueue &omp_queue();
 
 class Context {
   public:
-    static Context create(const torch::Tensor &tensor, int chunk_dim,
+    // pool_name: the registered GPU / Remote / CPU-in-place KV pool (= tensor_key);
+    // cpu_pool: the CPU pool its blocks are staged in ("scratch", or pool_name when in place).
+    static Context create(const std::string &pool_name, const std::string &cpu_pool,
                           GpuTransferDirection direction = GpuTransferDirection::H2D,
                           const std::string &name = "", kv_xfer::stream_t work_stream = nullptr) {
+        using kv_pool::PoolDevice;
         Context ctx;
         ctx.name_ = name;
-        ctx.gpu_tensor_ = tensor;
         ctx.direction_ = direction;
+        ctx.pool_ = &kv_pool::get_kv_pool(pool_name);
+        ctx.cpu_pool_ = &kv_pool::get_kv_pool(cpu_pool);
+        IAXL_CHECK(ctx.cpu_pool_->device == PoolDevice::CPU, "cpu_pool is not in CPU memory");
+        ctx.pool_->check_same_block_geometry(*ctx.cpu_pool_);
+
+        const kv_pool::KVPool &p = *ctx.pool_;
+        if (p.device == PoolDevice::Remote) {
+#ifdef CPU_SUPPORT
+            TORCH_CHECK(false, "RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link");
+#else
+            ctx.ops_ = &kv_xfer::rdma_ops();
+            ctx.xctx_ = kv_xfer::rdma_context_create(p, *ctx.cpu_pool_);
+#endif
+        } else {
+            ctx.ops_ = &kv_xfer::gpu_ops();
+            ctx.xctx_ = kv_xfer::context_create((char *)p.base, p.dev_id, p.chunk_stride,
+                                                p.outer_dims, p.inner_size, p.outer_block_size,
+                                                work_stream);
+        }
         ctx.event_ = ctx.ops_->event_acquire();
         ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
-
-        int64_t outer_dims = 1;
-        for (int d = 0; d < chunk_dim; d++)
-            outer_dims *= tensor.size(d);
-        int64_t inner_size = tensor.element_size();
-        for (int d = chunk_dim + 1; d < tensor.dim(); d++)
-            inner_size *= tensor.size(d);
-        int64_t chunk_stride = tensor.stride(chunk_dim) * tensor.element_size();
-        int64_t outer_block_size = tensor.size(chunk_dim) * inner_size;
-        ctx.chunk_bytes_ = outer_dims * inner_size;
-
-        ctx.xctx_ = kv_xfer::context_create((char *)tensor.data_ptr(), tensor.device().index(),
-                                            chunk_stride, outer_dims, inner_size, outer_block_size,
-                                            work_stream);
         ctx.stream_id_ = ctx.ops_->context_stream_id(ctx.xctx_);
 
         PROFILE_SCOPE_FMT("ctx_create(%s,stream=%llu)", name.c_str(), ctx.stream_id_);
         return ctx;
     }
 
-    // Remote (RDMA) tensor: only its address and contiguous geometry are known here.
-    static Context create_remote(uintptr_t base, int dev_id, const std::vector<int64_t> &shape,
-                                 int64_t elem_size, int chunk_dim,
-                                 GpuTransferDirection direction = GpuTransferDirection::H2D,
-                                 const std::string &name = "") {
-#ifdef CPU_SUPPORT
-        TORCH_CHECK(false, "RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link");
-#else
-        Context ctx;
-        ctx.ops_ = &kv_xfer::rdma_ops();
-        ctx.name_ = name;
-        ctx.direction_ = direction;
-        ctx.event_ = ctx.ops_->event_acquire();
-        ctx.queue_ = &((direction == GpuTransferDirection::H2D) ? h2d_queue() : d2h_queue());
-
-        int64_t outer_dims = 1;
-        for (int d = 0; d < chunk_dim; d++)
-            outer_dims *= shape[d];
-        int64_t inner_size = elem_size;
-        for (size_t d = chunk_dim + 1; d < shape.size(); d++)
-            inner_size *= shape[d];
-        int64_t outer_block_size = shape[chunk_dim] * inner_size;
-        ctx.chunk_bytes_ = outer_dims * inner_size;
-
-        ctx.xctx_ = kv_xfer::rdma_context_create((char *)base, inner_size, outer_dims, inner_size,
-                                                 outer_block_size);
-        PROFILE_SCOPE_FMT("ctx_create_remote(%s)", name.c_str());
-        return ctx;
-#endif
-    }
-
-    void xfer_chunk(const torch::Tensor &cpu_tensor, int64_t chunk_idx);
+    // pool_[chunk_indices[i]] <-> cpu_pool_[cpu_block_indices[i]] (async).
     void xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
-                           const std::vector<torch::Tensor> &cpu_tensors);
-    // Same transfer, but takes the chunk indices and CPU addresses as prebuilt int64 tensors.
-    void xfer_chunks_batch_fast(const torch::Tensor &chunk_indices, const torch::Tensor &cpu_ptrs);
+                           const std::vector<int64_t> &cpu_block_indices);
     void xfer_finish();
     void xfer_wait();
     bool xfer_is_complete();
@@ -109,13 +80,13 @@ class Context {
 
     void zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                     const std::vector<std::string> &chunk_labels,
-                    const std::vector<torch::Tensor> &cpu_tensors, bool compress = true);
+                    const std::vector<int64_t> &cpu_block_indices, bool compress = true);
 
     // priority / bundle_id / sort_key go to TaskQueue::submit() of the decompression task.
     void unzip_from_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                         const std::vector<std::string> &chunk_labels,
                         const std::vector<int64_t> &chunk_indices,
-                        const std::vector<torch::Tensor> &cpu_tensors,
+                        const std::vector<int64_t> &cpu_block_indices,
                         int priority = TaskQueue::PRIORITY_HIGH, uint64_t bundle_id = 0,
                         int64_t sort_key = -1);
 
@@ -130,6 +101,8 @@ class Context {
     kv_xfer::event_t event() const { return event_; }
     TaskQueue &queue() const { return *queue_; }
     const std::string &name() const { return name_; }
+    const kv_pool::KVPool &pool() const { return *pool_; }
+    const kv_pool::KVPool &cpu_pool() const { return *cpu_pool_; }
 
     Context() = default;
     ~Context() {
@@ -149,8 +122,8 @@ class Context {
             ops_ = other.ops_;
             xctx_ = other.xctx_;
             stream_id_ = other.stream_id_;
-            chunk_bytes_ = other.chunk_bytes_;
-            gpu_tensor_ = std::move(other.gpu_tensor_);
+            pool_ = other.pool_;
+            cpu_pool_ = other.cpu_pool_;
             direction_ = other.direction_;
             queue_ = other.queue_;
             event_ = other.event_;
@@ -197,8 +170,8 @@ class Context {
     const kv_xfer::Ops *ops_ = &kv_xfer::gpu_ops();
     kv_xfer::context_t xctx_ = nullptr;
     unsigned long long stream_id_ = 0;
-    int64_t chunk_bytes_ = 0;
-    torch::Tensor gpu_tensor_;
+    const kv_pool::KVPool *pool_ = nullptr;
+    const kv_pool::KVPool *cpu_pool_ = nullptr;
     GpuTransferDirection direction_ = GpuTransferDirection::H2D;
     TaskQueue *queue_ = nullptr;
     kv_xfer::event_t event_ = nullptr;
@@ -209,20 +182,6 @@ class Context {
     std::future<void> zip_future_;
     std::future<void> unzip_future_;
 };
-
-inline void gpu_transfer_batch_pytorch(torch::Tensor &gpu_tensor, int chunk_dim,
-                                       const std::vector<int64_t> &chunk_indices,
-                                       const std::vector<torch::Tensor> &cpu_tensors,
-                                       GpuTransferDirection direction) {
-    for (size_t i = 0; i < chunk_indices.size(); i++) {
-        auto gpu_slice = gpu_tensor.select(chunk_dim, chunk_indices[i]);
-        if (direction == GpuTransferDirection::H2D) {
-            gpu_slice.copy_(cpu_tensors[i], true);
-        } else {
-            cpu_tensors[i].copy_(gpu_slice, true);
-        }
-    }
-}
 
 inline TaskQueue &h2d_queue() {
     static TaskQueue queue("H2D");
