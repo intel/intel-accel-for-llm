@@ -264,6 +264,8 @@ static int dsa_init(void) {
 
     g_max_xfer = dsa_read_wq_attr("max_transfer_size", DSA_MAX_XFER);
     g_max_batch = dsa_read_wq_attr("max_batch_size", 1);
+    IAXL_CHECK(dsa_read_wq_attr("block_on_fault", 0) == 1,
+               "dsa: WQ has block_on_fault=0, run tools/setup_dsa.sh to enable it");
 
     for (w = 0; w < num_wq; w++) {
         char path[64];
@@ -367,7 +369,7 @@ int dsa_memcpy(void *dest, const void *src, size_t n) {
         memset(&desc, 0, sizeof(desc));
         desc.opcode = DSA_OPCODE_MEMMOVE;
 
-        desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CC;
+        desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CC | IDXD_OP_FLAG_BOF;
         desc.completion_addr = (uint64_t)&comp;
         desc.src_addr = (uint64_t)src + done;
         desc.dst_addr = (uint64_t)dest + done;
@@ -417,7 +419,7 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
     for (j = 0; j < cnt; j++) {
         sub[j].opcode = DSA_OPCODE_MEMMOVE;
 
-        sub[j].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CC;
+        sub[j].flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CC | IDXD_OP_FLAG_BOF;
         sub[j].completion_addr = (uint64_t)&comp[j];
         sub[j].src_addr = (uint64_t)src[first + j];
         sub[j].dst_addr = (uint64_t)dest[first + j];
@@ -436,6 +438,7 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
 
     memset(&bdesc, 0, sizeof(bdesc));
     bdesc.opcode = DSA_OPCODE_BATCH;
+    /* BOF is reserved in the batch descriptor itself; it only goes on the sub-descriptors. */
     bdesc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
     bdesc.desc_list_addr = (uint64_t)sub;
     bdesc.desc_count = (uint32_t)cnt;
@@ -443,6 +446,20 @@ static int dsa_submit_batch(void *portal, struct dsa_hw_desc *sub,
 
     __builtin_ia32_sfence();
     return dsa_submit(&bdesc, portal);
+}
+
+/* A batch status of DSA_COMP_BATCH_FAIL only says "some sub-descriptor failed"; the cause is here. */
+static void dsa_dump_batch_fail(const struct dsa_completion_record *comp, size_t cnt) {
+    size_t j;
+
+    for (j = 0; j < cnt; j++) {
+        if (comp[j].status == 0 || comp[j].status == DSA_COMP_SUCCESS)
+            continue;
+        fprintf(stderr,
+                "  sub-desc %zu: status=0x%x result=0x%x bytes_completed=%u fault_addr=0x%" PRIx64
+                "\n",
+                j, comp[j].status, comp[j].result, comp[j].bytes_completed, comp[j].fault_addr);
+    }
 }
 
 int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n[], size_t count) {
@@ -516,6 +533,7 @@ int dsa_memcpy_batch(void *const dest[], const void *const src[], const size_t n
             k = dsa_wait_any(bcomp, busy_slots, inflight);
             if (bcomp[busy_slots[k]].status != DSA_COMP_SUCCESS) {
                 fprintf(stderr, "dsa batch failed, status=0x%x\n", bcomp[busy_slots[k]].status);
+                dsa_dump_batch_fail(g_comps[tid] + busy_slots[k] * per_batch, per_batch);
                 ok = 0;
             }
             free_slots[nfree++] = busy_slots[k];
@@ -543,6 +561,7 @@ static void dsa_reap_done(size_t w) {
             continue;
         if (status != DSA_COMP_SUCCESS) {
             fprintf(stderr, "dsa batch failed, ticket=%" PRIu64 " status=0x%x\n", ticket, status);
+            dsa_dump_batch_fail(g_comps[w] + slot * g_max_batch, g_max_batch);
             if (!g_first_failed || ticket < g_first_failed)
                 g_first_failed = ticket;
         }

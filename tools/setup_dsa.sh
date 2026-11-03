@@ -63,6 +63,7 @@ for DEV in "${DEVS[@]}"; do
             --type=user \
             --name=dsa_gpu \
             --priority=10 \
+            --block-on-fault=1 \
             --max-transfer-size="$MAXXFER" \
             --max-batch-size="$MAXBATCH" \
             --driver-name=user
