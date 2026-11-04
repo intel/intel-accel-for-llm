@@ -67,7 +67,6 @@ struct KVPool {
         auto p = reinterpret_cast<uintptr_t>(ptr);
         return p >= base && p < base + total_bytes;
     }
-    bool is_contiguous_blocks() const { return outer_dims == 1 && chunk_stride == inner_size; }
 
     // Entry-point checks (caller thread), done once per call.
     void check_indices(const std::vector<int64_t> &idx) const;
