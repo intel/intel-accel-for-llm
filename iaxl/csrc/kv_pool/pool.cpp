@@ -178,7 +178,8 @@ KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_
     if (chunk_stride > 0) {
         IAXL_CHECK(t.stride(chunk_dim) * t.element_size() == chunk_stride,
                    "KVPool chunk_stride does not match the tensor stride");
-        int64_t expected = t.element_size();
+        // torch strides are in elements, not bytes.
+        int64_t expected = 1;
         for (int d = t.dim() - 1; d > chunk_dim; d--) {
             IAXL_CHECK(t.stride(d) == expected, "KVPool tensor inner dims must be contiguous");
             expected *= t.size(d);
