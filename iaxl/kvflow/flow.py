@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import os
 import time
 import torch
@@ -173,14 +174,29 @@ class KVFlow:
                 assert block_dim == 0, "CPU KV blocks must be chunked on axis 0"
                 _iqt.register_kv_pool_cpu(name, t, 0)
             else:
-                _iqt.register_kv_pool_gpu(name, t, block_dim)
+                # Packed layouts give each layer a page view whose outer stride
+                # may be larger than the page itself.
+                chunk_stride = t.stride(block_dim) * t.element_size()
+                _iqt.register_kv_pool_gpu(name, t, block_dim, chunk_stride)
             self._registered.append(name)
         if not self._in_place:
-            first = next(iter(kv_caches.values()))
-            block_shape = tuple(s for d, s in enumerate(first.shape) if d != block_dim)
-            self.chunk_pool = ScratchPool(
-                block_shape, first.dtype, pin_memory=self.device_type not in (None, "cpu")
-            )
+            local = [t for t in kv_caches.values() if not isinstance(t, RemoteTensor)]
+            if local:
+                largest = max(
+                    local,
+                    key=lambda t: math.prod(
+                        s for d, s in enumerate(t.shape) if d != block_dim
+                    )
+                    * t.element_size(),
+                )
+                block_shape = tuple(
+                    s for d, s in enumerate(largest.shape) if d != block_dim
+                )
+                self.chunk_pool = ScratchPool(
+                    block_shape,
+                    largest.dtype,
+                    pin_memory=self.device_type not in (None, "cpu"),
+                )
 
     def close(self):
         if self.chunk_pool is not None:
