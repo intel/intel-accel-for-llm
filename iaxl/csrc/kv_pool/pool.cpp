@@ -24,6 +24,12 @@ void KVPool::check_same_block_geometry(const KVPool &other) const {
                "pools have different block geometry");
 }
 
+void KVPool::check_staging_geometry(const KVPool &staging) const {
+    IAXL_CHECK(staging.block_bytes >= block_bytes && elem_size == staging.elem_size &&
+                   dtype == staging.dtype,
+               "staging pool is smaller than the KV block");
+}
+
 std::vector<char *> KVPool::block_ptrs(const std::vector<int64_t> &idx) const {
     std::vector<char *> ptrs(idx.size());
     for (size_t i = 0; i < idx.size(); i++)
@@ -33,7 +39,7 @@ std::vector<char *> KVPool::block_ptrs(const std::vector<int64_t> &idx) const {
 
 KVPool make_kv_pool(uintptr_t base, PoolDevice device, int dev_id,
                     const std::vector<int64_t> &shape, int64_t elem_size, int32_t dtype,
-                    int chunk_dim) {
+                    int chunk_dim, int64_t chunk_stride) {
     IAXL_CHECK(chunk_dim >= 0 && static_cast<size_t>(chunk_dim) < shape.size(),
                "chunk_dim out of range");
     KVPool p;
@@ -51,8 +57,10 @@ KVPool make_kv_pool(uintptr_t base, PoolDevice device, int dev_id,
     p.inner_size = elem_size;
     for (size_t d = chunk_dim + 1; d < shape.size(); d++)
         p.inner_size *= shape[d];
-    p.chunk_stride = p.inner_size;
-    p.outer_block_size = p.num_blocks * p.inner_size;
+    p.chunk_stride = chunk_stride > 0 ? chunk_stride : p.inner_size;
+    // For a packed (strided) 2-D cache the gap belongs to the next page; for
+    // outer-dimension layouts the segment blocks stay contiguous.
+    p.outer_block_size = p.num_blocks * (p.outer_dims == 1 ? p.chunk_stride : p.inner_size);
     p.block_bytes = p.outer_dims * p.inner_size;
     p.total_bytes = static_cast<size_t>(p.outer_dims) * p.outer_block_size;
     return p;
@@ -76,7 +84,8 @@ Registry &registry() {
 
 bool same_geometry(const KVPool &a, const KVPool &b) {
     return a.base == b.base && a.device == b.device && a.shape == b.shape &&
-           a.chunk_dim == b.chunk_dim && a.elem_size == b.elem_size && a.dtype == b.dtype;
+           a.chunk_dim == b.chunk_dim && a.elem_size == b.elem_size && a.dtype == b.dtype &&
+           a.chunk_stride == b.chunk_stride && a.block_bytes == b.block_bytes;
 }
 
 const KVPool &register_with_tensor(KVPool pool, const torch::Tensor *t) {
@@ -91,10 +100,19 @@ const KVPool &register_with_tensor(KVPool pool, const torch::Tensor *t) {
         return it->second;
     }
     for (auto &[_, other] : r.pools)
-        if (other.base == pool.base)
-            IAXL_CHECK(other.shape == pool.shape && other.chunk_dim == pool.chunk_dim &&
-                           other.elem_size == pool.elem_size,
-                       "pools sharing one buffer must have the same geometry");
+        if (other.base == pool.base) {
+            if (pool.device == PoolDevice::GPU) {
+                // Packed overlay: MLA and indexer views can share a block base
+                // while covering different page sizes.
+                IAXL_CHECK(other.chunk_dim == pool.chunk_dim &&
+                               other.elem_size == pool.elem_size,
+                           "GPU views sharing one buffer must have the same element geometry");
+            } else {
+                IAXL_CHECK(other.shape == pool.shape && other.chunk_dim == pool.chunk_dim &&
+                               other.elem_size == pool.elem_size,
+                           "pools sharing one buffer must have the same geometry");
+            }
+        }
     if (t)
         r.tensors.emplace(pool.name, *t);
     const KVPool &p = r.pools.emplace(pool.name, std::move(pool)).first->second;
@@ -155,11 +173,22 @@ void add_pool_hooks(const PoolHooks &hooks) {
 
 int64_t tensor_bytes(const torch::Tensor &t) { return t.numel() * t.element_size(); }
 
-KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_dim) {
-    IAXL_CHECK(t.is_contiguous(), "a KVPool tensor must be contiguous");
+KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_dim,
+                           int64_t chunk_stride) {
+    if (chunk_stride > 0) {
+        IAXL_CHECK(t.stride(chunk_dim) * t.element_size() == chunk_stride,
+                   "KVPool chunk_stride does not match the tensor stride");
+        int64_t expected = t.element_size();
+        for (int d = t.dim() - 1; d > chunk_dim; d--) {
+            IAXL_CHECK(t.stride(d) == expected, "KVPool tensor inner dims must be contiguous");
+            expected *= t.size(d);
+        }
+    } else {
+        IAXL_CHECK(t.is_contiguous(), "a KVPool tensor must be contiguous");
+    }
     KVPool p = make_kv_pool(reinterpret_cast<uintptr_t>(t.data_ptr()), device, t.device().index(),
                             t.sizes().vec(), t.element_size(),
-                            static_cast<int32_t>(t.scalar_type()), chunk_dim);
+                            static_cast<int32_t>(t.scalar_type()), chunk_dim, chunk_stride);
     p.pinned = t.is_cpu() && t.is_pinned();
     return p;
 }
@@ -171,9 +200,10 @@ const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int
     return register_with_tensor(std::move(p), &t);
 }
 
-const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim) {
+const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim,
+                                   int64_t chunk_stride) {
     IAXL_CHECK(!t.is_cpu(), "register_kv_pool_gpu: tensor is on the CPU");
-    KVPool p = kv_pool_from_tensor(t, PoolDevice::GPU, chunk_dim);
+    KVPool p = kv_pool_from_tensor(t, PoolDevice::GPU, chunk_dim, chunk_stride);
     p.name = std::move(name);
     return register_with_tensor(std::move(p), &t);
 }
