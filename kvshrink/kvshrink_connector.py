@@ -20,6 +20,7 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
-from iaxl import KVStore, generate_block_hashs, setup_root_logger
+from iaxl import KVStore, setup_root_logger
 from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
@@ -222,6 +223,24 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if role == KVConnectorRole.SCHEDULER:
+            _, hash_block_size = resolve_kv_cache_block_sizes(
+                kv_cache_config, vllm_config
+            )
+            if hash_block_size != self.block_size:
+                raise ValueError(
+                    "KVShrinkConnector needs one vLLM block hash per "
+                    f"{self.block_size} tokens, got hash_block_size={hash_block_size}"
+                )
+            hash_algo = vllm_config.cache_config.prefix_caching_hash_algo
+            if (
+                hash_algo in ("xxhash", "xxhash_cbor")
+                and os.getenv("PYTHONHASHSEED") is None
+            ):
+                raise ValueError(
+                    f"KVShrinkConnector with prefix_caching_hash_algo={hash_algo!r} "
+                    "requires PYTHONHASHSEED, otherwise block hashes differ "
+                    "between processes"
+                )
             # Scheduler store reads its DP group's tp0; offset mgmt ports by DP
             # group so DP schedulers on one host don't clash.
             iaxl_envs.IAXL_API_CONTROLLER_PORT += self.dp_rank
@@ -279,12 +298,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if self._req_states.pop(request.request_id, None) is not None:
             logger.warning("Discarded stale state for request %s", request.request_id)
 
-        block_hashes = [
-            str(block_hash)
-            for block_hash in generate_block_hashs(
-                request.all_token_ids[:-1], self.block_size
-            )
-        ]
+        # vLLM always computes the last prompt token, so it is never loaded.
+        num_blocks = (request.num_tokens - 1) // self.block_size
+        block_hashes: list[str] = []
+        for block_hash in request.block_hashes[:num_blocks]:
+            block_hashes.append(block_hash.hex())
         existence_cache = self._store().has(block_hashes)
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
