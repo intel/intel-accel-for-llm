@@ -46,8 +46,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("register_kv_pool_cpu", &kv_pool::register_kv_pool_cpu, py::arg("name"), py::arg("tensor"),
           py::arg("chunk_dim") = 0, py::return_value_policy::reference);
-    m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"), py::arg("tensor"),
-          py::arg("chunk_dim"), py::return_value_policy::reference);
+    m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"),
+          py::arg("tensor"), py::arg("chunk_dim"), py::arg("chunk_stride") = 0,
+          py::return_value_policy::reference);
     m.def(
         "register_kv_pool_remote",
         [](std::string name, const std::string &peer, uintptr_t base, const std::vector<int64_t> &shape,
