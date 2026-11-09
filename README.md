@@ -9,6 +9,7 @@
 - [IAXL Design](doc/design/iaxl.md)
 - [KV Zip Design](doc/design/kv-zip.md)
 - [KVShrink Design](doc/design/kvshrink.md)
+- [Recipes Design](doc/design/recipes.md)
 
 ## Host Setup
 
@@ -123,6 +124,8 @@ Send a Chat Completions test request:
 ```
 
 To run the model on the CPU, start the container on the vLLM CPU image as described in the [vLLM CPU inference guide](doc/usage/vllm-cpu-inference.en.md).
+
+To keep a scenario's overrides of `setvars.sh`, `start.sh`, `tools/auto_config.sh` and `examples/kvshrink-vllm-serve.sh` together, put them in a recipe directory and select it with `IAXL_RECIPE=<name> ./start.sh`; see the [recipes design](doc/design/recipes.md) and the commented [`vllm-cpu` recipe](examples/recipes/vllm-cpu/README.md), which doubles as the reference example.
 
 ## KVShrink vLLM Benchmark
 

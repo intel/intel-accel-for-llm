@@ -545,3 +545,9 @@ validate_omp_config() {
         "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM" \
         "  IAXL_USE_OMP=$IAXL_USE_OMP"
 }
+
+# A recipe (IAXL_RECIPE_DIR, resolved by setvars.sh) may add functions or redefine any of the
+# functions above; its definitions win because they are sourced last. See doc/design/recipes.md.
+if [[ -f "${IAXL_RECIPE_DIR:-}/auto_config.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/auto_config.sh"
+fi

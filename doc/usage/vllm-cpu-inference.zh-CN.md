@@ -59,12 +59,12 @@ export IAXL_QATLIB=intree # in-tree 驱动（qat_4xxx，VF 绑定到 vfio-pci）
 
 ## 4. 缓存配置
 
-`DEVICE=cpu` 时，`examples/kvshrink-vllm-serve.sh` 不传 `--gpu-memory-utilization`。CPU 推理时通常需要调整下列变量：
+`examples/kvshrink-vllm-serve.sh` 默认传 `--gpu-memory-utilization 0.8`，CPU 推理不能带这个参数：把 `VLLM_SERVE_CMDLINE_ARGS` 设为去掉它的完整参数列表（`vllm-cpu` recipe 已经这样设置）。CPU 推理时通常需要调整下列变量：
 
 | 变量 | 作用 |
 | --- | --- |
 | `VLLM_CPU_KVCACHE_SPACE` | vLLM 运行时 KV cache 大小（GiB）。KVShrink 压缩缓存的大小由 `IAXL_DDR_POOL_SIZE_GB` 单独设置。 |
-| `MAX_MODEL_LEN` | `--max-model-len`（默认 `32765`）。CPU KV cache 放不下一个满长度请求时调小。 |
+| `VLLM_SERVE_CMDLINE_ARGS` | 除模型、并行参数和 `--block-size` 之外的所有 `vllm serve` 选项，默认 `--trust-remote-code --max-model-len 32765 --port 8000 --no-enable-prefix-caching --gpu-memory-utilization 0.8`。CPU 上去掉 `--gpu-memory-utilization`；CPU KV cache 放不下一个满长度请求时调小 `--max-model-len`。 |
 | `BLOCK_SIZE` | `--block-size`，仅在设置时传入。vLLM v0.29 在 CPU 上默认为 `128`（MLA 模型为 `16`），其他取值须为 32 的倍数。CPU 上每层一个 KV block 为 `2 × num_kv_heads × block_size × head_size × dtype_bytes` 字节，必须不超过 `IAXL_ZIP_SRC_CAP`，压缩后不超过 `IAXL_ZIP_DST_CAP`（`setvars.sh` 中都设为 4 MiB）。block 更大时，可以同时调大这两个值，或者设置 `IAXL_ZIP_SEGMENT_SIZE_KB`，按该大小（单位 KiB）分段压缩，这时只需每段（小于该大小的两倍）满足上述限制。 |
 | `IAXL_KV_DATA_SHUFFLE`、`IAXL_KV_LOSSY_TRUNC` | 两者都为 `0` 时，编解码直接从 vLLM 的 KV block 压缩、直接解压到 KV block，没有中转拷贝。`setvars.sh` 默认开启字节重排。任一开启都会改写编解码输入，block 需要先拷贝到 scratch buffer。字节重排能提升压缩率，代价是对每个 block 多做一遍处理。 |
 
@@ -88,6 +88,8 @@ export IAXL_OMP_THREAD_NUM=2
 ```
 
 该脚本会 source `setvars.sh`，并把 `IAXL_LD_PRELOAD`（按照 vLLM CPU 后端的推荐预加载 libtcmalloc 和 libiomp5）加到 `LD_PRELOAD` 前面。
+
+[`vllm-cpu` recipe](../../examples/recipes/vllm-cpu/README.md) 把第 1 到第 4 节的 export 和上面的 CPU 划分打包在一起：在主机上执行 `IAXL_RECIPE=vllm-cpu ./start.sh`，再在容器里执行 `./examples/kvshrink-vllm-serve.sh`，效果与上面相同；机制见 [recipes 设计文档](../design/recipes.md)。
 
 ## 6. 验证
 

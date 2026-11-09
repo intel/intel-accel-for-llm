@@ -59,12 +59,12 @@ When choosing CPUs:
 
 ## 4. Cache Settings
 
-`examples/kvshrink-vllm-serve.sh` drops `--gpu-memory-utilization` when `DEVICE=cpu`. These variables commonly need overriding for CPU inference:
+`examples/kvshrink-vllm-serve.sh` passes `--gpu-memory-utilization 0.8` by default, which CPU inference must not receive: set `VLLM_SERVE_CMDLINE_ARGS` to the full option list without it (the `vllm-cpu` recipe does). These variables commonly need overriding for CPU inference:
 
 | Variable | Purpose |
 | --- | --- |
 | `VLLM_CPU_KVCACHE_SPACE` | Live vLLM KV cache size in GiB. `IAXL_DDR_POOL_SIZE_GB` sizes the compressed KVShrink cache independently. |
-| `MAX_MODEL_LEN` | `--max-model-len` (default `32765`). Lower it when the CPU KV cache cannot hold one full-length request. |
+| `VLLM_SERVE_CMDLINE_ARGS` | All `vllm serve` options other than the model, parallelism and `--block-size`; default `--trust-remote-code --max-model-len 32765 --port 8000 --no-enable-prefix-caching --gpu-memory-utilization 0.8`. Drop `--gpu-memory-utilization` and lower `--max-model-len` when the CPU KV cache cannot hold one full-length request. |
 | `BLOCK_SIZE` | `--block-size`, passed only when set. vLLM v0.29 defaults to `128` on CPU (`16` for MLA models) and needs a multiple of 32 otherwise. A CPU KV block holds `2 × num_kv_heads × block_size × head_size × dtype_bytes` bytes per layer and must fit in `IAXL_ZIP_SRC_CAP` and, compressed, in `IAXL_ZIP_DST_CAP` (both 4 MiB in `setvars.sh`). For larger blocks, raise both caps or set `IAXL_ZIP_SEGMENT_SIZE_KB` to compress each block in segments of that many KiB; then only each segment, shorter than twice that size, must fit. |
 | `IAXL_KV_DATA_SHUFFLE`, `IAXL_KV_LOSSY_TRUNC` | With both set to `0`, the codec compresses straight from the vLLM KV blocks and decompresses straight into them, with no staging copies. `setvars.sh` enables shuffle by default. Either one rewrites the codec input, so blocks are staged in scratch buffers. Shuffle improves the compression ratio at the cost of one extra pass over every block. |
 
@@ -88,6 +88,8 @@ export IAXL_OMP_THREAD_NUM=2
 ```
 
 The script sources `setvars.sh` and prepends `IAXL_LD_PRELOAD` (libtcmalloc and libiomp5, as vLLM's CPU backend recommends) to `LD_PRELOAD`.
+
+The [`vllm-cpu` recipe](../../examples/recipes/vllm-cpu/README.md) packages the exports of sections 1 to 4 and this CPU split, so `IAXL_RECIPE=vllm-cpu ./start.sh` followed by `./examples/kvshrink-vllm-serve.sh` in the container is equivalent; see the [recipes design](../design/recipes.md).
 
 ## 6. Verification
 

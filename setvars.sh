@@ -1,11 +1,38 @@
+TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# =============================================================================
+# Recipe: a directory of per-scenario overrides, selected with IAXL_RECIPE (a name under
+# examples/recipes/ or a directory path). See doc/design/recipes.md and examples/recipes/vllm-cpu.
+#   $IAXL_RECIPE_DIR/auto_config.sh   sourced by tools/auto_config.sh: add or override functions
+#   $IAXL_RECIPE_DIR/setvars.pre.sh   sourced here, before the defaults below: set env vars
+#   $IAXL_RECIPE_DIR/setvars.post.sh  sourced after everything is computed: fix up values and
+#                                     edit CONTAINER_NAME / ENV_VARS / DOCKER_RUN_ARGS
+# =============================================================================
+if [[ -n "${IAXL_RECIPE:-}" ]]; then
+    if [[ -d "$IAXL_RECIPE" ]]; then
+        IAXL_RECIPE_DIR=$(cd -- "$IAXL_RECIPE" && pwd)
+    elif [[ -d "$TOP_DIR/examples/recipes/$IAXL_RECIPE" ]]; then
+        IAXL_RECIPE_DIR="$TOP_DIR/examples/recipes/$IAXL_RECIPE"
+    else
+        echo "ERROR: IAXL_RECIPE='$IAXL_RECIPE' is neither a directory nor a name under $TOP_DIR/examples/recipes" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    export IAXL_RECIPE IAXL_RECIPE_DIR
+    echo "Recipe: $IAXL_RECIPE_DIR"
+else
+    unset IAXL_RECIPE_DIR
+fi
+
+source "$TOP_DIR/tools/auto_config.sh" # also loads $IAXL_RECIPE_DIR/auto_config.sh
+if [[ -f "${IAXL_RECIPE_DIR:-}/setvars.pre.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/setvars.pre.sh" || return 1 2>/dev/null || exit 1
+fi
+$TOP_DIR/tools/setup_system.sh
+
 export IAXL_VERSION=${IAXL_VERSION:-1.5.1}
 export IAXL_BASE_DOCKER_IMAGE=${IAXL_BASE_DOCKER_IMAGE:-"vllm/vllm-openai:v0.29.0"}
 export IAXL_DEV_DOCKER_IMAGE=${IAXL_DEV_DOCKER_IMAGE:-"vllm-iaxl-dev:$IAXL_VERSION"}
 export IAXL_BUILDER_DOCKER_IMAGE=${IAXL_BUILDER_DOCKER_IMAGE:-"vllm-iaxl-builder"}
-
-TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$TOP_DIR/tools/auto_config.sh"
-$TOP_DIR/tools/setup_system.sh
 
 # =============================================================================
 # Configurable runtime / build environment variables (all IAXL_* prefixed).
@@ -199,8 +226,11 @@ fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 
-# docker
-CONTAINER_NAME=iaxl.vllm
+# ---- docker (used by start.sh) ---------------------------------------------
+# A recipe's setvars.post.sh may edit CONTAINER_NAME, ENV_VARS and DOCKER_RUN_ARGS; --name and
+# the -e flags for ENV_VARS are appended after it.
+CONTAINER_NAME=${CONTAINER_NAME:-iaxl.vllm}
+# Host variables forwarded into the container with -e VAR=value.
 ENV_VARS=(
     no_proxy
     http_proxy
@@ -213,30 +243,33 @@ ENV_VARS=(
     IAXL_QATLIB_VERSION
     IAXL_VERSION
     IAXL_LD_PRELOAD
+    IAXL_RECIPE
 )
 
+DOCKER_RUN_ARGS=(
+    --rm
+    --privileged
+    --pid host
+    --net host
+    -it
+    -v /dev:/dev
+    --entrypoint ""
+)
 case "$DEVICE" in
     cuda)
-        if [[ "$NVIDIA_RUNTIME" == "none" ]]; then
-            DOCKER_RUN_ARGS=()
-        else
-            DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "all")
+        if [[ "$NVIDIA_RUNTIME" != "none" ]]; then
+            DOCKER_RUN_ARGS+=("--runtime" "nvidia" "--gpus" "all")
         fi
         ;;
     xpu)
-        DOCKER_RUN_ARGS=("--device" "/dev/dri")
+        DOCKER_RUN_ARGS+=("--device" "/dev/dri")
         ;;
-    cpu)
-        DOCKER_RUN_ARGS=()
-        ;;
+    cpu) ;;
     *)
         echo "Unsupported DEVICE: $DEVICE (expected cuda, xpu or cpu)" >&2
         return 1 2>/dev/null || exit 1
         ;;
 esac
-for var in "${ENV_VARS[@]}"; do
-    DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
-done
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
 # qatlib (in-tree driver) shares the host's QAT VFs through the host qatmgr socket.
@@ -248,3 +281,12 @@ if [[ -d "$MODEL" ]]; then
     DOCKER_RUN_ARGS+=("-v" "$MODEL_DIR:$MODEL_DIR:ro")
 fi
 DOCKER_RUN_ARGS+=("-v" "$PWD:$PWD" "-w" "$PWD")
+
+if [[ -f "${IAXL_RECIPE_DIR:-}/setvars.post.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/setvars.post.sh" || return 1 2>/dev/null || exit 1
+fi
+
+DOCKER_RUN_ARGS+=("--name" "$CONTAINER_NAME")
+for var in "${ENV_VARS[@]}"; do
+    DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
+done
