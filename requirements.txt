@@ -8,3 +8,4 @@ matplotlib
 meson
 ninja
 tomlkit
+evalscope[perf]
