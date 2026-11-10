@@ -107,6 +107,15 @@ Decompression routes each segment by its flags:
 
 IAA and QAT/CPU segments are tracked with two separate cursors. Batches stored without compression (`IAXL_KV_COMPRESSION=0`, or leading layers that bypass compression) consist of stored segments only, so they use the copy path in both directions.
 
+## Buffer API
+
+`kv_zip_compress_into` and `kv_zip_decompress_into` encode and decode the same blocks over memory the caller owns, without a `KVPool`. `torch_ext` exposes them as `zip_compress_into`, `zip_decompress_into` and `zip_max_block_size`, which accept any contiguous object with the Python buffer protocol and release the GIL while they run. LMCache uses them to compress whole chunks in its DRAM L2 adapter.
+
+- Each destination must hold `kv_zip_max_block_size(orig_size)` bytes: the header, the segment table, and the tensor stored raw. Compression parks segments in the destination payload, so sources stay unchanged.
+- Each segment must fit in `IAXL_ZIP_SRC_CAP`. Set `IAXL_ZIP_SEGMENT_SIZE_KB` for larger tensors.
+- Every block is checked against its buffer before any is decoded. Malformed blocks and undersized buffers raise `std::invalid_argument` (`ValueError` in Python) instead of aborting.
+- The backend slots are process-wide, so concurrent batches from any API take turns on one pipeline mutex.
+
 ## Threading Runtime
 
 `parallel.h` contains no zip-specific code, so any module can use it:

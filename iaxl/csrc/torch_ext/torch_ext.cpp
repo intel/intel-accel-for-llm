@@ -5,13 +5,44 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <deque>
+
 #include "context.h"
 #include "kv_pool.h"
 #include "kv_xfer_rdma.h"
+#include "kv_zip.h"
 
 using namespace profiler;
 
 namespace py = pybind11;
+
+namespace {
+
+// A contiguous buffer held through the Python buffer protocol. Releasing it needs the GIL.
+struct HeldBuffer {
+    Py_buffer view{};
+    HeldBuffer(const py::object &obj, bool writable) {
+        if (PyObject_GetBuffer(obj.ptr(), &view, writable ? PyBUF_WRITABLE : PyBUF_SIMPLE) != 0)
+            throw py::error_already_set();
+    }
+    ~HeldBuffer() { PyBuffer_Release(&view); }
+    HeldBuffer(const HeldBuffer &) = delete;
+    HeldBuffer &operator=(const HeldBuffer &) = delete;
+};
+
+template <class Span>
+std::vector<Span> hold_buffers(const std::vector<py::object> &objs, bool writable,
+                               std::deque<HeldBuffer> &held) {
+    std::vector<Span> spans;
+    spans.reserve(objs.size());
+    for (const auto &obj : objs) {
+        const Py_buffer &view = held.emplace_back(obj, writable).view;
+        spans.push_back({static_cast<char *>(view.buf), static_cast<size_t>(view.len)});
+    }
+    return spans;
+}
+
+} // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
@@ -598,6 +629,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](int priority) { omp_queue().sort_priority_level(priority); },
         "Stable-sort the waiting OMP-Main tasks of level `priority` by sort_key",
         py::arg("priority"), py::call_guard<py::gil_scoped_release>());
+
+    // Block codec over caller-owned memory: any contiguous object with the buffer protocol, such
+    // as memoryview or bytearray. Data shuffling, truncation and segmenting follow IAXL_* env.
+    m.def("zip_max_block_size", &kv_zip::kv_zip_max_block_size,
+          "Upper bound on the block size of a tensor of `size` bytes", py::arg("size"));
+
+    m.def(
+        "zip_compress_into",
+        [](const std::vector<py::object> &srcs, const std::vector<py::object> &dsts,
+           at::ScalarType dtype) {
+            std::deque<HeldBuffer> held;
+            const auto in = hold_buffers<kv_zip::ConstBytes>(srcs, false, held);
+            const auto out = hold_buffers<kv_zip::Bytes>(dsts, true, held);
+            py::gil_scoped_release release;
+            return kv_zip::kv_zip_compress_into(in, out, static_cast<int>(c10::elementSize(dtype)),
+                                                dtype == at::kBFloat16);
+        },
+        "Compress srcs[i] (elements of `dtype`) into one block in dsts[i], which must hold "
+        "zip_max_block_size(len(srcs[i])) bytes, and return the block sizes. Sources are not "
+        "modified.",
+        py::arg("srcs"), py::arg("dsts"), py::arg("dtype"));
+
+    m.def(
+        "zip_decompress_into",
+        [](const std::vector<py::object> &srcs, const std::vector<py::object> &dsts) {
+            std::deque<HeldBuffer> held;
+            const auto in = hold_buffers<kv_zip::ConstBytes>(srcs, false, held);
+            const auto out = hold_buffers<kv_zip::Bytes>(dsts, true, held);
+            py::gil_scoped_release release;
+            return kv_zip::kv_zip_decompress_into(in, out);
+        },
+        "Decompress block srcs[i] into dsts[i] and return the tensor sizes. Malformed blocks "
+        "raise ValueError.",
+        py::arg("srcs"), py::arg("dsts"));
 
 #ifndef CPU_SUPPORT // RDMA (remote_pool) runs on NIXL, which DEVICE=cpu builds do not link
     m.def("rdma_init", &kv_xfer::rdma_init, py::arg("name"), py::arg("listen_port"),
