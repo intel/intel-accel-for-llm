@@ -89,8 +89,8 @@ A block is a `BlockHeader`, then one `SegmentEntry` per segment, then the payloa
 | `BlockHeader` field | Content |
 | --- | --- |
 | `magic`, `version` | `"IAXZ"` and `1`. Blocks without them, such as caches persisted by older versions with the former 8-byte header, are rejected. |
-| `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression; `kBlockExponentOnly`: only the first (high-byte, sign and exponent) half of each shuffled segment was compressed, and the second half follows the stream raw. Compression sets it when `IAXL_ZIP_EXPONENT_ONLY=1`; decompression always reads it |
-| `orig_size` | Tensor size in bytes |
+| `flags` | `kBlockShuffled`: each segment was BF16-shuffled on its own before compression; `kBlockExponentOnly`: only the first (high-byte, sign and exponent) half of each shuffled segment was compressed, and the second half follows the stream raw. Compression sets it when `IAXL_ZIP_EXPONENT_ONLY=1`; decompression always reads it. `kBlockLossy`: the block is one segment whose bytes are the lossy codec's payload of the tensor instead of its bytes (`IAXL_KV_LOSSY_ENABLE=1`); the codec writes the payload straight into the backend's input buffer at submit, and decompression rebuilds the tensor from the decoded payload |
+| `orig_size` | Tensor size in bytes, or the lossy payload size with `kBlockLossy` |
 | `segment_size` | Bytes per segment, or `orig_size` when the tensor is one segment; the last segment also takes the remainder. Decompression reads it from the block, not from `IAXL_ZIP_SEGMENT_SIZE_KB` |
 | `segments` | Number of `SegmentEntry` records |
 
@@ -106,6 +106,10 @@ Decompression routes each segment by its flags:
 - All other streams go to QAT or CPU workers.
 
 IAA and QAT/CPU segments are tracked with two separate cursors. Batches stored without compression (`IAXL_KV_COMPRESSION=0`, or leading layers that bypass compression) consist of stored segments only, so they use the copy path in both directions.
+
+### Lossy Codec Plug-in
+
+The lossy codec sits behind a two-function interface in `iaxl/csrc/kv_zip/lossy.h` (`lossy_serialize`, `lossy_deserialize`). `torch_ext` only ships weak, default-visibility stubs for it (`lossy.cpp`) that abort with an `IAXL check failed` message naming the fix when `IAXL_KV_LOSSY_ENABLE` is set without a codec loaded; the calls go through the PLT, so a library defining the same symbols strongly and loaded ahead of `torch_ext` takes them over. The codec validates the block shape once, on the first tensor it sees. The codec is a separately distributed library, `_lib/libiaxl_kv_lossy.so`, outside the CMake build. With `IAXL_KV_LOSSY_ENABLE=1`, `setvars.sh` appends that library to `IAXL_LD_PRELOAD` (failing if it is missing), so it is preloaded in every process that compresses or decompresses (vLLM workers and the RDMA daemon). The codec library must not reference `torch_ext` symbols (such as `envs`), because `torch_ext` is `dlopen`ed later with `RTLD_LOCAL`; the env switch is therefore read in `kv_zip.cpp`, and the codec only sees the block tensor.
 
 ## Threading Runtime
 

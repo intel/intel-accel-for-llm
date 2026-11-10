@@ -71,6 +71,7 @@ sudo ./tools/install_gdr_driver.sh
 | 压缩 | `IAXL_ZIP_LEVEL` | `1` | 所有压缩后端的压缩级别，取值 `1`（最快）到 `9`（压缩率最高）。QAT 和 CPU 直接使用该级别；IAA 硬件只支持 level 1，因此 IAA 忽略此配置。建议保持默认值 `1`：提高级别对 KV cache 压缩率的提升很有限，却会明显降低压缩速度 |
 | 压缩 | `IAXL_KV_DATA_SHUFFLE` | `1` | 压缩前对 BF16 数据做字节重排（`0`/`1`）。会稍微降低压缩性能，但可以提升压缩率和解压性能 |
 | 压缩 | `IAXL_ZIP_EXPONENT_ONLY` | `IAXL_KV_DATA_SHUFFLE` | 字节重排开启时，只压缩 BF16 的高字节（符号和指数），低字节原样保存（`0`/`1`）。可以提升压缩率和压缩、解压性能；此时 `IAXL_KV_LOSSY_TRUNC` 对压缩率基本没有帮助 |
+| 压缩 | `IAXL_KV_LOSSY_ENABLE` | `0` | 压缩前先做有损 KV 编码（`0`/`1`）。编码器是单独分发的库 `_lib/libiaxl_kv_lossy.so`，`setvars.sh` 会把它加入 `IAXL_LD_PRELOAD`，缺失时报错退出。要求 BF16 KV cache |
 | vLLM | `MODEL` | `Qwen/Qwen3-32B` | Hugging Face 模型 ID 或本地模型路径 |
 | vLLM | `TP_SIZE` | `2` | 必须配置；Tensor Parallel worker 数量，CPU、QAT 和 DSA 资源将据此自动配置 |
 | vLLM | `DP_SIZE` | `1` | Data Parallel 组数；rank 总数 = `TP_SIZE × DP_SIZE` |

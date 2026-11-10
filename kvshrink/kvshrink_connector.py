@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -507,15 +508,31 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     layer_name, group.kv_cache_spec
                 )
 
-        attn_dtype = next(
-            (
-                spec.dtype
-                for spec in spec_by_layer.values()
-                if isinstance(spec, AttentionSpec)
-            ),
+        attn_spec = next(
+            (spec for spec in spec_by_layer.values() if isinstance(spec, AttentionSpec)),
             None,
         )
-        assert attn_dtype is not None
+        assert attn_spec is not None
+        attn_dtype = attn_spec.dtype
+        # The flat page hides the K/V layout from the lossy codec, which
+        # quantizes per head vector: publish the attention block's real shape
+        # (kv, block_size, heads, head_size); MLA has one latent (kv=1). Left
+        # unset when the page is not plain K/V (padding, indexer, mixed states).
+        kv = 1 if attn_spec.head_size_v == 0 else 2
+        block_shape = (kv, attn_spec.block_size, attn_spec.num_heads, attn_spec.head_size)
+        if attn_spec.head_size_v in (0, attn_spec.head_size) and (
+            math.prod(block_shape) * attn_dtype.itemsize == attn_spec.page_size_bytes
+        ):
+            os.environ["IAXL_KV_BLOCK_SHAPE"] = ",".join(map(str, block_shape))
+            logger.info("IAXL_KV_BLOCK_SHAPE=%s", os.environ["IAXL_KV_BLOCK_SHAPE"])
+        else:
+            os.environ.pop("IAXL_KV_BLOCK_SHAPE", None)
+            logger.warning(
+                "Attention page (%d bytes) is not a plain K/V block %s; "
+                "IAXL_KV_BLOCK_SHAPE left unset",
+                attn_spec.page_size_bytes,
+                block_shape,
+            )
 
         views: dict[str, torch.Tensor] = {}
         for layer_name, cache in kv_caches.items():

@@ -12,6 +12,10 @@
 // large tensor keeps several requests in flight. Each tensor still becomes exactly one block: a
 // header, a segment table and the segment payloads.
 //
+// With IAXL_KV_LOSSY_ENABLE a tensor is one segment whose bytes are the lossy codec's payload,
+// written straight into the backend's input buffer; decompression rebuilds the tensor from the
+// decoded payload.
+//
 // QAT and CPU streams are mutually compatible, IAA streams are compatible with neither, so each
 // segment records whether IAA produced it and decompression only hands it to a backend that can
 // decode it.
@@ -43,8 +47,8 @@ namespace kv_zip {
 struct BlockHeader {
     uint32_t magic;        // kBlockMagic
     uint16_t version;      // kBlockVersion
-    uint16_t flags;        // kBlockShuffled, kBlockExponentOnly
-    uint32_t orig_size;    // tensor bytes
+    uint16_t flags;        // kBlockShuffled, kBlockExponentOnly, kBlockLossy
+    uint32_t orig_size;    // tensor bytes, or lossy payload bytes with kBlockLossy
     uint32_t segment_size; // tensor bytes per segment, the last one also takes the remainder
     uint32_t segments;     // SegmentEntry records that follow
 };
@@ -65,6 +69,8 @@ static constexpr uint16_t kBlockShuffled = 1u << 0;
 // Only the first half of each shuffled segment went through the backend; the second half follows
 // the stream raw. Stored segments are whole.
 static constexpr uint16_t kBlockExponentOnly = 1u << 1;
+// The single segment covers the lossy codec's payload of the tensor, not its bytes.
+static constexpr uint16_t kBlockLossy = 1u << 2;
 // The payload is the segment itself: compression was off or did not make it smaller.
 static constexpr uint32_t kSegmentStored = 1u << 0;
 // IAA produced the stream, so only IAA can decode it.
@@ -116,6 +122,31 @@ static const BlockHeader &block_header(const char *block) {
 
 static const SegmentEntry *segment_table(const char *block) {
     return reinterpret_cast<const SegmentEntry *>(block + sizeof(BlockHeader));
+}
+
+// Head vector length of a KV block. vLLM registers each block as a flat page, so the
+// connector publishes the real block shape (kv, block_size, heads, head_dim) in
+// IAXL_KV_BLOCK_SHAPE; read lazily since it is set after this library is loaded.
+// Unset -> the pool's last dimension.
+static int64_t kv_head_dim(const kv_pool::KVPool &pool) {
+    static const int64_t env_dim = [] {
+        const char *s = getenv("IAXL_KV_BLOCK_SHAPE");
+        if (!s || !*s)
+            return int64_t{0};
+        const char *last = strrchr(s, ',');
+        return static_cast<int64_t>(atoll(last ? last + 1 : s));
+    }();
+    return env_dim > 0 ? env_dim : pool.shape.back();
+}
+
+// The block as a [rows, head_dim] tensor of the pool's dtype, as the lossy codec consumes it.
+static at::Tensor block_tensor(const kv_pool::KVPool &pool, char *block) {
+    IAXL_CHECK(!pool.shape.empty(), "kv_zip: pool has no shape");
+    const int64_t d = kv_head_dim(pool);
+    IAXL_CHECK(d > 0 && pool.block_bytes % (d * pool.elem_size) == 0,
+               "kv_zip: block is not a whole number of head vectors");
+    return at::from_blob(block, {pool.block_bytes / (d * pool.elem_size), d},
+                         at::TensorOptions().dtype(static_cast<at::ScalarType>(pool.dtype)));
 }
 
 enum class ZipBackend { QAT, IAA, CPU };
@@ -305,7 +336,9 @@ void kv_zip_compress_batch(const kv_pool::KVPool &pool, const std::vector<int64_
     std::vector<ZipBlock> blocks(n);
     std::vector<SegmentRef> segs;
     segs.reserve(n);
-    const bool shuffle = data_shuffle_enabled() && pool.dtype == static_cast<int32_t>(at::kBFloat16);
+    const bool lossy = envs.IAXL_KV_LOSSY_ENABLE;
+    const bool shuffle =
+        !lossy && data_shuffle_enabled() && pool.dtype == static_cast<int32_t>(at::kBFloat16);
     for (size_t i = 0; i < n; i++) {
         ZipBlock &b = blocks[i];
         b.data = pool.block_ptr(block_indices[i]);
@@ -313,12 +346,18 @@ void kv_zip_compress_batch(const kv_pool::KVPool &pool, const std::vector<int64_
         const uint16_t shuffled = envs.IAXL_ZIP_EXPONENT_ONLY
                                       ? kBlockShuffled | kBlockExponentOnly
                                       : kBlockShuffled;
-        b.header = make_header(orig_sizes[i], shuffle ? shuffled : 0);
-        // Segments are prepared in the backends' input buffers. The last one is the longest.
-        IAXL_CHECK(segment_length(b.header, b.header.segments - 1) <=
-                       static_cast<uint32_t>(envs.IAXL_ZIP_SRC_CAP),
-                   "kv_zip: segment exceeds IAXL_ZIP_SRC_CAP; raise it or set "
-                   "IAXL_ZIP_SEGMENT_SIZE_KB");
+        if (lossy) {
+            // Not segmented (segment_size_for does not apply): the payload must fit one segment of
+            // IAXL_ZIP_SRC_CAP, and its size is only known once the codec has written it at submit.
+            b.header = {kBlockMagic, kBlockVersion, kBlockLossy, 0, 0, 1};
+        } else {
+            b.header = make_header(orig_sizes[i], shuffle ? shuffled : 0);
+            // Segments are prepared in the backends' input buffers. The last one is the longest.
+            IAXL_CHECK(segment_length(b.header, b.header.segments - 1) <=
+                           static_cast<uint32_t>(envs.IAXL_ZIP_SRC_CAP),
+                       "kv_zip: segment exceeds IAXL_ZIP_SRC_CAP; raise it or set "
+                       "IAXL_ZIP_SEGMENT_SIZE_KB");
+        }
         b.first = static_cast<uint32_t>(segs.size());
         b.pending.store(b.header.segments, std::memory_order_relaxed);
         for (uint32_t k = 0; k < b.header.segments; k++)
@@ -358,14 +397,20 @@ void kv_zip_compress_batch(const kv_pool::KVPool &pool, const std::vector<int64_
         },
         [&](ZipBackend backend, int slot, size_t s) {
             const SegmentRef r = segs[s];
-            const ZipBlock &b = blocks[r.block];
-            const char *src = b.data + size_t(r.index) * b.header.segment_size;
-            const uint32_t len = segment_length(b.header, r.index);
+            ZipBlock &b = blocks[r.block];
             char *in = static_cast<char *>(ops(backend).src_buf(slot));
-            if (b.header.flags & kBlockShuffled)
-                shuffle_copy(in, src, len, b.mask);
-            else
-                masked_copy(in, src, len, b.mask);
+            if (lossy) {
+                const size_t size = lossy_serialize(block_tensor(pool, b.data), in,
+                                                    static_cast<size_t>(envs.IAXL_ZIP_SRC_CAP));
+                b.header.orig_size = b.header.segment_size = static_cast<uint32_t>(size);
+            } else {
+                const char *src = b.data + size_t(r.index) * b.header.segment_size;
+                const uint32_t len = segment_length(b.header, r.index);
+                if (b.header.flags & kBlockShuffled)
+                    shuffle_copy(in, src, len, b.mask);
+                else
+                    masked_copy(in, src, len, b.mask);
+            }
             const int status =
                 ops(backend).compress(slot, in, static_cast<int>(zip_length(b.header, r.index)));
             IAXL_CHECK(status == 0, "kv_zip: zip compress failed");
@@ -417,8 +462,11 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         const BlockHeader &h = block_header(data_ptrs[i]);
         IAXL_CHECK(h.magic == kBlockMagic && h.version == kBlockVersion,
                    "kv_zip: unknown block format, e.g. a KV cache persisted by an older iaxl");
-        IAXL_CHECK(h.orig_size == static_cast<uint32_t>(pool.block_bytes),
+        const bool lossy = h.flags & kBlockLossy;
+        IAXL_CHECK(lossy || h.orig_size == static_cast<uint32_t>(pool.block_bytes),
                    "kv_zip: block size does not match pool block byte size");
+        IAXL_CHECK(!lossy || (h.segments == 1 && pool.dtype == static_cast<int32_t>(at::kBFloat16)),
+                   "kv_zip: lossy block must be one segment of a bf16 pool");
         IAXL_CHECK(h.segment_size > 0 && h.segments == segment_count(h.orig_size, h.segment_size),
                    "kv_zip: invalid segment table");
         IAXL_CHECK(!(h.flags & kBlockExponentOnly) || (h.flags & kBlockShuffled),
@@ -444,10 +492,15 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         const bool split = !(e.flags & kSegmentStored) && (h.flags & kBlockExponentOnly);
         IAXL_CHECK(len == (split ? zip_length(h, r.index) : full),
                    "kv_zip: decompressed size does not match segment size");
+        char *block = pool.block_ptr(block_indices[r.block]);
+        if (h.flags & kBlockLossy) {
+            lossy_deserialize(src, full, block_tensor(pool, block));
+            return;
+        }
         const char *head = static_cast<const char *>(src);
         const char *tail = split ? data_ptrs[r.block] + e.offset + e.length - (full - len)
                                  : head + full / 2;
-        char *dst = pool.block_ptr(block_indices[r.block]) + size_t(r.index) * h.segment_size;
+        char *dst = block + size_t(r.index) * h.segment_size;
         if (h.flags & kBlockShuffled)
             shuffle_copy(dst, head, tail, full);
         else
