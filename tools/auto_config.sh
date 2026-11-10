@@ -1,5 +1,22 @@
 #!/usr/bin/env bash
 
+# Defaults of TP_SIZE / DP_SIZE, shared by setvars.sh and iaxl_num_workers.
+IAXL_DEFAULT_TP_SIZE=2
+IAXL_DEFAULT_DP_SIZE=1
+
+# Worker count, one per (dp, tp) pair, from TP_SIZE / DP_SIZE or their defaults. setvars.sh derives
+# NUM_WORKERS from it; a recipe's setvars.pre.sh, which runs before that, can call it too.
+iaxl_num_workers() {
+    local tp_size=${TP_SIZE:-$IAXL_DEFAULT_TP_SIZE} dp_size=${DP_SIZE:-$IAXL_DEFAULT_DP_SIZE}
+
+    validate_tp_size "$tp_size" || return 1
+    if ! [[ "$dp_size" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: DP_SIZE must be a positive integer, got '$dp_size'" >&2
+        return 1
+    fi
+    echo $((tp_size * dp_size))
+}
+
 validate_tp_size() {
     local tp_size=$1
     if ! [[ "$tp_size" =~ ^[1-9][0-9]*$ ]]; then
@@ -545,3 +562,13 @@ validate_omp_config() {
         "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM" \
         "  IAXL_USE_OMP=$IAXL_USE_OMP"
 }
+
+# A recipe (IAXL_RECIPE_DIR, resolved by setvars.sh) may add functions or redefine the functions
+# above; its definitions win because they are sourced last. doc/design/recipes.md lists the ones
+# meant to be redefined and their contract.
+if [[ -f "${IAXL_RECIPE_DIR:-}/auto_config.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/auto_config.sh" || {
+        echo "ERROR: recipe hook $IAXL_RECIPE_DIR/auto_config.sh failed" >&2
+        return 1
+    }
+fi

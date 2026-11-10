@@ -1,11 +1,43 @@
+TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# =============================================================================
+# Recipe: a directory of per-scenario overrides, selected with IAXL_RECIPE (a name under
+# examples/recipes/ or a directory path). See doc/design/recipes.md and examples/recipes/vllm-cpu.
+#   $IAXL_RECIPE_DIR/auto_config.sh   sourced by tools/auto_config.sh: add or override functions
+#   $IAXL_RECIPE_DIR/setvars.pre.sh   sourced here, before the defaults below: set env vars
+#   $IAXL_RECIPE_DIR/setvars.post.sh  sourced after everything is computed: fix up values and
+#                                     edit CONTAINER_NAME / ENV_VARS / DOCKER_RUN_ARGS
+# =============================================================================
+if [[ -n "${IAXL_RECIPE:-}" ]]; then
+    if [[ -d "$IAXL_RECIPE" ]]; then
+        IAXL_RECIPE_DIR=$(cd -- "$IAXL_RECIPE" && pwd)
+        IAXL_RECIPE=$IAXL_RECIPE_DIR # A relative path would resolve differently in another directory or the container
+    elif [[ -d "$TOP_DIR/examples/recipes/$IAXL_RECIPE" ]]; then
+        IAXL_RECIPE_DIR="$TOP_DIR/examples/recipes/$IAXL_RECIPE"
+    else
+        echo "ERROR: IAXL_RECIPE='$IAXL_RECIPE' is neither a directory nor a name under $TOP_DIR/examples/recipes" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    export IAXL_RECIPE IAXL_RECIPE_DIR
+    echo "Recipe: $IAXL_RECIPE_DIR"
+else
+    unset IAXL_RECIPE_DIR
+fi
+
+# Recipe hooks end with `return 0`; `return 1` (after printing an ERROR) aborts setvars.sh.
+source "$TOP_DIR/tools/auto_config.sh" || return 1 2>/dev/null || exit 1 # also loads $IAXL_RECIPE_DIR/auto_config.sh
+if [[ -f "${IAXL_RECIPE_DIR:-}/setvars.pre.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/setvars.pre.sh" || {
+        echo "ERROR: recipe hook $IAXL_RECIPE_DIR/setvars.pre.sh failed" >&2
+        return 1 2>/dev/null || exit 1
+    }
+fi
+$TOP_DIR/tools/setup_system.sh
+
 export IAXL_VERSION=${IAXL_VERSION:-1.6.0}
 export IAXL_BASE_DOCKER_IMAGE=${IAXL_BASE_DOCKER_IMAGE:-"vllm/vllm-openai:v0.29.0"}
 export IAXL_DEV_DOCKER_IMAGE=${IAXL_DEV_DOCKER_IMAGE:-"vllm-iaxl-dev:$IAXL_VERSION"}
 export IAXL_BUILDER_DOCKER_IMAGE=${IAXL_BUILDER_DOCKER_IMAGE:-"vllm-iaxl-builder"}
-
-TOP_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$TOP_DIR/tools/auto_config.sh"
-$TOP_DIR/tools/setup_system.sh
 
 # =============================================================================
 # Configurable runtime / build environment variables (all IAXL_* prefixed).
@@ -34,10 +66,10 @@ export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP="${KVSHRINK_VLLM_KV_ASYNC_
 
 # ---- vLLM ------------------------------------------------------------------
 export MODEL="${MODEL:-Qwen/Qwen3-32B}" # Hugging Face model ID or local model path
-export TP_SIZE="${TP_SIZE:-2}"            # Tensor-parallel worker count
-export DP_SIZE="${DP_SIZE:-1}"            # Data-parallel group count
+export TP_SIZE="${TP_SIZE:-$IAXL_DEFAULT_TP_SIZE}" # Tensor-parallel worker count (default 2, in tools/auto_config.sh)
+export DP_SIZE="${DP_SIZE:-$IAXL_DEFAULT_DP_SIZE}" # Data-parallel group count (default 1)
 # Total workers = one per (dp, tp) pair; CPU/QAT/DSA specs are indexed per worker.
-NUM_WORKERS=$((TP_SIZE * DP_SIZE))
+NUM_WORKERS=$(iaxl_num_workers) || return 1 2>/dev/null || exit 1
 VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
 export VLLM_CPU_OMP_THREADS_BIND # Per-worker CPU affinity (one entry per global rank)
 export KVSHRINK_CPU_OMP_THREADS_BIND="${KVSHRINK_CPU_OMP_THREADS_BIND:-$VLLM_CPU_OMP_THREADS_BIND}" # Per-worker CPUs for iaxl threads (one entry per global rank)
@@ -199,8 +231,12 @@ fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 
-# docker
-CONTAINER_NAME=iaxl.vllm
+# ---- docker (used by start.sh) ---------------------------------------------
+# A recipe's setvars.post.sh may edit CONTAINER_NAME, ENV_VARS and DOCKER_RUN_ARGS; --name and
+# the -e flags for ENV_VARS are appended after it.
+CONTAINER_NAME=${CONTAINER_NAME:-iaxl.vllm}
+# Host variables forwarded into the container with -e VAR=value. Forward inputs only: setvars.sh and
+# the recipe run again in the container and derive everything else from them.
 ENV_VARS=(
     no_proxy
     http_proxy
@@ -213,30 +249,33 @@ ENV_VARS=(
     IAXL_QATLIB_VERSION
     IAXL_VERSION
     IAXL_LD_PRELOAD
+    IAXL_RECIPE
 )
 
+DOCKER_RUN_ARGS=(
+    --rm
+    --privileged
+    --pid host
+    --net host
+    -it
+    -v /dev:/dev
+    --entrypoint ""
+)
 case "$DEVICE" in
     cuda)
-        if [[ "$NVIDIA_RUNTIME" == "none" ]]; then
-            DOCKER_RUN_ARGS=()
-        else
-            DOCKER_RUN_ARGS=("--runtime" "nvidia" "--gpus" "all")
+        if [[ "$NVIDIA_RUNTIME" != "none" ]]; then
+            DOCKER_RUN_ARGS+=("--runtime" "nvidia" "--gpus" "all")
         fi
         ;;
     xpu)
-        DOCKER_RUN_ARGS=("--device" "/dev/dri")
+        DOCKER_RUN_ARGS+=("--device" "/dev/dri")
         ;;
-    cpu)
-        DOCKER_RUN_ARGS=()
-        ;;
+    cpu) ;;
     *)
         echo "Unsupported DEVICE: $DEVICE (expected cuda, xpu or cpu)" >&2
         return 1 2>/dev/null || exit 1
         ;;
 esac
-for var in "${ENV_VARS[@]}"; do
-    DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
-done
 DOCKER_RUN_ARGS+=("-e" "HF_HOME=/_data/hf_home")
 DOCKER_RUN_ARGS+=("-v" "$PWD/_data:/_data")
 # qatlib (in-tree driver) shares the host's QAT VFs through the host qatmgr socket.
@@ -248,3 +287,15 @@ if [[ -d "$MODEL" ]]; then
     DOCKER_RUN_ARGS+=("-v" "$MODEL_DIR:$MODEL_DIR:ro")
 fi
 DOCKER_RUN_ARGS+=("-v" "$PWD:$PWD" "-w" "$PWD")
+
+if [[ -f "${IAXL_RECIPE_DIR:-}/setvars.post.sh" ]]; then
+    source "$IAXL_RECIPE_DIR/setvars.post.sh" || {
+        echo "ERROR: recipe hook $IAXL_RECIPE_DIR/setvars.post.sh failed" >&2
+        return 1 2>/dev/null || exit 1
+    }
+fi
+
+DOCKER_RUN_ARGS+=("--name" "$CONTAINER_NAME")
+for var in "${ENV_VARS[@]}"; do
+    DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
+done
