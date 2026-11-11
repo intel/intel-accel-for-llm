@@ -92,6 +92,22 @@ The script sources `setvars.sh` and prepends `IAXL_LD_PRELOAD` (libtcmalloc and 
 
 The [`vllm-cpu` recipe](../../examples/recipes/vllm-cpu/README.md) packages the exports of sections 1 to 4 and this CPU split, so `IAXL_RECIPE=vllm-cpu ./start.sh` followed by `./examples/kvshrink-vllm-serve.sh` in the container starts the same setup. The recipe also sets `MAX_MODEL_LEN=16384`, takes `VLLM_CPU_KVCACHE_SPACE` out of the default DDR pool budget and gives the container a 16 GiB `/dev/shm`; see the [recipes design](../design/recipes.md).
 
+### qatlib Standalone Mode
+
+With the in-tree driver, the [`qat-standalone` recipe](../../examples/recipes/qat-standalone/README.md) runs each container in qatlib standalone mode, which qatlib recommends for containers: the container gets the last VF of each QAT PF on its NUMA node and opens them itself, with no host `qatmgr` and no `--privileged`. Each container runs one rank on one NUMA node, and on a host without GPUs the recipe applies the settings of sections 1 to 4 itself:
+
+```bash
+IAXL_RECIPE=qat-standalone ./start.sh   # first NUMA node with QAT: iaxl.vllm.numa0, port 8000
+
+# In the container shell opened by start.sh
+./examples/kvshrink-vllm-serve.sh
+
+# The same in a second terminal starts the next node (iaxl.vllm.numa1, port 8001)
+IAXL_RECIPE=qat-standalone ./start.sh
+```
+
+The recipe gives vLLM every core of the node but the last two, which go to IAXL (`RECIPE_IAXL_CPUS_PER_RANK`) with `IAXL_OMP_THREAD_NUM=2`, and sizes the DDR pool from the node's memory minus `VLLM_CPU_KVCACHE_SPACE` (40 GiB) and the model weights, when they are already downloaded. `RECIPE_NUMA_NODE=<n>` selects a node, and explicit `VLLM_CPU_OMP_THREADS_BIND` / `KVSHRINK_CPU_OMP_THREADS_BIND` lists are used as given. The host needs the VFs bound to `vfio-pci` and no running `qatmgr` (`systemctl stop qat` after boot keeps them bound). Containers share the source tree and each builds IAXL on entry, so start them one after another.
+
 ## 6. Verification
 
 - **`setvars.sh` output:** check `VLLM_CPU_OMP_THREADS_BIND`, `KVSHRINK_CPU_OMP_THREADS_BIND`, `IAXL_OMP_THREAD_NUM`, and `IAXL_USE_OMP=0`.
@@ -118,3 +134,4 @@ The [`vllm-cpu` recipe](../../examples/recipes/vllm-cpu/README.md) packages the 
 | `IAXL_OMP_THREAD_NUM (...) + reserved (...) exceeds the smallest rank CPU allocation` | The smallest `VLLM_CPU_OMP_THREADS_BIND` entry is too small. Lower `IAXL_RESERVED_CPU_NUM` or `IAXL_OMP_THREAD_NUM`. |
 | vLLM warns that libiomp or libtcmalloc is not in `LD_PRELOAD` | Start vLLM with `examples/kvshrink-vllm-serve.sh`, with `IAXL_LD_PRELOAD` set as in section 1. |
 | `RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link` | Cross-node KV cache reuse needs a CUDA or XPU build. |
+| `containers in qatlib standalone mode run one rank each` | With the `qat-standalone` recipe, start one container per NUMA node with `TP_SIZE=1` (section 5). |

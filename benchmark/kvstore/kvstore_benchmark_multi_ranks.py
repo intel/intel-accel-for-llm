@@ -189,6 +189,7 @@ def main() -> None:
             name=f"rank{rank}",
         )
         proc.start()
+        child_conn.close()  # else recv() never sees EOF when the rank dies
         conns.append(parent_conn)
         procs.append(proc)
     try:

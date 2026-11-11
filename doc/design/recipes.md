@@ -11,7 +11,7 @@ Running KVShrink in a new scenario used to mean editing four files that everyone
 
 Those edits are hard to keep apart from the defaults, easy to lose on update, and impossible to switch between.
 
-A **recipe** moves the scenario-specific part into its own directory under `examples/recipes/<name>/` and selects it with one variable, `IAXL_RECIPE`. The shared scripts stay generic and grow a small, fixed set of hook points; a recipe fills in the hooks it needs and leaves the rest alone. [examples/recipes/vllm-cpu](../../examples/recipes/vllm-cpu/README.md) is a fully commented recipe for the [vLLM CPU inference guide](../usage/vllm-cpu-inference.en.md) and is the starting point for new ones.
+A **recipe** moves the scenario-specific part into its own directory under `examples/recipes/<name>/` and selects it with one variable, `IAXL_RECIPE`. The shared scripts stay generic and grow a small, fixed set of hook points; a recipe fills in the hooks it needs and leaves the rest alone. [examples/recipes/vllm-cpu](../../examples/recipes/vllm-cpu/README.md) is a fully commented recipe for the [vLLM CPU inference guide](../usage/vllm-cpu-inference.en.md) and is the starting point for new ones. [examples/recipes/qat-standalone](../../examples/recipes/qat-standalone/README.md) runs one rank per container in qatlib standalone mode and shows a recipe that replaces default `docker run` flags and forwards values the container cannot derive.
 
 Design goals:
 
@@ -71,6 +71,7 @@ These functions are meant to be redefined; their arguments and output format are
 | `qat_auto_detect` | worker count | comma-separated QAT device indices per rank, separated by `\|`, e.g. `0,1\|2,3` | default `KVSHRINK_QAT_DEVICES` | each rank at startup (`bind_intel_accel` in `iaxl/utils/affinity.py`: one entry per rank), then the QAT driver when it opens the devices |
 | `dsa_auto_detect` | worker count | DSA work-queue names per rank, separated by `\|`, e.g. `wq0.0\|wq2.0` | default `KVSHRINK_DSA_DEVICES` and `IAXL_DSA_WQS` (rank 0) | each rank at startup (`bind_intel_accel`), then the DSA library when it opens the queue |
 | `ddr_pool_total_size_gb` | worker count | DDR pool budget in GB across all ranks, an integer | default `IAXL_DDR_POOL_TOTAL_SIZE_GB`; the per-rank size is the total divided by the worker count | none |
+| `omp_thread_count` | QAT instances, CPU zip threads, IAA instances | thread count, an integer | default `IAXL_OMP_THREAD_NUM` when a zip backend is enabled; called after `rank_cpu_counts` has set `MIN_RANK_CPU_COUNT` | `validate_omp_config` |
 
 Helper for hooks, not meant to be redefined:
 
@@ -120,7 +121,7 @@ Both `*_ARGS` variables are split on whitespace, so no value may contain a space
 
 `IAXL_RECIPE` is part of the default `ENV_VARS`, so the container shell started by `start.sh` has it, and `kvshrink-vllm-serve.sh` or a benchmark sourcing `setvars.sh` there resolves and applies the same recipe. For this to work the recipe directory must be visible in the container at the same path: directories under `examples/recipes/` are, because the repository is bind-mounted at its host path; a recipe outside the repository must add its own `-v` mount in `setvars.post.sh`.
 
-Because the recipe runs again inside the container, forwarding recipe defaults through `ENV_VARS` is unnecessary. `ENV_VARS` carries **inputs** only: values a user may set on the host command line, such as a recipe's own knobs (the `vllm-cpu` recipe forwards `VLLM_CPU_KVCACHE_SPACE`, `MAX_MODEL_LEN` and `RECIPE_IAXL_CPUS_PER_RANK`). A value that `setvars.sh` or a hook derives must not be forwarded. The container derives it again, and a hook that adjusts it would then apply the adjustment twice. For example, forwarding `IAXL_DDR_POOL_TOTAL_SIZE_GB` from a host where the `vllm-cpu` recipe had already subtracted vLLM's KV cache would make the container subtract it again. An unset name is forwarded as an empty string, which `${VAR:-default}` treats as unset, so forwarding an optional variable is harmless.
+Because the recipe runs again inside the container, forwarding recipe defaults through `ENV_VARS` is unnecessary. `ENV_VARS` carries **inputs** only: values a user may set on the host command line, such as a recipe's own knobs (the `vllm-cpu` recipe forwards `VLLM_CPU_KVCACHE_SPACE`, `MAX_MODEL_LEN` and `RECIPE_IAXL_CPUS_PER_RANK`). A value that `setvars.sh` or a hook derives must not be forwarded. The container derives it again, and a hook that adjusts it would then apply the adjustment twice. For example, forwarding `IAXL_DDR_POOL_TOTAL_SIZE_GB` from a host where the `vllm-cpu` recipe had already subtracted vLLM's KV cache would make the container subtract it again. The exception is a value the container cannot derive because it sees less of the host: the `qat-standalone` container sees only its GPU and QAT VFs, so the recipe forwards the CPUs, DDR pool share and ports the host picked, and its `setvars.pre.sh` keeps them as given. An unset name is forwarded as an empty string, which `${VAR:-default}` treats as unset, so forwarding an optional variable is harmless.
 
 ## Writing a recipe
 
