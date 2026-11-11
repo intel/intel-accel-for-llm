@@ -53,6 +53,12 @@ export IAXL_QATLIB=intree   # before sourcing setvars.sh / building
 
 With `IAXL_QATLIB=intree` the build links the system `libqat` / `libusdm` found by `pkg-config qatlib` instead of downloading and building the out-of-tree package into `_lib`. Without a system qatlib (as in the dev container), it builds qatlib `IAXL_QATLIB_VERSION` (default `26.02.0`; match the host `qatmgr`) into `_lib`, and `start.sh` mounts the host `/run/qat`.
 
+To run the in-tree driver in qatlib standalone mode instead, which qatlib recommends for containers, use the [`qat-standalone` recipe](examples/recipes/qat-standalone/README.md): each container gets its own QAT VFs instead of the host `qatmgr`, runs without `--privileged`, `--pid host` or the host `/dev`, and runs one rank. Each run of the command below starts the container of the next GPU without one (on a host without GPUs, of the next NUMA node with QAT):
+
+```bash
+IAXL_RECIPE=qat-standalone ./start.sh   # e.g. container iaxl.vllm.gpu2, vLLM port 8002; CUDA_VISIBLE_DEVICES=2 (XPU: ZE_AFFINITY_MASK) selects the GPU
+```
+
 3. Install the GDRCopy driver and configure DSA:
 
 ```bash

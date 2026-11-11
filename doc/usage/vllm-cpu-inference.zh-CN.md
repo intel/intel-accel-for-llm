@@ -92,6 +92,22 @@ export IAXL_OMP_THREAD_NUM=2
 
 [`vllm-cpu` recipe](../../examples/recipes/vllm-cpu/README.md) 把第 1 到第 4 节的 export 和上面的 CPU 划分打包在一起：在主机上执行 `IAXL_RECIPE=vllm-cpu ./start.sh`，再在容器里执行 `./examples/kvshrink-vllm-serve.sh`，即可启动相同的配置。此外，该 recipe 还设置 `MAX_MODEL_LEN=16384`，从默认 DDR pool 预算中扣除 `VLLM_CPU_KVCACHE_SPACE`，并为容器提供 16 GiB 的 `/dev/shm`；机制见 [recipes 设计文档](../design/recipes.md)。
 
+### qatlib Standalone 模式
+
+使用 in-tree 驱动时，[`qat-standalone` recipe](../../examples/recipes/qat-standalone/README.md) 以 qatlib standalone 模式运行每个容器，这也是 qatlib 推荐的容器用法：容器获得其 NUMA 节点上每个 QAT PF 的最后一个 VF 并自行打开，不需要宿主机 `qatmgr`，也不需要 `--privileged`。每个容器在一个 NUMA 节点上运行一个 rank；在没有 GPU 的主机上，recipe 会自行应用第 1 到第 4 节的设置：
+
+```bash
+IAXL_RECIPE=qat-standalone ./start.sh   # 第一个带 QAT 的 NUMA 节点：iaxl.vllm.numa0，端口 8000
+
+# 在 start.sh 打开的容器 shell 中执行
+./examples/kvshrink-vllm-serve.sh
+
+# 在另一个终端中再执行一次，即启动下一个节点（iaxl.vllm.numa1，端口 8001）
+IAXL_RECIPE=qat-standalone ./start.sh
+```
+
+recipe 把节点上除最后两个以外的物理核都交给 vLLM，最后两个交给 IAXL（`RECIPE_IAXL_CPUS_PER_RANK`），并设置 `IAXL_OMP_THREAD_NUM=2`；DDR pool 按该节点内存减去 `VLLM_CPU_KVCACHE_SPACE`（40 GiB）和已下载的模型权重计算。`RECIPE_NUMA_NODE=<n>` 可指定节点，显式设置的 `VLLM_CPU_OMP_THREADS_BIND` / `KVSHRINK_CPU_OMP_THREADS_BIND` 按原样使用。宿主机需要把 VF 绑定到 `vfio-pci`，且不能运行 `qatmgr`（开机后执行 `systemctl stop qat`，VF 仍保持绑定）。多个容器共用源码目录，且启动时都会构建 IAXL，因此请依次启动。
+
 ## 6. 验证
 
 - **`setvars.sh` 输出**：检查 `VLLM_CPU_OMP_THREADS_BIND`、`KVSHRINK_CPU_OMP_THREADS_BIND`、`IAXL_OMP_THREAD_NUM` 和 `IAXL_USE_OMP=0`。
@@ -118,3 +134,4 @@ export IAXL_OMP_THREAD_NUM=2
 | `IAXL_OMP_THREAD_NUM (...) + reserved (...) exceeds the smallest rank CPU allocation` | `VLLM_CPU_OMP_THREADS_BIND` 中最小的一项 CPU 太少。调小 `IAXL_RESERVED_CPU_NUM` 或 `IAXL_OMP_THREAD_NUM`。 |
 | vLLM 警告 `LD_PRELOAD` 中没有 libiomp 或 libtcmalloc | 按第 1 节设置 `IAXL_LD_PRELOAD`，并用 `examples/kvshrink-vllm-serve.sh` 启动 vLLM。 |
 | `RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link` | 跨节点 KV cache 复用需要 CUDA 或 XPU 构建。 |
+| `containers in qatlib standalone mode run one rank each` | 使用 `qat-standalone` recipe 时，每个 NUMA 节点启动一个 `TP_SIZE=1` 的容器（见第 5 节）。 |
