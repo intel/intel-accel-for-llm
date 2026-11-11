@@ -14,6 +14,10 @@ using namespace profiler;
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
+    // Before any KV pool is registered, so the DSA hooks see every GPU KV pool.
+    kv_xfer::dsa_install_pool_hooks();
+#endif
 
     m.attr("device_type") = IAXL_DEVICE;
 

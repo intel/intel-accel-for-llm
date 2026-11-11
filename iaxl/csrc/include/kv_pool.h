@@ -90,12 +90,12 @@ const KVPool *find_kv_pool(std::string_view name);  // nullptr if not registered
 const KVPool *find_kv_pool_by_base(uintptr_t base);
 void unregister_kv_pool(std::string_view name);
 
-// Transport backend callbacks; rdma_init() installs the NIXL versions.
+// Transport backend callbacks (RDMA, DSA), called with the registry lock held.
 struct PoolHooks {
     void (*on_register)(const KVPool &) = nullptr;
     void (*on_unregister)(const KVPool &) = nullptr;
 };
-void set_pool_hooks(const PoolHooks &hooks);
+void add_pool_hooks(const PoolHooks &hooks);
 
 // ---- torch side (pool.cpp) ----
 // cpu/gpu: validates contiguity and device, records pinned, keeps `t` alive until unregistered.

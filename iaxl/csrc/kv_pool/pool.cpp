@@ -66,7 +66,7 @@ struct Registry {
     std::mutex mu;
     std::unordered_map<std::string, KVPool> pools;
     std::unordered_map<std::string, torch::Tensor> tensors; // keeps CPU/GPU pools alive
-    PoolHooks hooks;
+    std::vector<PoolHooks> hooks;
 };
 
 Registry &registry() {
@@ -98,8 +98,9 @@ const KVPool &register_with_tensor(KVPool pool, const torch::Tensor *t) {
     if (t)
         r.tensors.emplace(pool.name, *t);
     const KVPool &p = r.pools.emplace(pool.name, std::move(pool)).first->second;
-    if (r.hooks.on_register)
-        r.hooks.on_register(p);
+    for (const PoolHooks &hooks : r.hooks)
+        if (hooks.on_register)
+            hooks.on_register(p);
     return p;
 }
 
@@ -137,16 +138,17 @@ void unregister_kv_pool(std::string_view name) {
     auto it = r.pools.find(std::string(name));
     if (it == r.pools.end())
         return;
-    if (r.hooks.on_unregister)
-        r.hooks.on_unregister(it->second);
+    for (const PoolHooks &hooks : r.hooks)
+        if (hooks.on_unregister)
+            hooks.on_unregister(it->second);
     r.pools.erase(it);
     r.tensors.erase(std::string(name));
 }
 
-void set_pool_hooks(const PoolHooks &hooks) {
+void add_pool_hooks(const PoolHooks &hooks) {
     auto &r = registry();
     std::lock_guard<std::mutex> lock(r.mu);
-    r.hooks = hooks;
+    r.hooks.push_back(hooks);
 }
 
 // ---- torch side ----

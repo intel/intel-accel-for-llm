@@ -45,11 +45,14 @@ void context_sync_cur(context_t ctx);
 
 #if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
 
-void dsa_context_reset();
+// Adds the kv_pool hooks that map every GPU KV pool through GDRCopy once, at registration.
+void dsa_install_pool_hooks();
+// BAR address of a registered GPU KV pool base, or nullptr when IAXL_DSA_GD_ENABLE=0.
+void *dsa_gpu_bar_base(char *gpu_base);
 
 // Submits the copies asynchronously and updates `ticket` so dsa_wait_ticket() can later
 // wait for exactly the batches issued through this context.
-bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
+bool dsa_copy_chunks_batch(char *gpu_bar_base, int64_t chunk_stride, int64_t outer_dims,
                            int64_t inner_size, int64_t outer_block_size, bool is_h2d,
                            const std::vector<int64_t> &chunk_indices,
                            const std::vector<char *> &cpu_ptrs, uint64_t &ticket);

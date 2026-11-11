@@ -202,7 +202,6 @@ export IAXL_LD_PRELOAD=${IAXL_LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libtcmalloc_
 export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0} # Keep freed memory in tcmalloc instead of returning it to the OS
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------
-export IAXL_DSA_GD_RESET_ON_DESTROY=${IAXL_DSA_GD_RESET_ON_DESTROY:-0} # Large BAR with stable tensor VAs can keep this off for better performance (0/1)
 export IAXL_DSA_WQS=${IAXL_DSA_WQS:-wq0.0}                             # Comma/space separated DSA work-queue names
 
 # ---- Debug / profiling ------------------------------------------------------

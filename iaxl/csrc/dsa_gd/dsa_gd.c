@@ -172,6 +172,29 @@ int dsa_gd_register(gd_ctx *ctx, uint64_t dptr, size_t nbytes) {
     return mapping_for(ctx, dptr, nbytes) ? 0 : -1;
 }
 
+/* Releases the mapping that dsa_gd_register(ctx, dptr, nbytes) created; -1 if there is none. */
+int dsa_gd_unregister(gd_ctx *ctx, uint64_t dptr, size_t nbytes) {
+    uint64_t base = dptr & GD_GPU_PAGE_MASK;
+    size_t map_size = (dptr - base + nbytes + GD_GPU_PAGE_SIZE - 1) & GD_GPU_PAGE_MASK;
+    struct mapping *prev = NULL;
+    struct mapping *m = ctx->maps;
+
+    while (m && !(m->base == base && m->map_size == map_size)) {
+        prev = m;
+        m = m->next;
+    }
+    if (!m)
+        return -1;
+    if (prev)
+        prev->next = m->next;
+    else
+        ctx->maps = m->next;
+    gdr_unmap(ctx->g, m->mh, m->bar, m->map_size);
+    gdr_unpin_buffer(ctx->g, m->mh);
+    free(m);
+    return 0;
+}
+
 static int resolve(gd_ctx *ctx, uint64_t ptr, int is_cuda, size_t n, struct mapping **out_map,
                    uint64_t *cpu_addr) {
     if (is_cuda) {
@@ -297,6 +320,15 @@ int dsa_gd_default_register(uint64_t dptr, size_t nbytes) {
     pthread_mutex_lock(&g_default_mutex);
     ctx = default_ctx_locked();
     ret = ctx ? dsa_gd_register(ctx, dptr, nbytes) : -1;
+    pthread_mutex_unlock(&g_default_mutex);
+    return ret;
+}
+
+int dsa_gd_default_unregister(uint64_t dptr, size_t nbytes) {
+    int ret;
+
+    pthread_mutex_lock(&g_default_mutex);
+    ret = g_default ? dsa_gd_unregister(g_default, dptr, nbytes) : -1;
     pthread_mutex_unlock(&g_default_mutex);
     return ret;
 }
