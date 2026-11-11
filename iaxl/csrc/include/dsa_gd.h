@@ -25,6 +25,8 @@ void dsa_gd_reset(gd_ctx *ctx);
 
 int dsa_gd_register(gd_ctx *ctx, uint64_t dptr, size_t nbytes);
 
+int dsa_gd_unregister(gd_ctx *ctx, uint64_t dptr, size_t nbytes);
+
 int dsa_gd_copy(gd_ctx *ctx, uint64_t dst, int dst_cuda, uint64_t src, int src_cuda, size_t nbytes);
 
 int dsa_gd_dsa_copy(gd_ctx *ctx, uint64_t dst, int dst_cuda, uint64_t src, int src_cuda,
@@ -35,6 +37,7 @@ int dsa_gd_dsa_copy_batch(gd_ctx *ctx, const uint64_t *dst, const int *dst_cuda,
                           size_t count);
 
 int dsa_gd_default_register(uint64_t dptr, size_t nbytes);
+int dsa_gd_default_unregister(uint64_t dptr, size_t nbytes);
 int dsa_gd_default_copy(uint64_t dst, int dst_cuda, uint64_t src, int src_cuda, size_t nbytes);
 int dsa_gd_default_dsa_copy(uint64_t dst, int dst_cuda, uint64_t src, int src_cuda, size_t nbytes);
 int dsa_gd_default_dsa_copy_batch(const uint64_t *dst, const int *dst_cuda, const uint64_t *src,

@@ -138,6 +138,8 @@ struct XferContext {
     int64_t inner_size;
     int64_t outer_block_size;
 #if defined(DSA_SUPPORT)
+    // BAR address of gpu_base_ptr, mapped once when the KV pool was registered.
+    char *gpu_bar_base = nullptr;
     // Latest DSA ticket issued through this context. Each Context (i.e. each layer in flight)
     // waits for its own ticket instead of draining the whole engine, so the D2H submitter can
     // keep later layers queued while the compressor consumes an earlier one.
@@ -180,16 +182,15 @@ context_t context_create(char *gpu_base_ptr, int device_index, int64_t chunk_str
     x->outer_dims = outer_dims;
     x->inner_size = inner_size;
     x->outer_block_size = outer_block_size;
+#if defined(DSA_SUPPORT)
+    x->gpu_bar_base = static_cast<char *>(dsa_gpu_bar_base(gpu_base_ptr));
+#endif
     return x;
 }
 
 void context_destroy(context_t ctx) {
     if (!ctx)
         return;
-#if defined(DSA_SUPPORT)
-    if (envs.IAXL_DSA_GD_RESET_ON_DESTROY)
-        dsa_context_reset();
-#endif
     delete as_ctx(ctx);
 }
 
@@ -264,8 +265,8 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
     });
 #if defined(DSA_SUPPORT)
 
-    if (dsa_copy_chunks_batch(gpu_base_ptr, chunk_stride, outer_dims, inner_size, outer_block_size,
-                              h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
+    if (dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
+                              outer_block_size, h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
             fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");

@@ -5,8 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
+#include "kv_pool.h"
 #include "kv_xfer.h"
 #include "env.h"
 #include "iaxl_common.h"
@@ -21,23 +23,80 @@ extern "C" int dsa_memcpy_batch_wait(uint64_t ticket);
 
 namespace kv_xfer {
 
-// Serialises dsa_gd registration and batch submission. The wait path deliberately does not
-// take it: dsa_memcpy_batch_wait() is thread-safe on its own, and a waiter queued behind a
-// submitter that is blocked on a saturated WQ would lose the copy/compress overlap.
+using kv_pool::KVPool;
+using kv_pool::PoolDevice;
+
+// Serialises batch submission and the release of a KV pool mapping. The wait path deliberately
+// does not take it: dsa_memcpy_batch_wait() is thread-safe on its own, and a waiter queued
+// behind a submitter that is blocked on a saturated WQ would lose the copy/compress overlap.
 static std::mutex dsa_context_mutex;
 
-void dsa_context_reset() {
-    std::lock_guard<std::mutex> lock(dsa_context_mutex);
-    dsa_memcpy_batch_wait(UINT64_MAX); // drain every in-flight batch before tearing down
-    dsa_gd_default_reset();
+// One GDRCopy mapping per GPU KV pool base, made when the first pool on that base is registered
+// and released when the last one is unregistered (hybrid layers share a base). Mapping the whole
+// pool once keeps the pinned total at the KV cache size: pinning again up to the highest block of
+// every copy made gdrdrv hand out ever larger handles, and libgdrapi 2.5 keeps them in 32 bits,
+// so after 16 TiB of pins it unpinned the wrong, still used mapping.
+struct DsaRegion {
+    void *bar_base = nullptr;
+    int refs = 0;
+};
+static std::mutex dsa_region_mutex;
+static std::unordered_map<uintptr_t, DsaRegion> dsa_regions; // by KV pool base
+
+// kv_pool hooks: called with the registry lock held, so never call back into kv_pool here.
+static void dsa_on_register(const KVPool &p) {
+    if (!envs.IAXL_DSA_GD_ENABLE || p.device != PoolDevice::GPU)
+        return;
+    std::lock_guard<std::mutex> lock(dsa_region_mutex);
+    auto [it, inserted] = dsa_regions.try_emplace(p.base);
+    it->second.refs++;
+    if (!inserted)
+        return;
+    void *bar_base = nullptr;
+    const bool mapped = dsa_gd_default_register(p.base, p.total_bytes) == 0 &&
+                        dsa_gd_default_gpu_bar_addr(p.base, p.total_bytes, &bar_base) == 0;
+    if (!mapped)
+        fprintf(stderr,
+                "dsa: GDRCopy cannot map KV pool %s (%zu bytes); the GPU BAR1 may be smaller "
+                "than the KV cache. Set IAXL_DSA_GD_ENABLE=0 to copy with CUDA instead.\n",
+                p.name.c_str(), p.total_bytes);
+    IAXL_CHECK(mapped, "dsa: KV pool registration failed");
+    it->second.bar_base = bar_base;
 }
 
-bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_dims,
+static void dsa_on_unregister(const KVPool &p) {
+    if (!envs.IAXL_DSA_GD_ENABLE || p.device != PoolDevice::GPU)
+        return;
+    std::lock_guard<std::mutex> lock(dsa_region_mutex);
+    auto it = dsa_regions.find(p.base);
+    IAXL_CHECK(it != dsa_regions.end(), "dsa: GPU KV pool was not registered");
+    if (--it->second.refs > 0)
+        return;
+    // No DSA batch may still read or write the pool once its mapping is gone, and no new batch
+    // may be submitted while it goes away.
+    std::lock_guard<std::mutex> submit_lock(dsa_context_mutex);
+    dsa_memcpy_batch_wait(UINT64_MAX);
+    IAXL_CHECK(dsa_gd_default_unregister(p.base, p.total_bytes) == 0,
+               "dsa: KV pool mapping not found");
+    dsa_regions.erase(it);
+}
+
+void dsa_install_pool_hooks() { kv_pool::add_pool_hooks({dsa_on_register, dsa_on_unregister}); }
+
+void *dsa_gpu_bar_base(char *gpu_base) {
+    std::lock_guard<std::mutex> lock(dsa_region_mutex);
+    auto it = dsa_regions.find(reinterpret_cast<uintptr_t>(gpu_base));
+    if (it == dsa_regions.end())
+        return nullptr;
+    return it->second.bar_base;
+}
+
+bool dsa_copy_chunks_batch(char *gpu_bar_base, int64_t chunk_stride, int64_t outer_dims,
                            int64_t inner_size, int64_t outer_block_size, bool is_h2d,
                            const std::vector<int64_t> &chunk_indices,
                            const std::vector<char *> &cpu_ptrs, uint64_t &ticket) {
 
-    if (!envs.IAXL_DSA_GD_ENABLE)
+    if (gpu_bar_base == nullptr) // IAXL_DSA_GD_ENABLE=0: the KV pool has no BAR mapping
         return false;
 
     std::lock_guard<std::mutex> lock(dsa_context_mutex);
@@ -52,22 +111,6 @@ bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_d
     if (count == 0)
         return true;
 
-    size_t span = 0;
-    for (size_t i = 0; i < num_chunks; ++i) {
-        const size_t end = static_cast<size_t>(chunk_indices[i]) * chunk_stride +
-                           static_cast<size_t>(outer_dims - 1) * outer_block_size +
-                           static_cast<size_t>(inner_size);
-        if (end > span)
-            span = end;
-    }
-    if (dsa_gd_default_register(reinterpret_cast<uint64_t>(gpu_base), span) != 0)
-        return false;
-
-    void *gpu_bar_base = nullptr;
-    if (dsa_gd_default_gpu_bar_addr(reinterpret_cast<uint64_t>(gpu_base),
-                                    static_cast<size_t>(inner_size), &gpu_bar_base) != 0)
-        return false;
-
     std::vector<void *> dest(count), src(count);
     std::vector<size_t> nbytes(count);
 
@@ -76,8 +119,7 @@ bool dsa_copy_chunks_batch(char *gpu_base, int64_t chunk_stride, int64_t outer_d
         const int64_t gpu_chunk_off = chunk_indices[i] * chunk_stride;
         char *cpu_chunk = cpu_ptrs[i];
         for (int64_t o = 0; o < outer_dims; ++o) {
-            char *gpu_bar =
-                static_cast<char *>(gpu_bar_base) + gpu_chunk_off + o * outer_block_size;
+            char *gpu_bar = gpu_bar_base + gpu_chunk_off + o * outer_block_size;
             char *cpu_ptr = cpu_chunk + o * inner_size;
             if (is_h2d) {
                 dest[k] = gpu_bar;

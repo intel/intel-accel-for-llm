@@ -71,7 +71,6 @@ struct Envs {
     int IAXL_CACHE_CACHEGROUP_NUM;
 
     bool IAXL_DSA_GD_ENABLE;
-    bool IAXL_DSA_GD_RESET_ON_DESTROY;
     const char *(*IAXL_DSA_WQS)(void);
 
     bool IAXL_DEBUG_LOG;

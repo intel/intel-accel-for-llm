@@ -160,7 +160,7 @@ void rdma_init(const std::string &name, int listen_port) {
     nixlBackendH *ucx = nullptr;
     NIXL_CHECK(r.agent_->createBackend("UCX", params, ucx));
     r.opt.backends.push_back(ucx);
-    kv_pool::set_pool_hooks({on_register, on_unregister});
+    kv_pool::add_pool_hooks({on_register, on_unregister});
     fprintf(stderr, "[kv_xfer/rdma] agent %s listening on port %d\n", name.c_str(), listen_port);
 }
 
