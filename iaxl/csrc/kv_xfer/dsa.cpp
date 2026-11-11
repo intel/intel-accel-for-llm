@@ -26,16 +26,10 @@ namespace kv_xfer {
 using kv_pool::KVPool;
 using kv_pool::PoolDevice;
 
-// Serialises batch submission and the release of a KV pool mapping. The wait path deliberately
-// does not take it: dsa_memcpy_batch_wait() is thread-safe on its own, and a waiter queued
-// behind a submitter that is blocked on a saturated WQ would lose the copy/compress overlap.
+// Serialises batch submission and mapping release; dsa_memcpy_batch_wait() needs no lock.
 static std::mutex dsa_context_mutex;
 
-// One GDRCopy mapping per GPU KV pool base, made when the first pool on that base is registered
-// and released when the last one is unregistered (hybrid layers share a base). Mapping the whole
-// pool once keeps the pinned total at the KV cache size: pinning again up to the highest block of
-// every copy made gdrdrv hand out ever larger handles, and libgdrapi 2.5 keeps them in 32 bits,
-// so after 16 TiB of pins it unpinned the wrong, still used mapping.
+// One GDRCopy mapping per KV pool base: re-pinning on every copy overflowed libgdrapi's handles.
 struct DsaRegion {
     void *bar_base = nullptr;
     int refs = 0;
@@ -72,8 +66,7 @@ static void dsa_on_unregister(const KVPool &p) {
     IAXL_CHECK(it != dsa_regions.end(), "dsa: GPU KV pool was not registered");
     if (--it->second.refs > 0)
         return;
-    // No DSA batch may still read or write the pool once its mapping is gone, and no new batch
-    // may be submitted while it goes away.
+    // Wait for in-flight DSA batches before the mapping goes away.
     std::lock_guard<std::mutex> submit_lock(dsa_context_mutex);
     dsa_memcpy_batch_wait(UINT64_MAX);
     IAXL_CHECK(dsa_gd_default_unregister(p.base, p.total_bytes) == 0,

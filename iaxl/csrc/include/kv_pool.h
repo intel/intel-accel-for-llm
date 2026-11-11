@@ -90,8 +90,7 @@ const KVPool *find_kv_pool(std::string_view name);  // nullptr if not registered
 const KVPool *find_kv_pool_by_base(uintptr_t base);
 void unregister_kv_pool(std::string_view name);
 
-// Transport backend callbacks, called for every pool with the registry lock held. Each backend
-// adds its own pair: rdma_init() the NIXL one, the DSA backend (CUDA builds) the GDRCopy one.
+// Transport backend callbacks (RDMA, DSA), called with the registry lock held.
 struct PoolHooks {
     void (*on_register)(const KVPool &) = nullptr;
     void (*on_unregister)(const KVPool &) = nullptr;

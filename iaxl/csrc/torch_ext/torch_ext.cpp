@@ -15,8 +15,7 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
-    // Python cannot register a KV pool before importing this module, so the DSA hooks see
-    // every GPU KV pool.
+    // Before any KV pool is registered, so the DSA hooks see every GPU KV pool.
     kv_xfer::dsa_install_pool_hooks();
 #endif
 
