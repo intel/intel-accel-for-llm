@@ -57,6 +57,7 @@ export IAXL_QAT_ZIP_ENABLE=${IAXL_QAT_ZIP_ENABLE:-1} # Enable QAT compression wo
 export IAXL_IAA_ZIP_ENABLE=${IAXL_IAA_ZIP_ENABLE:-0} # Enable IAA (QPL) compression workers (0/1)
 export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-0} # Enable CPU compression workers (0/1); costs a lot of CPU, keep off unless needed
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
+export IAXL_KV_LOSSY_ENABLE=${IAXL_KV_LOSSY_ENABLE:-0} # Lossy KV codec before compression (0/1); needs _lib/libiaxl_kv_lossy.so
 
 # ---- Async KV load ----------------------------------------------------------
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=${KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED:-1}      # Enable asynchronous KV loading (0/1)
@@ -100,6 +101,7 @@ printf '%s\n' \
     "  TP_SIZE=$TP_SIZE" \
     "  DP_SIZE=$DP_SIZE" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
+    "  IAXL_KV_LOSSY_ENABLE=$IAXL_KV_LOSSY_ENABLE" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
     "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
     "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
@@ -199,6 +201,11 @@ validate_omp_config "$MIN_RANK_CPU_COUNT" || return 1 2>/dev/null || exit 1
 # Prepended to LD_PRELOAD by the example and benchmark scripts. The vLLM CPU image ships libiomp5 in
 # its venv instead: IAXL_LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/opt/venv/lib/libiomp5.so
 export IAXL_LD_PRELOAD=${IAXL_LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/usr/local/lib/libiomp5.so}
+# The lossy codec overrides torch_ext's weak stubs, so it must be preloaded (same path on the host and in the container).
+if env_truthy "$IAXL_KV_LOSSY_ENABLE"; then
+    [[ -e "$TOP_DIR/_lib/libiaxl_kv_lossy.so" ]] || { echo "IAXL_KV_LOSSY_ENABLE=1 but $TOP_DIR/_lib/libiaxl_kv_lossy.so is missing" >&2; return 1 2>/dev/null || exit 1; }
+    export IAXL_LD_PRELOAD="$IAXL_LD_PRELOAD:$TOP_DIR/_lib/libiaxl_kv_lossy.so"
+fi
 export TCMALLOC_RELEASE_RATE=${TCMALLOC_RELEASE_RATE:-0} # Keep freed memory in tcmalloc instead of returning it to the OS
 
 # ---- Intel DSA (host<->device copy accelerator, CUDA only) ------------------

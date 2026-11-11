@@ -74,6 +74,7 @@ Common settings in `setvars.sh`. Other variables in `setvars.sh` are advanced se
 | Compression | `IAXL_ZIP_LEVEL` | `1` | Compression level for all zip backends, from `1` (fastest) to `9` (best ratio). QAT and CPU use the level as is. IAA hardware only supports level 1, so IAA ignores this setting. Keep the default `1`: higher levels barely improve the KV cache compression ratio but make compression much slower |
 | Compression | `IAXL_KV_DATA_SHUFFLE` | `1` | Byte-shuffle BF16 data before compression (`0`/`1`). Slightly lowers compression throughput, but improves the compression ratio and decompression throughput |
 | Compression | `IAXL_ZIP_EXPONENT_ONLY` | `IAXL_KV_DATA_SHUFFLE` | With shuffle on, compress only the BF16 high bytes (sign and exponent) and store the low bytes raw (`0`/`1`). Improves the compression ratio and both throughputs; `IAXL_KV_LOSSY_TRUNC` then barely helps the ratio |
+| Compression | `IAXL_KV_LOSSY_ENABLE` | `0` | Lossy KV codec applied before compression (`0`/`1`). The codec is a separately distributed library, `_lib/libiaxl_kv_lossy.so`; `setvars.sh` adds it to `IAXL_LD_PRELOAD` and fails if it is missing. Requires BF16 KV caches |
 | vLLM | `MODEL` | `Qwen/Qwen3-32B` | Hugging Face model ID or local model path |
 | vLLM | `TP_SIZE` | `2` | Required; number of Tensor Parallel workers. CPU, QAT, and DSA resources are configured based on this value |
 | vLLM | `DP_SIZE` | `1` | Number of Data Parallel groups; total ranks = `TP_SIZE × DP_SIZE` |

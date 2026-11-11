@@ -116,7 +116,8 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
     call("warmup")
     put_times = call("put")
     get_times = call("get")
-    verified = call("verify")
+    verifications = call("verify")
+    verified = [ok for ok, _ in verifications]
     statuses = call("status")
     metrics = call("metrics")
 
@@ -151,10 +152,16 @@ def schedule(kb, tp_size: int, conns: list) -> bool:
     )
 
     status, total = aggregate(statuses, metrics)
+    lines = [line for _, line in verifications]
+    verification = (
+        lines[0]
+        if len(set(lines)) == 1
+        else "\n".join(f"rank{rank}: {line}" for rank, line in enumerate(lines))
+    )
     kb.print_report(
         max(put_times),
         max(get_times),
-        all(verified),
+        verification,
         status,
         total,
         total_blocks * tp_size,

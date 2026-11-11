@@ -4,6 +4,7 @@
 #include "lossy.h"
 
 #include "env.h"
+#include "iaxl_common.h"
 
 namespace kv_zip {
 
@@ -18,6 +19,22 @@ uint16_t lossy_mask(int element_size) {
         return static_cast<uint16_t>(byte << 8 | byte);
     }
     return 0xFFFF;
+}
+
+// "No codec loaded" stubs; a preloaded codec library overrides them (see lossy.h).
+#define IAXL_LOSSY_STUB __attribute__((weak)) IAXL_LOSSY_API
+
+#define IAXL_LOSSY_STUB_MSG                                                                        \
+    "IAXL_KV_LOSSY_ENABLE is set but no lossy codec is loaded; "                                  \
+    "LD_PRELOAD _lib/libiaxl_kv_lossy.so"
+
+IAXL_LOSSY_STUB size_t lossy_serialize(const at::Tensor &, void *, size_t) {
+    IAXL_CHECK(false, IAXL_LOSSY_STUB_MSG);
+    return 0;
+}
+
+IAXL_LOSSY_STUB void lossy_deserialize(const void *, size_t, const at::Tensor &) {
+    IAXL_CHECK(false, IAXL_LOSSY_STUB_MSG);
 }
 
 } // namespace kv_zip
