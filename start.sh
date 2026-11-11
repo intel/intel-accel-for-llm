@@ -2,6 +2,7 @@
 # NVIDIA_RUNTIME=none ./start.sh  -> skip nvidia docker runtime/gpus args (e.g. on a storage-only node)
 # ./start.sh --rebuild            -> rebuild the dev image even if it already exists
 # DEVICE=cpu ./start.sh           -> vLLM CPU inference; also set the CPU base image (see doc/usage/vllm-cpu-inference.en.md)
+# IAXL_RECIPE=<name> ./start.sh   -> apply the overrides in examples/recipes/<name> (see doc/design/recipes.md)
 REBUILD=0
 for arg in "$@"; do
     case "$arg" in
@@ -21,16 +22,9 @@ if [[ $REBUILD == 1 ]] || ! docker image inspect "$IAXL_DEV_DOCKER_IMAGE" >/dev/
         --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy
 fi
 
+# All docker run flags come from DOCKER_RUN_ARGS in setvars.sh (a recipe's setvars.post.sh can edit them).
 docker run \
     "${DOCKER_RUN_ARGS[@]}" \
-    --rm \
-    --privileged \
-    --pid host \
-    --net host \
-    -it \
-    --name "$CONTAINER_NAME" \
-    -v /dev:/dev \
-    --entrypoint "" \
     "$IAXL_DEV_DOCKER_IMAGE" \
     bash -c '
         for gid in $(id -G); do
