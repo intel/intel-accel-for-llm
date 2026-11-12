@@ -358,8 +358,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return block_hash.hex()
 
     @staticmethod
-    def _current_block_ids(scheduler_output: SchedulerOutput, req_id: str):
-        return scheduler_output.kv_connector_block_state.get_block_ids(req_id)
+    def _current_block_ids(
+        scheduler_output: SchedulerOutput, req_id: str
+    ) -> list[list[int]]:
+        # The scheduler's own block table, copied so later CoW moves cannot
+        # change the snapshot this step saves from.
+        return [
+            list(ids)
+            for ids in scheduler_output.kv_connector_block_state.get_block_ids(req_id)
+        ]
 
     @staticmethod
     def _boundary_offloads(scheduler_output: SchedulerOutput, req_id: str):
@@ -568,10 +575,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for request in scheduler_output.scheduled_new_reqs:
             state = self._req_states[request.req_id]
-            state.block_ids = [
-                list(ids)
-                for ids in self._current_block_ids(scheduler_output, request.req_id)
-            ]
+            state.block_ids = self._current_block_ids(scheduler_output, request.req_id)
             self._add_request_to_save(
                 request.req_id,
                 request.num_computed_tokens,
@@ -585,10 +589,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 raise RuntimeError("Resuming from preemption is not supported")
 
             state = self._req_states[req_id]
-            state.block_ids = [
-                list(ids)
-                for ids in self._current_block_ids(scheduler_output, req_id)
-            ]
+            state.block_ids = self._current_block_ids(scheduler_output, req_id)
             self._add_request_to_save(
                 req_id,
                 cached_reqs.num_computed_tokens[index],
