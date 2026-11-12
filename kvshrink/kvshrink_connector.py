@@ -20,7 +20,7 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -341,8 +341,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.kvstore
 
     @staticmethod
-    def _hash_key(block_hash: bytes) -> str:
-        # vLLM BlockHash is bytes; IAFL's KV pool rejects path separators.
+    def _store_key(block_hash: BlockHash) -> str:
+        # vLLM's BlockHash is the raw digest, not hex. IAFL keys are
+        # "label:chunk_id" and are split on ':', so a raw digest (which may
+        # contain ':') cannot be used as the id.
         return block_hash.hex()
 
     @staticmethod
@@ -372,7 +374,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # vLLM always computes the last prompt token, so it is never loaded.
         num_blocks = (request.num_tokens - 1) // self.block_size
         block_hashes = [
-            self._hash_key(block_hash)
+            self._store_key(block_hash)
             for block_hash in request.block_hashes[:num_blocks]
         ]
         state = ReqState(
