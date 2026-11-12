@@ -507,11 +507,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for gid, block_id, tokens in boundary_offloads:
             boundaries.setdefault(gid, []).append((block_id, tokens))
 
-        exists_by_group = [
-            state.mamba_existence_cache if is_mamba else state.existence_cache
-            for is_mamba, _ in self.groups
-        ]
-
         all_ids: list[list[int]] = []
         for group_id, (is_mamba, _) in enumerate(self.groups):
             if not self.group_enabled[group_id]:
@@ -519,7 +514,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
 
             blocks = [0] * len(state.block_hashes)
-            exists = exists_by_group[group_id]
+            exists = (
+                state.mamba_existence_cache
+                if is_mamba
+                else state.existence_cache
+            )
             if is_mamba:
                 # boundary_offloads carries the exact GPU block id of every
                 # committed boundary; the request still owns it in this step,
@@ -539,15 +538,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if block_id and start <= index < end and not exists[index]:
                     blocks[index] = block_id
             all_ids.append(blocks)
-
-        # Mark availability after every group, so groups sharing the attention
-        # or mamba label do not hide blocks from each other in this step.
-        for group_id, blocks in enumerate(all_ids):
-            if not self.group_enabled[group_id]:
-                continue
-            for index, block_id in enumerate(blocks):
-                if block_id:
-                    exists_by_group[group_id][index] = True
 
         if any(any(ids) for ids in all_ids):
             self._reqs_to_save.add_request(
