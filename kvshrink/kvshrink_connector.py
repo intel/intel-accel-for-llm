@@ -503,6 +503,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         end = min(num_tokens // self.block_size, len(state.block_hashes))
         if end <= start:
             return
+        boundaries: dict[int, list[tuple[int, int]]] = {}
+        for gid, block_id, tokens in boundary_offloads:
+            boundaries.setdefault(gid, []).append((block_id, tokens))
+
         exists_by_group = [
             state.mamba_existence_cache if is_mamba else state.existence_cache
             for is_mamba, _ in self.groups
@@ -522,8 +526,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 # so the id is stable and no hash re-check is needed.
                 candidates = (
                     (tokens // self.block_size - 1, block_id)
-                    for gid, block_id, tokens in boundary_offloads
-                    if gid == group_id and tokens % self.block_size == 0
+                    for block_id, tokens in boundaries.get(group_id, ())
+                    if tokens % self.block_size == 0
                 )
             else:
                 ids = state.block_ids[group_id]
