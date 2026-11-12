@@ -100,8 +100,10 @@ struct PoolHooks {
 void add_pool_hooks(const PoolHooks &hooks);
 
 // ---- torch side (pool.cpp) ----
-// cpu/gpu: validates contiguity and device, records pinned, keeps `t` alive until unregistered.
-const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0);
+// cpu/gpu: validates device and geometry, records pinned, keeps `t` alive until unregistered.
+// A zero `chunk_stride` means a contiguous tensor; a non-zero one addresses packed blocks.
+const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0,
+                                   int64_t chunk_stride = 0);
 const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim,
                                    int64_t chunk_stride = 0);
 const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,

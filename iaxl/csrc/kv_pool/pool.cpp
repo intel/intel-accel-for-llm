@@ -194,9 +194,10 @@ KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_
     return p;
 }
 
-const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim) {
+const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim,
+                                   int64_t chunk_stride) {
     IAXL_CHECK(t.is_cpu(), "register_kv_pool_cpu: tensor is not on the CPU");
-    KVPool p = kv_pool_from_tensor(t, PoolDevice::CPU, chunk_dim);
+    KVPool p = kv_pool_from_tensor(t, PoolDevice::CPU, chunk_dim, chunk_stride);
     p.name = std::move(name);
     return register_with_tensor(std::move(p), &t);
 }

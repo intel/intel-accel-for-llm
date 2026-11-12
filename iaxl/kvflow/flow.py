@@ -171,15 +171,15 @@ class KVFlow:
         for name, t in kv_caches.items():
             if isinstance(t, RemoteTensor):
                 continue
+            # Packed layouts give each layer a page view whose outer stride
+            # may be larger than the page itself. Outer-dimension layouts
+            # (block_dim > 0) keep the contiguous-segment contract.
+            chunk_stride = (
+                t.stride(block_dim) * t.element_size() if block_dim == 0 else 0
+            )
             if t.is_cpu:
-                _iqt.register_kv_pool_cpu(name, t, block_dim)
+                _iqt.register_kv_pool_cpu(name, t, block_dim, chunk_stride)
             else:
-                # Packed layouts give each layer a page view whose outer stride
-                # may be larger than the page itself. Outer-dimension layouts
-                # (block_dim > 0) keep the contiguous-segment contract.
-                chunk_stride = (
-                    t.stride(block_dim) * t.element_size() if block_dim == 0 else 0
-                )
                 _iqt.register_kv_pool_gpu(name, t, block_dim, chunk_stride)
             self._registered.append(name)
         if not self._in_place:
