@@ -320,6 +320,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             len(existence_cache),
         )
         if self.has_mamba:
+            attention_matched_blocks = matched_blocks
             # A hit must end at a block whose mamba state was saved.
             state.mamba_existence_cache = self._store().has(
                 block_hashes, label="mamba", truncate=False
@@ -329,6 +330,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 and not state.mamba_existence_cache[matched_blocks - 1]
             ):
                 matched_blocks -= 1
+            # Stop the chunk at the end of the stored attention KV to save its mamba state.
+            if attention_matched_blocks > matched_blocks:
+                request.shared_prefix_boundary = (
+                    attention_matched_blocks * self.block_size
+                )
         matched_tokens = matched_blocks * self.block_size
         num_new_tokens = max(0, matched_tokens - num_computed_tokens)
 
@@ -356,7 +362,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             f"externally-cached tokens: {num_new_tokens}, "
             f"locally-cached tokens: {num_computed_tokens}, async={use_async}, "
             f"selected_load_layers={selected_layers}, "
-            f"async_load_layers={state.async_load_layers}"
+            f"async_load_layers={state.async_load_layers}, "
+            f"shared_prefix_boundary={request.shared_prefix_boundary}"
         )
         return num_new_tokens, use_async
 
