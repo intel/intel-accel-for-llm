@@ -203,7 +203,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 layer_spec = specs.get(layer_name, spec) if specs else spec
                 if is_mamba or getattr(layer_spec, "tokens_per_state", 1) > 1:
                     self._hookless_layers.add(layer_name)
-        self.num_hookless_layers = 0
         logger.info(
             "KVShrinkConnector(%s): block_size=%d, hash_block_size=%d, "
             "has_mamba=%s, mamba_cache_mode=%r, prefix caching=%s, "
@@ -224,6 +223,13 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
+        )
+        # The scheduler never registers caches, so it needs the count from the
+        # config alone. The worker recomputes it from what it registers.
+        self.num_hookless_layers = sum(
+            1
+            for layer_name in self._hookless_layers
+            if extract_layer_index(layer_name) < self.num_layers
         )
         self.vllm_device = vllm_config.device_config.device_type
         parallel_config = vllm_config.parallel_config
