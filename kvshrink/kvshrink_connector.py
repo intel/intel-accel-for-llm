@@ -465,8 +465,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids = blocks.get_block_ids()
         load_start = state.num_computed_tokens // self.block_size
         load_end = load_start + num_external_tokens // self.block_size
-        if load_end > len(state.block_hashes):
-            raise ValueError("External hit exceeds the resolved hash list")
+        assert load_end <= len(state.block_hashes)
 
         all_ids: list[list[int]] = []
         for group_id, (is_mamba, _) in enumerate(self.groups):
@@ -474,8 +473,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 all_ids.append([])
                 continue
             ids = list(block_ids[group_id])
-            if load_end > len(ids):
-                raise ValueError("External hit exceeds a group's block table")
             if is_mamba:
                 # Only the boundary slot carries a saved state.
                 all_ids.append(
