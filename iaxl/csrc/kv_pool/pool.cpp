@@ -18,12 +18,6 @@ void KVPool::check_indices(const std::vector<int64_t> &idx) const {
         IAXL_CHECK(i >= 0 && i < num_blocks, "block index out of range");
 }
 
-void KVPool::check_same_block_geometry(const KVPool &other) const {
-    IAXL_CHECK(block_bytes == other.block_bytes && elem_size == other.elem_size &&
-                   dtype == other.dtype,
-               "pools have different block geometry");
-}
-
 void KVPool::check_staging_geometry(const KVPool &staging) const {
     IAXL_CHECK(staging.block_bytes >= block_bytes && elem_size == staging.elem_size &&
                    dtype == staging.dtype,
@@ -212,8 +206,9 @@ const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int
 
 const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,
                                       const std::vector<int64_t> &shape, int64_t elem_size,
-                                      int32_t dtype, int dev_id, int chunk_dim) {
-    KVPool p = make_kv_pool(base, PoolDevice::Remote, dev_id, shape, elem_size, dtype, chunk_dim);
+                                      int32_t dtype, int dev_id, int chunk_dim, int64_t chunk_stride) {
+    KVPool p = make_kv_pool(base, PoolDevice::Remote, dev_id, shape, elem_size, dtype, chunk_dim,
+                            chunk_stride);
     p.name = std::move(name);
     p.peer = peer;
     return register_kv_pool(std::move(p));

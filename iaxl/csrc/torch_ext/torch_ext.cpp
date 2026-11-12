@@ -57,12 +57,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "register_kv_pool_remote",
         [](std::string name, const std::string &peer, uintptr_t base, const std::vector<int64_t> &shape,
-           int64_t elem_size, at::ScalarType dtype, int dev_id, int chunk_dim) -> const kv_pool::KVPool & {
+           int64_t elem_size, at::ScalarType dtype, int dev_id, int chunk_dim,
+           int64_t chunk_stride) -> const kv_pool::KVPool & {
             return kv_pool::register_kv_pool_remote(std::move(name), peer, base, shape, elem_size,
-                                                    static_cast<int32_t>(dtype), dev_id, chunk_dim);
+                                                    static_cast<int32_t>(dtype), dev_id, chunk_dim,
+                                                    chunk_stride);
         },
         py::arg("name"), py::arg("peer"), py::arg("base"), py::arg("shape"), py::arg("elem_size"),
-        py::arg("dtype"), py::arg("dev_id"), py::arg("chunk_dim"), py::return_value_policy::reference);
+        py::arg("dtype"), py::arg("dev_id"), py::arg("chunk_dim"), py::arg("chunk_stride") = 0,
+        py::return_value_policy::reference);
     m.def("unregister_kv_pool", &kv_pool::unregister_kv_pool, py::arg("name"));
     m.def("get_kv_pool", &kv_pool::get_kv_pool, py::arg("name"), py::return_value_policy::reference);
     m.def("find_kv_pool", &kv_pool::find_kv_pool, py::arg("name"), py::return_value_policy::reference);

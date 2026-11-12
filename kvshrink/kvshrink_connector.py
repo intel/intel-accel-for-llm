@@ -697,12 +697,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             page = spec_by_layer[layer_name].page_size_bytes
             assert offset % itemsize == 0 and stride % itemsize == 0
             assert page % itemsize == 0 and page <= stride
-            if iaxl_envs.IAXL_RDMA_ENABLE and stride != page:
-                raise ValueError(
-                    "KVShrink remote pool does not support packed block strides; "
-                    f"layer {layer_name} has stride={stride}, page={page}. "
-                    "Use the local KVStore path or disable RDMA."
-                )
             views[layer_name] = torch.tensor(
                 [], dtype=attn_dtype, device=ref.device
             ).set_(

@@ -45,12 +45,9 @@ class Context {
         IAXL_CHECK(ctx.cpu_pool_->device == PoolDevice::CPU, "cpu_pool is not in CPU memory");
 
         const kv_pool::KVPool &p = *ctx.pool_;
-        if (p.device == PoolDevice::Remote) {
-            ctx.pool_->check_same_block_geometry(*ctx.cpu_pool_);
-        } else {
-            // Mixed page sizes share one max-page scratch pool.
-            ctx.pool_->check_staging_geometry(*ctx.cpu_pool_);
-        }
+        // Mixed page sizes share one max-page staging pool, remote pools included:
+        // the staging block only has to cover the block being transferred.
+        ctx.pool_->check_staging_geometry(*ctx.cpu_pool_);
         if (p.device == PoolDevice::Remote) {
 #ifdef CPU_SUPPORT
             TORCH_CHECK(false, "RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link");

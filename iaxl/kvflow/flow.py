@@ -183,10 +183,12 @@ class KVFlow:
                 _iqt.register_kv_pool_gpu(name, t, block_dim, chunk_stride)
             self._registered.append(name)
         if not self._in_place:
-            local = [t for t in kv_caches.values() if not isinstance(t, RemoteTensor)]
-            if local:
+            # Remote layers count too: the daemon stages their blocks through this
+            # pool even though it never registers them locally.
+            layers = list(kv_caches.values())
+            if layers:
                 largest = max(
-                    local,
+                    layers,
                     key=lambda t: math.prod(
                         s for d, s in enumerate(t.shape) if d != block_dim
                     )

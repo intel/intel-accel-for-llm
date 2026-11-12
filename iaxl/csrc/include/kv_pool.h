@@ -70,7 +70,6 @@ struct KVPool {
 
     // Entry-point checks (caller thread), done once per call.
     void check_indices(const std::vector<int64_t> &idx) const;
-    void check_same_block_geometry(const KVPool &other) const;
     // A staging pool may be larger than the KV block (max-page scratch); the
     // transfer/codec paths only touch `block_bytes` of it.
     void check_staging_geometry(const KVPool &other) const;
@@ -108,7 +107,8 @@ const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int
                                    int64_t chunk_stride = 0);
 const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,
                                       const std::vector<int64_t> &shape, int64_t elem_size,
-                                      int32_t dtype, int dev_id, int chunk_dim);
+                                      int32_t dtype, int dev_id, int chunk_dim,
+                                      int64_t chunk_stride = 0);
 
 // Block idx as a view of `t` (the tensor the pool was registered with).
 torch::Tensor block_tensor(const torch::Tensor &t, const KVPool &pool, int64_t idx);
