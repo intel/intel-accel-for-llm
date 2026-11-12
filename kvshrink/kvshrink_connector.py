@@ -472,14 +472,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if not self.group_enabled[group_id]:
                 all_ids.append([])
                 continue
-            ids = list(block_ids[group_id])
+            group_ids = list(block_ids[group_id])[load_start:load_end]
             if is_mamba:
-                # Only the boundary slot carries a saved state.
-                all_ids.append(
-                    [0] * (load_end - load_start - 1) + [ids[load_end - 1]]
-                )
-            else:
-                all_ids.append(ids[load_start:load_end])
+                # Only the boundary slot carries a saved state; 0 means "not
+                # transferred" and keeps the list aligned with block_hashes.
+                group_ids[:-1] = [0] * (len(group_ids) - 1)
+            all_ids.append(group_ids)
 
         self._reqs_to_load.add_request(
             request.request_id,
