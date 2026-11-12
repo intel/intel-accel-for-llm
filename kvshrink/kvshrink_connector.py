@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 ReqId = str
 
 # OMP-Main TaskQueue levels: P0 loads a forward waits on, P1 first N layers, P2 remaining layers.
+# KVStore namespaces: attention groups share one, mamba groups another. Layer
+# completeness inside a label is a separate fix.
+ATTN_LABEL = "attn"
+MAMBA_LABEL = "mamba"
+
 LOAD_PRIORITY_P0 = 0
 LOAD_PRIORITY_P1 = 1
 LOAD_PRIORITY_P2 = 2
@@ -148,6 +153,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self.group_enabled.append(
                 bool(group.enable_kv_transfer and group.kv_cache_spec.prefix_cacheable)
             )
+        self.group_labels = [
+            MAMBA_LABEL if is_mamba else ATTN_LABEL for is_mamba, _ in self.groups
+        ]
         self.has_mamba = any(
             is_mamba and self.group_enabled[group_id]
             for group_id, (is_mamba, _) in enumerate(self.groups)
@@ -333,12 +341,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return self.kvstore
 
     @staticmethod
-    def _label(is_mamba: bool) -> str:
-        # Two labels only: all attention groups share "attn", all mamba groups
-        # share "mamba". Layer completeness inside a label is a separate fix.
-        return "mamba" if is_mamba else "attn"
-
-    @staticmethod
     def _hash_key(block_hash: bytes) -> str:
         # vLLM BlockHash is bytes; IAFL's KV pool rejects path separators.
         return block_hash.hex()
@@ -400,7 +402,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         ]
         if attention_groups:
             state.existence_cache = self._store().has(
-                block_hashes, label=self._label(False)
+                block_hashes, label=ATTN_LABEL
             )
             while (
                 matched_blocks > 0
@@ -411,7 +413,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             state.existence_cache = [True] * len(block_hashes)
         if mamba_groups:
             state.mamba_existence_cache = self._store().has(
-                block_hashes, label=self._label(True), truncate=False
+                block_hashes, label=MAMBA_LABEL, truncate=False
             )
             while (
                 matched_blocks > 0
@@ -830,7 +832,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 block_indices=block_ids,
                 block_hashs=block_hashes,
                 layer_names=self.groups[group_id][1],
-                label=self._label(self.groups[group_id][0]),
+                label=self.group_labels[group_id],
             )
             if self._current_get_tasks is None:
                 self._current_get_tasks = {}
@@ -890,7 +892,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     block_hashs=block_hashes,
                     layer_names=layer_names,
                     description=req_id,
-                    label=self._label(is_mamba),
+                    label=self.group_labels[group_id],
                     priorities=priorities,
                     bundle_id=load_bundle_id,
                 ))
@@ -964,7 +966,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     block_indices=block_ids,
                     block_hashs=block_hashes,
                     layer_names=layer_names,
-                    label=self._label(is_mamba),
+                    label=self.group_labels[group_id],
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
                 if is_mamba:
