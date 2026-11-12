@@ -853,8 +853,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
             return
-        if layer_name not in self._layer_key:
-            return
 
         layer_keys = [self._layer_key[layer_name]]
         # Wait for the synchronous (batched) loads for this layer.
