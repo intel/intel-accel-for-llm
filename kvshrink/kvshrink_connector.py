@@ -28,7 +28,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
-    iter_layer_specs,
 )
 
 if TYPE_CHECKING:
@@ -190,16 +189,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self.block_size = scheduler_block_size
         self.hash_block_size = hash_block_size
-        self._wait_all_loads = any(
-            any(
-                getattr(spec, "tokens_per_state", 1) > 1
-                for spec in iter_layer_specs(
-                    kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-                )
+        # Mamba state and indexer caches have no per-layer load hook, so
+        # they must be registered first and covered by the early-start window.
+        self._hookless_layers: set[str] = set()
+        for group_id, (is_mamba, names) in enumerate(self.groups):
+            if not self.group_enabled[group_id]:
+                continue
+            spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+            specs = (
+                spec.kv_cache_specs if isinstance(spec, UniformTypeKVCacheSpecs) else None
             )
-            for group_id in range(len(self.groups))
-            if self.group_enabled[group_id]
-        )
+            for layer_name in names:
+                layer_spec = specs.get(layer_name, spec) if specs else spec
+                if is_mamba or getattr(layer_spec, "tokens_per_state", 1) > 1:
+                    self._hookless_layers.add(layer_name)
+        self.num_hookless_layers = 0
         logger.info(
             "KVShrinkConnector(%s): block_size=%d, hash_block_size=%d, "
             "has_mamba=%s, mamba_cache_mode=%r, prefix caching=%s, "
@@ -414,16 +418,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
-        # Mamba layers lead the worker's layer order and have no layer-load
-        # hook, so the early-start window must cover them. -1 keeps its
-        # meaning (wait for every layer); 0 asks for a synchronous load, which
-        # hybrid cannot do, so it becomes that window as well.
-        if self.has_mamba and selected_layers >= 0:
-            selected_layers += self.num_mamba_layers
-        if self._wait_all_loads:
-            # Indexer side caches have no per-layer hook; require every layer
-            # to finish before get_finished() releases the request.
-            selected_layers = -1
+        # -1 keeps its meaning (wait for every layer); 0 asks for a synchronous
+        # load, which hybrid cannot do, so it becomes that window as well.
+        # The window is a prefix of the worker's layer order, which starts with
+        # the hookless layers (mamba state, indexer caches).
+        if selected_layers >= 0 and self.num_hookless_layers:
+            selected_layers += self.num_hookless_layers
         # A dynamic-map layer value of 0 selects synchronous loading. It is not
         # an async request that resumes before layer 0.
         use_async = num_new_tokens > 0 and selected_layers != 0
@@ -702,15 +702,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if self.group_enabled[group_id]
             for ln in names
         }
-        mamba_layers = {
-            ln
-            for group_id, (is_mamba, names) in enumerate(self.groups)
-            if is_mamba and self.group_enabled[group_id]
-            for ln in names
-        }
         kv_caches = {
             ln: kv_caches[ln]
-            for ln in sorted(kv_caches, key=lambda ln: ln not in mamba_layers)
+            for ln in sorted(kv_caches, key=lambda ln: ln not in self._hookless_layers)
             if ln in enabled_layers and extract_layer_index(ln) < self.num_layers
         }
 
@@ -744,6 +738,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             len(names)
             for group_id, (is_mamba, names) in enumerate(self.groups)
             if is_mamba and self.group_enabled[group_id]
+        )
+        self.num_hookless_layers = sum(
+            1 for ln in kv_caches if ln in self._hookless_layers
         )
 
         if not kv_caches:
@@ -924,7 +921,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         **kwargs: Any,
     ) -> None:
         # Save every group after the forward in wait_for_save(). This covers
-        # hookless indexer side caches and avoids re-saving loaded blocks.
+        # hookless indexer caches and avoids re-saving loaded blocks.
         return
 
     def wait_for_save(self) -> None:
