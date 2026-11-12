@@ -383,37 +383,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._req_states[request.request_id] = state
 
-        enabled_groups = [
-            group_id
-            for group_id, enabled in enumerate(self.group_enabled)
-            if enabled
-        ]
-        if not enabled_groups:
-            return 0, False
-
+        # One namespace per kind of content. All attention groups share the
+        # attention prefix and all mamba groups share the boundary state (SWA is
+        # not supported by this connector yet).
         matched_blocks = len(block_hashes)
-
-        # Two namespaces only. Multiple attention groups share the attention
-        # prefix and multiple mamba groups share the boundary state (SWA is not
-        # supported by this connector yet).
-        attention_groups = [
-            group_id for group_id in enabled_groups if not self.groups[group_id][0]
-        ]
-        mamba_groups = [
-            group_id for group_id in enabled_groups if self.groups[group_id][0]
-        ]
-        if attention_groups:
-            state.existence_cache = self._store().has(
-                block_hashes, label=ATTN_LABEL
-            )
-            while (
-                matched_blocks > 0
-                and not state.existence_cache[matched_blocks - 1]
-            ):
-                matched_blocks -= 1
-        else:
-            state.existence_cache = [True] * len(block_hashes)
-        if mamba_groups:
+        state.existence_cache = self._store().has(block_hashes, label=ATTN_LABEL)
+        while matched_blocks > 0 and not state.existence_cache[matched_blocks - 1]:
+            matched_blocks -= 1
+        if self.has_mamba:
+            # A hit must also end at a block whose mamba state was saved.
             state.mamba_existence_cache = self._store().has(
                 block_hashes, label=MAMBA_LABEL, truncate=False
             )
