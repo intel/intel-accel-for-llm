@@ -522,11 +522,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if is_mamba:
                 # boundary_offloads carries the exact GPU block id of every
                 # committed boundary; the request still owns it in this step,
-                # so the id is stable and no hash re-check is needed.
+                # so the id is stable and no hash re-check is needed. A
+                # boundary always covers whole blocks: the scheduler rejects
+                # hash_block_size != block_size at init.
                 candidates = (
                     (tokens // self.block_size - 1, block_id)
                     for block_id, tokens in boundaries.get(group_id, ())
-                    if tokens % self.block_size == 0
                 )
             else:
                 ids = state.block_ids[group_id]
