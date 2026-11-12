@@ -503,68 +503,52 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         end = min(num_tokens // self.block_size, len(state.block_hashes))
         if end <= start:
             return
-        all_ids: list[list[int]] = []
+        # [(group_id, block_id, boundary_tokens)] -> {group_id: [(block_id, tokens)]}
+        boundaries: dict[int, list[tuple[int, int]]] = {}
+        for group_id, block_id, boundary_tokens in boundary_offloads:
+            boundaries.setdefault(group_id, []).append((block_id, boundary_tokens))
 
+        exists_by_group = [
+            state.mamba_existence_cache if is_mamba else state.existence_cache
+            for is_mamba, _ in self.groups
+        ]
+
+        all_ids: list[list[int]] = []
         for group_id, (is_mamba, _) in enumerate(self.groups):
             if not self.group_enabled[group_id]:
                 all_ids.append([])
                 continue
 
-            ids = state.block_ids[group_id]
-            group_ids = [0] * len(state.block_hashes)
-            exists = (
-                state.mamba_existence_cache
-                if is_mamba
-                else state.existence_cache
-            )
-
+            blocks = [0] * len(state.block_hashes)
+            exists = exists_by_group[group_id]
             if is_mamba:
-                # boundary_offloads carries the exact GPU block id for each
-                # committed boundary; never infer it from the block table. The
-                # request still owns the block in this scheduler step, so the
-                # id is stable and no hash re-check is needed.
-                for gid, block_id, boundary_tokens in boundary_offloads:
-                    if gid != group_id:
-                        continue
-                    if (
-                        boundary_tokens % self.block_size != 0
-                        or boundary_tokens > num_tokens
-                    ):
-                        continue
-                    index = boundary_tokens // self.block_size - 1
-                    if index < start or index >= len(state.block_hashes):
-                        continue
-                    if index < len(exists) and exists[index]:
-                        continue
-                    if block_id == 0:
-                        continue
-                    group_ids[index] = block_id
+                # boundary_offloads carries the exact GPU block id of every
+                # committed boundary; the request still owns it in this step,
+                # so the id is stable and no hash re-check is needed.
+                candidates = (
+                    (tokens // self.block_size - 1, block_id)
+                    for block_id, tokens in boundaries.get(group_id, ())
+                    if tokens % self.block_size == 0
+                )
             else:
-                limit = min(len(ids), end, len(state.block_hashes))
-                for index in range(start, limit):
-                    if index < len(exists) and exists[index]:
-                        continue
-                    block_id = ids[index]
-                    if block_id == 0:
-                        continue
-                    group_ids[index] = block_id
+                ids = state.block_ids[group_id]
+                candidates = (
+                    (index, ids[index])
+                    for index in range(start, min(len(ids), end, len(blocks)))
+                )
+            for index, block_id in candidates:
+                if block_id and start <= index < end and not exists[index]:
+                    blocks[index] = block_id
+            all_ids.append(blocks)
 
-            all_ids.append(group_ids)
-
-        # Mark availability after every group has been considered, so groups
-        # sharing the attention or mamba label do not hide blocks from each
-        # other in this step.
-        for group_id, (is_mamba, _) in enumerate(self.groups):
+        # Mark availability after every group, so groups sharing the attention
+        # or mamba label do not hide blocks from each other in this step.
+        for group_id, blocks in enumerate(all_ids):
             if not self.group_enabled[group_id]:
                 continue
-            exists = (
-                state.mamba_existence_cache
-                if is_mamba
-                else state.existence_cache
-            )
-            for index, block_id in enumerate(all_ids[group_id]):
-                if block_id and index < len(exists):
-                    exists[index] = True
+            for index, block_id in enumerate(blocks):
+                if block_id:
+                    exists_by_group[group_id][index] = True
 
         if any(any(ids) for ids in all_ids):
             self._reqs_to_save.add_request(
