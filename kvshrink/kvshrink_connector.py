@@ -773,8 +773,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if not self.group_enabled[group_id] or not self.groups[group_id][1]:
                     continue
                 block_ids, block_hashes = request.for_group(group_id)
-                if not block_ids:
-                    continue
                 batch = sync_batches.setdefault(group_id, ([], []))
                 batch[0].extend(block_ids)
                 batch[1].extend(block_hashes)
@@ -838,8 +836,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 if not self.group_enabled[group_id] or not layer_names:
                     continue
                 block_ids, block_hashes = request.for_group(group_id)
-                if not block_ids:
-                    continue
                 tasks.update(self._store().get(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
