@@ -8,6 +8,7 @@
 #include "context.h"
 #include "kv_pool.h"
 #include "kv_xfer_rdma.h"
+#include "kv_zip.h"
 
 using namespace profiler;
 
@@ -145,6 +146,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("unzip_is_complete", &Context::unzip_is_complete,
              "Check if unzip OMP work complete (non-blocking)",
              py::call_guard<py::gil_scoped_release>());
+
+    m.def(
+        "compress_tensors",
+        [](const std::vector<torch::Tensor> &tensors) {
+            std::vector<char *> bufs;
+            std::vector<size_t> sizes;
+            kv_zip::kv_zip_compress_tensors(tensors, bufs, sizes);
+            std::vector<torch::Tensor> blocks(bufs.size());
+            for (size_t i = 0; i < bufs.size(); i++)
+                blocks[i] = torch::from_blob(bufs[i], {static_cast<int64_t>(sizes[i])}, free,
+                                             torch::kUInt8);
+            return blocks;
+        },
+        "Compress each tensor (contiguous CPU, all of one dtype and byte size) into a uint8\n"
+        "tensor holding its block. Tensors split into segments (IAXL_ZIP_SEGMENT_SIZE_KB) are\n"
+        "used as scratch and hold garbage afterwards.",
+        py::arg("tensors"), py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "decompress_tensors",
+        [](const std::vector<torch::Tensor> &blocks, const std::vector<torch::Tensor> &tensors) {
+            std::vector<const char *> bufs(blocks.size());
+            for (size_t i = 0; i < blocks.size(); i++) {
+                IAXL_CHECK(blocks[i].is_cpu() && blocks[i].is_contiguous(),
+                           "decompress_tensors: blocks must be contiguous CPU tensors");
+                bufs[i] = static_cast<const char *>(blocks[i].data_ptr());
+            }
+            kv_zip::kv_zip_decompress_tensors(bufs, tensors);
+        },
+        "Decompress blocks[i] (from compress_tensors) into tensors[i] in place", py::arg("blocks"),
+        py::arg("tensors"), py::call_guard<py::gil_scoped_release>());
 
     py::class_<kv_pool::Storage>(m, "Storage", "Persistent storage handler")
         .def(py::init<const std::string &>(), "Create storage handler with a persist directory.",

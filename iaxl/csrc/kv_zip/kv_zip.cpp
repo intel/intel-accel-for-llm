@@ -497,4 +497,71 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
         });
 }
 
+// A pool whose block index is the block's address (base 0, stride 1), so buffers living anywhere
+// form one batch for the pool-based entry points. Only the fields kv_zip_*_batch read are set.
+static kv_pool::KVPool address_pool(size_t nbytes, at::ScalarType dtype) {
+    kv_pool::KVPool pool;
+    pool.device = kv_pool::PoolDevice::CPU;
+    pool.elem_size = static_cast<int64_t>(c10::elementSize(dtype));
+    pool.dtype = static_cast<int32_t>(dtype);
+    pool.chunk_stride = 1;
+    pool.block_bytes = static_cast<int64_t>(nbytes);
+    return pool;
+}
+
+template <class T> static std::vector<int64_t> addresses(const std::vector<T *> &bufs) {
+    std::vector<int64_t> addrs(bufs.size());
+    for (size_t i = 0; i < bufs.size(); i++)
+        addrs[i] = reinterpret_cast<int64_t>(bufs[i]);
+    return addrs;
+}
+
+// Validates the tensors and returns their data pointers.
+static std::vector<char *> tensor_ptrs(const std::vector<torch::Tensor> &tensors) {
+    IAXL_CHECK(!tensors.empty(), "kv_zip: empty tensor list");
+    const torch::Tensor &t0 = tensors[0];
+    const int64_t nbytes = kv_pool::tensor_bytes(t0);
+    std::vector<char *> ptrs(tensors.size());
+    for (size_t i = 0; i < tensors.size(); i++) {
+        const torch::Tensor &t = tensors[i];
+        IAXL_CHECK(t.is_cpu() && t.is_contiguous(), "kv_zip: tensors must be contiguous CPU tensors");
+        IAXL_CHECK(t.scalar_type() == t0.scalar_type() && kv_pool::tensor_bytes(t) == nbytes,
+                   "kv_zip: tensors must share one dtype and byte size");
+        ptrs[i] = static_cast<char *>(t.data_ptr());
+    }
+    return ptrs;
+}
+
+void kv_zip_compress_tensors(const std::vector<char *> &in_bufs, size_t nbytes,
+                             at::ScalarType dtype, std::vector<char *> &out_bufs,
+                             std::vector<size_t> &out_sizes) {
+    const size_t n = in_bufs.size();
+    out_bufs.resize(n);
+    out_sizes.resize(n);
+    std::vector<size_t> orig_sizes(n);
+    kv_zip_compress_batch(address_pool(nbytes, dtype), addresses(in_bufs), out_bufs, out_sizes,
+                          orig_sizes);
+}
+
+void kv_zip_decompress_tensors(const std::vector<const char *> &in_bufs,
+                               const std::vector<char *> &out_bufs, size_t nbytes,
+                               at::ScalarType dtype) {
+    IAXL_CHECK(in_bufs.size() == out_bufs.size(), "kv_zip: in_bufs and out_bufs differ in length");
+    kv_zip_decompress_batch(in_bufs, address_pool(nbytes, dtype), addresses(out_bufs));
+}
+
+void kv_zip_compress_tensors(const std::vector<torch::Tensor> &tensors,
+                             std::vector<char *> &out_bufs, std::vector<size_t> &out_sizes) {
+    const std::vector<char *> ptrs = tensor_ptrs(tensors);
+    kv_zip_compress_tensors(ptrs, kv_pool::tensor_bytes(tensors[0]), tensors[0].scalar_type(),
+                            out_bufs, out_sizes);
+}
+
+void kv_zip_decompress_tensors(const std::vector<const char *> &in_bufs,
+                               const std::vector<torch::Tensor> &tensors) {
+    const std::vector<char *> ptrs = tensor_ptrs(tensors);
+    kv_zip_decompress_tensors(in_bufs, ptrs, kv_pool::tensor_bytes(tensors[0]),
+                              tensors[0].scalar_type());
+}
+
 } // namespace kv_zip
