@@ -938,7 +938,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        mamba_puts: list[dict[str, Any]] = []
         for req_id, request in metadata.reqs_to_save.requests.items():
             for group_id, (is_mamba, layer_names) in enumerate(self.groups):
                 if not self.group_enabled[group_id] or not layer_names:
@@ -959,14 +958,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     label=self.group_labels[group_id],
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
-                if is_mamba:
-                    mamba_puts.append(tasks)
 
-        # Mamba boundary blocks are handed off by the scheduler and may be
-        # retired before a later step; drain their host copies before return.
-        for tasks in mamba_puts:
-            if not self._store().put_wait(tasks):
-                raise RuntimeError("Failed to save mamba boundary KV")
+        # Nothing waits here: request_finished() asks vLLM to keep the blocks
+        # until get_finished() sees every queued copy land.
         self._hook_saved.clear()
 
     def get_finished(
