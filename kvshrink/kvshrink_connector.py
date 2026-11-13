@@ -917,14 +917,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        group_id = self._layer_group.get(layer_name)
-        if group_id is None:
+        # Draft (MTP) layers past the base model's hidden layers are not
+        # registered, but they do run attention and therefore reach this hook.
+        if self._connector_metadata is None or layer_name not in self._layer_group:
             return
 
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
+        group_id = self._layer_group[layer_name]
         layer_keys = [self._layer_key[layer_name]]
         for req_id, request in metadata.reqs_to_save.requests.items():
             block_ids, block_hashes = request.for_group(group_id)
