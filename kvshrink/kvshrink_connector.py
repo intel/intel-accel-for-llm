@@ -264,8 +264,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # vLLM layer name -> KVStore key (the layer index as a string): short keys
         # cut the per-block hashing/RPC cost of the long module names.
         self._layer_key: dict[str, str] = {}
-        self._layer_group: dict[str, int] = {}
-        self._hookless_keys: list[list[str]] = []
         # Ordered worker-side KVStore keys (populated in register_kv_caches),
         # used to select the first N layers for async early-start.
         self._layer_names: list[str] = []
@@ -699,27 +697,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for ordinal, ln in enumerate(sorted(names)):
                     self._layer_key[ln] = f"{index}.{ordinal}"
 
-        # Hooked layers are saved from save_kv_layer() as the forward visits
-        # them; the hookless ones (mamba states, indexer caches) only exist
-        # after the forward and are saved from wait_for_save().
-        self._layer_group = {
-            ln: group_id
-            for group_id, (_, names) in enumerate(self.groups)
-            if self.group_enabled[group_id]
-            for ln in names
-            if ln in kv_caches and ln not in self._hookless_layers
-        }
-        self._hookless_keys = [
-            [
-                self._layer_key[ln]
-                for ln in names
-                if ln in kv_caches and ln in self._hookless_layers
-            ]
-            if self.group_enabled[group_id]
-            else []
-            for group_id, (_, names) in enumerate(self.groups)
-        ]
-
         self.groups = [
             (
                 is_mamba,
@@ -917,28 +894,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        # Draft (MTP) layers past the base model's hidden layers are not
-        # registered, but they do run attention and therefore reach this hook.
-        if self._connector_metadata is None or layer_name not in self._layer_group:
-            return
-
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, KVShrinkConnectorMetadata):
-            raise TypeError("Unexpected connector metadata")
-
-        group_id = self._layer_group[layer_name]
-        layer_keys = [self._layer_key[layer_name]]
-        for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(group_id)
-            if not block_ids:
-                continue
-            tasks = self._store().put(
-                block_indices=block_ids,
-                block_hashs=block_hashes,
-                layer_names=layer_keys,
-                label=self.group_labels[group_id],
-            )
-            self._current_put_tasks.setdefault(req_id, []).append(tasks)
+        # Save every group after the forward in wait_for_save(). Not every
+        # attention implementation runs the per-layer hook (Qwen3.8's sparse
+        # attention does not), and hookless caches (mamba states, indexer) only
+        # exist after the forward anyway.
+        return
 
     def wait_for_save(self) -> None:
         if self._connector_metadata is None:
@@ -947,12 +907,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        # Hookless layers (mamba states, indexer caches) have no save hook;
-        # submit the groups that still have layers left here.
         mamba_puts: list[dict[str, Any]] = []
         for req_id, request in metadata.reqs_to_save.requests.items():
-            for group_id, layer_keys in enumerate(self._hookless_keys):
-                if not layer_keys:
+            for group_id, (is_mamba, layer_names) in enumerate(self.groups):
+                if not self.group_enabled[group_id] or not layer_names:
                     continue
                 block_ids, block_hashes = request.for_group(group_id)
                 if not block_ids:
@@ -960,11 +918,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=layer_keys,
+                    layer_names=layer_names,
                     label=self.group_labels[group_id],
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
-                if self.groups[group_id][0]:
+                if is_mamba:
                     mamba_puts.append(tasks)
 
         # Mamba boundary blocks are handed off by the scheduler and may be
