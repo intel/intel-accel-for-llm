@@ -760,9 +760,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             if request.is_async:
                 async_reqs.append((req_id, request))
             else:
-                # Hybrid loads are always async: vLLM still zeroes the blocks
-                # of a synchronous load on the compute stream.
-                assert not self.has_mamba
+                # Only fully hooked models reach this path: in
+                # get_num_new_matched_tokens() any hookless layer turns the
+                # synchronous choice into an async window.
                 sync_reqs.append((req_id, request))
 
         # Submit synchronous (blocking) loads first, batched per group so
