@@ -18,6 +18,12 @@ void KVPool::check_indices(const std::vector<int64_t> &idx) const {
         IAXL_CHECK(i >= 0 && i < num_blocks, "block index out of range");
 }
 
+void KVPool::check_same_block_geometry(const KVPool &other) const {
+    IAXL_CHECK(block_bytes == other.block_bytes && elem_size == other.elem_size &&
+                   dtype == other.dtype,
+               "pools have different block geometry");
+}
+
 void KVPool::check_staging_geometry(const KVPool &staging) const {
     IAXL_CHECK(staging.block_bytes >= block_bytes && elem_size == staging.elem_size &&
                    dtype == staging.dtype,

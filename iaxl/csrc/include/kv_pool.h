@@ -70,6 +70,8 @@ struct KVPool {
 
     // Entry-point checks (caller thread), done once per call.
     void check_indices(const std::vector<int64_t> &idx) const;
+    // Two pools that hold the same data must describe the same block exactly.
+    void check_same_block_geometry(const KVPool &other) const;
     // A staging pool may be larger than the KV block (max-page scratch); the
     // transfer/codec paths only touch `block_bytes` of it.
     void check_staging_geometry(const KVPool &other) const;
