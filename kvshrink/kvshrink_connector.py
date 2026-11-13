@@ -408,6 +408,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         while matched_blocks > 0 and not state.existence_cache[matched_blocks - 1]:
             matched_blocks -= 1
         if self.has_mamba:
+            attention_matched_blocks = matched_blocks
             # A hit must also end at a block whose mamba state was saved.
             state.mamba_existence_cache = self._store().has(
                 block_hashes, label=MAMBA_LABEL, truncate=False
