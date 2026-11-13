@@ -97,6 +97,22 @@ class KVStoreRemote:
         self.rpc.handshake()
 
         if kv_caches is not None:
+            # RDMA pre-builds one descriptor per staging block, so the staging
+            # pool needs a single block geometry. Mixed page sizes cannot use it.
+            geometries = {
+                (
+                    math.prod(s for d, s in enumerate(t.shape) if d != block_dim)
+                    * t.element_size(),
+                    t.dtype,
+                )
+                for t in kv_caches.values()
+            }
+            if len(geometries) > 1:
+                raise RuntimeError(
+                    "RDMA (remote_pool) requires one page size and dtype across "
+                    f"all KV caches; got {sorted(geometries, key=str)}. "
+                    "Disable RDMA (IAXL_RDMA_ENABLE=0) for mixed layouts."
+                )
             layers = {
                 n: {"base": t.data_ptr(), "shape": list(t.shape),
                     "dtype": str(t.dtype).split(".")[-1], "dev_id": t.get_device(),
