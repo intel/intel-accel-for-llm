@@ -20,7 +20,7 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import BlockHash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 ReqId = str
 
 # OMP-Main TaskQueue levels: P0 loads a forward waits on, P1 first N layers, P2 remaining layers.
+# KVStore namespaces: attention groups share one, mamba groups another. Layer
+# completeness inside a label is a separate fix.
+ATTN_LABEL = "attn"
+MAMBA_LABEL = "mamba"
+
 LOAD_PRIORITY_P0 = 0
 LOAD_PRIORITY_P1 = 1
 LOAD_PRIORITY_P2 = 2
@@ -76,6 +81,8 @@ class ReqMeta:
 @dataclass
 class ReqState:
     num_computed_tokens: int = 0
+    # Two namespaces: prefix-cacheable attention and mamba boundary state.
+    # Multiple KV cache groups may share one namespace (no SWA support yet).
     existence_cache: list[bool] = field(default_factory=list)
     mamba_existence_cache: list[bool] = field(default_factory=list)
     block_hashes: list[str] = field(default_factory=list)
@@ -133,39 +140,96 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.model_config = vllm_config.model_config
-        # (is_mamba, layer_names) per KV cache group; all groups share one
-        # block size, which is the enlarged one on hybrid models.
+        # (is_mamba, layer_names) per KV cache group; all enabled groups share
+        # one block size, which is the enlarged one on hybrid models.
         self.groups: list[tuple[bool, list[str]]] = []
+        self.group_enabled: list[bool] = []
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = next(iter(spec.kv_cache_specs.values()))
             self.groups.append((isinstance(spec, MambaSpec), list(group.layer_names)))
-        self.has_mamba = any(is_mamba for is_mamba, _ in self.groups)
+            self.group_enabled.append(
+                bool(group.enable_kv_transfer and group.kv_cache_spec.prefix_cacheable)
+            )
+        self.group_labels = [
+            MAMBA_LABEL if is_mamba else ATTN_LABEL for is_mamba, _ in self.groups
+        ]
+        self.has_mamba = any(
+            is_mamba and self.group_enabled[group_id]
+            for group_id, (is_mamba, _) in enumerate(self.groups)
+        )
         if self.has_mamba and vllm_config.cache_config.mamba_cache_mode != "align":
             raise ValueError(
                 "KVShrinkConnector on hybrid models requires "
                 "mamba_cache_mode='align', got "
                 f"{vllm_config.cache_config.mamba_cache_mode!r}"
             )
-        block_sizes = {g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups}
-        assert len(block_sizes) == 1, block_sizes
-        self.block_size = block_sizes.pop()
+        block_sizes = {
+            kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
+            for group_id in range(len(self.groups))
+            if self.group_enabled[group_id]
+        }
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        if block_sizes:
+            if len(block_sizes) != 1:
+                raise ValueError(
+                    "KVShrinkConnector requires one block size across enabled "
+                    f"prefix-cacheable groups, got {sorted(block_sizes)}"
+                )
+            self.block_size = block_sizes.pop()
+            if scheduler_block_size != self.block_size:
+                raise ValueError(
+                    "KVShrinkConnector block size must match the scheduler's "
+                    f"alignment: enabled={self.block_size}, "
+                    f"scheduler={scheduler_block_size}"
+                )
+        else:
+            self.block_size = scheduler_block_size
+        self.hash_block_size = hash_block_size
+        # Mamba state and indexer caches have no per-layer load hook, so
+        # they must be registered first and covered by the early-start window.
+        self._hookless_layers: set[str] = set()
+        for group_id, (is_mamba, names) in enumerate(self.groups):
+            if not self.group_enabled[group_id]:
+                continue
+            spec = kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
+            specs = (
+                spec.kv_cache_specs if isinstance(spec, UniformTypeKVCacheSpecs) else None
+            )
+            for layer_name in names:
+                layer_spec = specs.get(layer_name, spec) if specs else spec
+                if is_mamba or getattr(layer_spec, "tokens_per_state", 1) > 1:
+                    self._hookless_layers.add(layer_name)
         logger.info(
-            "KVShrinkConnector(%s): block_size=%d, has_mamba=%s, "
-            "mamba_cache_mode=%r, prefix caching=%s",
+            "KVShrinkConnector(%s): block_size=%d, hash_block_size=%d, "
+            "has_mamba=%s, mamba_cache_mode=%r, prefix caching=%s, "
+            "enabled_groups=%s",
             role.name,
             self.block_size,
+            self.hash_block_size,
             self.has_mamba,
             vllm_config.cache_config.mamba_cache_mode,
             vllm_config.cache_config.enable_prefix_caching,
+            [i for i, enabled in enumerate(self.group_enabled) if enabled],
         )
         self.num_mamba_layers = sum(
-            len(names) for is_mamba, names in self.groups if is_mamba
+            len(names)
+            for group_id, (is_mamba, names) in enumerate(self.groups)
+            if is_mamba and self.group_enabled[group_id]
         )
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
+        )
+        # The scheduler never registers caches, so it needs the count from the
+        # config alone. The worker recomputes it from what it registers.
+        self.num_hookless_layers = sum(
+            1
+            for layer_name in self._hookless_layers
+            if extract_layer_index(layer_name) < self.num_layers
         )
         self.vllm_device = vllm_config.device_config.device_type
         parallel_config = vllm_config.parallel_config
@@ -200,6 +264,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # vLLM layer name -> KVStore key (the layer index as a string): short keys
         # cut the per-block hashing/RPC cost of the long module names.
         self._layer_key: dict[str, str] = {}
+        self._layer_group: dict[str, int] = {}
+        self._hook_saved: set[str] = set()
         # Ordered worker-side KVStore keys (populated in register_kv_caches),
         # used to select the first N layers for async early-start.
         self._layer_names: list[str] = []
@@ -286,6 +352,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError("KVStore has not been initialized")
         return self.kvstore
 
+    @staticmethod
+    def _store_key(block_hash: BlockHash) -> str:
+        # vLLM's BlockHash is the raw digest, not hex. IAFL keys are
+        # "label:chunk_id" and are split on ':', so a raw digest (which may
+        # contain ':') cannot be used as the id.
+        return block_hash.hex()
+
+    @staticmethod
+    def _current_block_ids(
+        scheduler_output: SchedulerOutput, req_id: str
+    ) -> list[list[int]]:
+        # The scheduler's own block table, copied so later CoW moves cannot
+        # change the snapshot this step saves from.
+        return [
+            list(ids)
+            for ids in scheduler_output.kv_connector_block_state.get_block_ids(req_id)
+        ]
+
+    @staticmethod
+    def _boundary_offloads(scheduler_output: SchedulerOutput, req_id: str):
+        return list(
+            scheduler_output.kv_connector_block_state.boundary_state_offloads.get(
+                req_id, []
+            )
+        )
+
     ############################################################
     # Scheduler Side Methods
     ############################################################
@@ -300,30 +392,28 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # vLLM always computes the last prompt token, so it is never loaded.
         num_blocks = (request.num_tokens - 1) // self.block_size
-        block_hashes: list[str] = []
-        for block_hash in request.block_hashes[:num_blocks]:
-            block_hashes.append(block_hash.hex())
-        existence_cache = self._store().has(block_hashes)
+        block_hashes = [
+            self._store_key(block_hash)
+            for block_hash in request.block_hashes[:num_blocks]
+        ]
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
-            existence_cache=existence_cache,
             block_hashes=block_hashes,
         )
         self._req_states[request.request_id] = state
 
-        matched_blocks = next(
-            (
-                index
-                for index, exists in enumerate(existence_cache)
-                if not exists
-            ),
-            len(existence_cache),
-        )
+        # One namespace per kind of content. All attention groups share the
+        # attention prefix and all mamba groups share the boundary state (SWA is
+        # not supported by this connector yet).
+        matched_blocks = len(block_hashes)
+        state.existence_cache = self._store().has(block_hashes, label=ATTN_LABEL)
+        while matched_blocks > 0 and not state.existence_cache[matched_blocks - 1]:
+            matched_blocks -= 1
         if self.has_mamba:
             attention_matched_blocks = matched_blocks
-            # A hit must end at a block whose mamba state was saved.
+            # A hit must also end at a block whose mamba state was saved.
             state.mamba_existence_cache = self._store().has(
-                block_hashes, label="mamba", truncate=False
+                block_hashes, label=MAMBA_LABEL, truncate=False
             )
             while (
                 matched_blocks > 0
@@ -344,12 +434,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
-        # Mamba layers lead the worker's layer order and have no layer-load
-        # hook, so the early-start window must cover them. -1 keeps its
-        # meaning (wait for every layer); 0 asks for a synchronous load, which
-        # hybrid cannot do, so it becomes that window as well.
-        if self.has_mamba and selected_layers >= 0:
-            selected_layers += self.num_mamba_layers
+        # -1 keeps its meaning (wait for every layer); 0 asks for a synchronous
+        # load, which hybrid cannot do, so it becomes that window as well.
+        # The window is a prefix of the worker's layer order, which starts with
+        # the hookless layers (mamba state, indexer caches).
+        if selected_layers >= 0 and self.num_hookless_layers:
+            selected_layers += self.num_hookless_layers
         # A dynamic-map layer value of 0 selects synchronous loading. It is not
         # an async request that resumes before layer 0.
         use_async = num_new_tokens > 0 and selected_layers != 0
@@ -387,18 +477,32 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         load_end = load_start + num_external_tokens // self.block_size
         assert load_end <= len(state.block_hashes)
 
-        # A mamba table is null up to the hit boundary, so the same slice
-        # leaves only the slot that receives the saved state.
+        all_ids: list[list[int]] = []
+        for group_id, (is_mamba, _) in enumerate(self.groups):
+            if not self.group_enabled[group_id]:
+                all_ids.append([])
+                continue
+            group_ids = list(block_ids[group_id])[load_start:load_end]
+            if is_mamba:
+                # Only the boundary slot carries a saved state; 0 means "not
+                # transferred" and keeps the list aligned with block_hashes.
+                group_ids[:-1] = [0] * (len(group_ids) - 1)
+            all_ids.append(group_ids)
+
         self._reqs_to_load.add_request(
             request.request_id,
-            tuple(list(ids[load_start:load_end]) for ids in block_ids),
+            tuple(all_ids),
             state.block_hashes[load_start:load_end],
             is_async=state.is_async,
             async_load_layers=state.async_load_layers,
         )
 
     def _add_request_to_save(
-        self, req_id: ReqId, num_computed_tokens: int, num_scheduled_tokens: int
+        self,
+        req_id: ReqId,
+        num_computed_tokens: int,
+        num_scheduled_tokens: int,
+        boundary_offloads: list[tuple[int, int, int]],
     ) -> None:
         state = self._req_states.get(req_id)
         if state is None:
@@ -409,26 +513,46 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         end = min(num_tokens // self.block_size, len(state.block_hashes))
         if end <= start:
             return
+        boundaries: dict[int, list[tuple[int, int]]] = {}
+        for gid, block_id, tokens in boundary_offloads:
+            boundaries.setdefault(gid, []).append((block_id, tokens))
 
-        # Attention saves every full block; mamba only holds the state at the
-        # end of a block-aligned chunk, in slot end - 1.
-        save_mamba = (
-            self.has_mamba
-            and end * self.block_size == num_tokens
-            and not state.mamba_existence_cache[end - 1]
-        )
-        block_ids = tuple(
-            [0] * (end - start - 1) + [ids[end - 1] if save_mamba else 0]
-            if is_mamba
-            else [
-                0 if state.existence_cache[index] else ids[index]
-                for index in range(start, end)
-            ]
-            for (is_mamba, _), ids in zip(self.groups, state.block_ids)
-        )
-        if any(any(ids) for ids in block_ids):
+        all_ids: list[list[int]] = []
+        for group_id, (is_mamba, _) in enumerate(self.groups):
+            if not self.group_enabled[group_id]:
+                all_ids.append([])
+                continue
+
+            blocks = [0] * len(state.block_hashes)
+            exists = (
+                state.mamba_existence_cache
+                if is_mamba
+                else state.existence_cache
+            )
+            if is_mamba:
+                # boundary_offloads carries the exact GPU block id of every
+                # committed boundary; the request still owns it in this step,
+                # so the id is stable and no hash re-check is needed. A
+                # boundary always covers whole blocks: the scheduler rejects
+                # hash_block_size != block_size at init.
+                candidates = (
+                    (tokens // self.block_size - 1, block_id)
+                    for block_id, tokens in boundaries.get(group_id, ())
+                )
+            else:
+                ids = state.block_ids[group_id]
+                candidates = (
+                    (index, ids[index])
+                    for index in range(start, min(len(ids), end, len(blocks)))
+                )
+            for index, block_id in candidates:
+                if block_id and start <= index < end and not exists[index]:
+                    blocks[index] = block_id
+            all_ids.append(blocks)
+
+        if any(any(ids) for ids in all_ids):
             self._reqs_to_save.add_request(
-                req_id, block_ids, state.block_hashes[start:end]
+                req_id, tuple(all_ids), state.block_hashes
             )
 
     def request_finished(
@@ -454,11 +578,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for request in scheduler_output.scheduled_new_reqs:
             state = self._req_states[request.req_id]
-            state.block_ids = [list(ids) for ids in request.block_ids]
+            state.block_ids = self._current_block_ids(scheduler_output, request.req_id)
             self._add_request_to_save(
                 request.req_id,
                 request.num_computed_tokens,
                 num_scheduled_tokens[request.req_id],
+                self._boundary_offloads(scheduler_output, request.req_id),
             )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -467,15 +592,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 raise RuntimeError("Resuming from preemption is not supported")
 
             state = self._req_states[req_id]
-            new_block_ids = cached_reqs.new_block_ids[index]
-            if new_block_ids:
-                for ids, new_ids in zip(state.block_ids, new_block_ids):
-                    ids.extend(new_ids)
-            # Decode steps start past the prompt's hashes and save nothing.
+            state.block_ids = self._current_block_ids(scheduler_output, req_id)
             self._add_request_to_save(
                 req_id,
                 cached_reqs.num_computed_tokens[index],
                 num_scheduled_tokens[req_id],
+                self._boundary_offloads(scheduler_output, req_id),
             )
 
         # kvshrink loads asynchronously, but its start_load_kv only submits
@@ -499,8 +621,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def _view_as_blocks(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """View each layer's KV cache as contiguous ``(num_blocks, page)`` rows
-        per logical block, taken from the ``KVCacheConfig`` geometry."""
+        """View each layer's KV cache as ``(num_blocks, page)`` rows per
+        logical block, taken from the ``KVCacheConfig`` geometry."""
         num_blocks = self.kv_cache_config.num_blocks
         spec_by_layer: dict[str, Any] = {}
         for group in self.kv_cache_config.kv_cache_groups:
@@ -535,7 +657,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             stride = ref.stride(0) * ref.element_size()
             page = spec_by_layer[layer_name].page_size_bytes
             assert offset % itemsize == 0 and stride % itemsize == 0
-            assert page % itemsize == 0
+            assert page % itemsize == 0 and page <= stride
             views[layer_name] = torch.tensor(
                 [], dtype=attn_dtype, device=ref.device
             ).set_(
@@ -550,37 +672,73 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
 
-        # Skip draft (MTP) layers; put mamba layers first so the async
-        # early-start window covers them.
-        mamba_layers = {
-            ln for is_mamba, names in self.groups if is_mamba for ln in names
+        # Keep only transferable prefix-cacheable groups (the indexer tail ring
+        # is disabled). Put mamba layers first so the async early-start window
+        # covers them.
+        enabled_layers = {
+            ln
+            for group_id, (_, names) in enumerate(self.groups)
+            if self.group_enabled[group_id]
+            for ln in names
         }
         kv_caches = {
             ln: kv_caches[ln]
-            for ln in sorted(kv_caches, key=lambda ln: ln not in mamba_layers)
-            if extract_layer_index(ln) < self.num_layers
+            for ln in sorted(kv_caches, key=lambda ln: ln not in self._hookless_layers)
+            if ln in enabled_layers and extract_layer_index(ln) < self.num_layers
         }
-        self._layer_key = {ln: str(extract_layer_index(ln)) for ln in kv_caches}
-        if len(set(self._layer_key.values())) != len(self._layer_key):
-            raise ValueError(
-                f"KV cache layers do not have unique layer indices: {self._layer_key}"
-            )
-        # layer_group is looked up by vLLM name; groups hold KVStore keys.
-        self.layer_group = {
-            ln: index
-            for index, (_, names) in enumerate(self.groups)
+
+        # A transformer layer can own more than one cache module (e.g. MLA and
+        # its indexer). Append an ordinal to keep the short KVStore keys unique.
+        by_index: dict[int, list[str]] = {}
+        for ln in kv_caches:
+            by_index.setdefault(extract_layer_index(ln), []).append(ln)
+        self._layer_key = {}
+        for index, names in by_index.items():
+            if len(names) == 1:
+                self._layer_key[names[0]] = str(index)
+            else:
+                for ordinal, ln in enumerate(sorted(names)):
+                    self._layer_key[ln] = f"{index}.{ordinal}"
+
+        # Layers whose attention runs the per-layer transfer hook; anything
+        # else is left to wait_for_save().
+        self._layer_group = {
+            ln: group_id
+            for group_id, (_, names) in enumerate(self.groups)
+            if self.group_enabled[group_id]
             for ln in names
-            if ln in kv_caches
+            if ln in kv_caches and ln not in self._hookless_layers
         }
+
         self.groups = [
-            (is_mamba, [self._layer_key[ln] for ln in names if ln in kv_caches])
-            for is_mamba, names in self.groups
+            (
+                is_mamba,
+                (
+                    [self._layer_key[ln] for ln in names if ln in kv_caches]
+                    if self.group_enabled[group_id]
+                    else []
+                ),
+            )
+            for group_id, (is_mamba, names) in enumerate(self.groups)
         ]
+        self._last_layer_name = next(reversed(kv_caches)) if kv_caches else None
+        self._layer_names = [self._layer_key[ln] for ln in kv_caches]
+        self.num_mamba_layers = sum(
+            len(names)
+            for group_id, (is_mamba, names) in enumerate(self.groups)
+            if is_mamba and self.group_enabled[group_id]
+        )
+        self.num_hookless_layers = sum(
+            1 for ln in kv_caches if ln in self._hookless_layers
+        )
+
+        if not kv_caches:
+            logger.info("No enabled KV cache layers; connector is a no-op")
+            self.kvstore = None
+            return
 
         kv_caches = self._view_as_blocks(kv_caches)
         first_kv_cache = next(iter(kv_caches.values()))
-        self._last_layer_name = next(reversed(kv_caches))
-        self._layer_names = [self._layer_key[ln] for ln in kv_caches]
         self.kvstore = KVStore(
             model_name=os.path.basename(self.model_config.model),
             block_dim=0,
@@ -604,30 +762,45 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        sync_block_ids: list[int] = []
-        sync_block_hashes: list[str] = []
+        sync_reqs: list[tuple[ReqId, ReqMeta]] = []
         async_reqs: list[tuple[ReqId, ReqMeta]] = []
         for req_id, request in metadata.reqs_to_load.requests.items():
             assert all(
-                len(ids) == len(request.block_hashes) for ids in request.block_ids
+                len(ids) == len(request.block_hashes)
+                for group_id, ids in enumerate(request.block_ids)
+                if self.group_enabled[group_id]
             ), req_id
             if request.is_async:
                 async_reqs.append((req_id, request))
             else:
-                # Hybrid loads are always async: vLLM still zeroes the blocks
-                # of a synchronous load on the compute stream.
-                assert not self.has_mamba
-                sync_block_ids.extend(request.block_ids[0])
-                sync_block_hashes.extend(request.block_hashes)
+                # Only fully hooked models reach this path: in
+                # get_num_new_matched_tokens() any hookless layer turns the
+                # synchronous choice into an async window.
+                sync_reqs.append((req_id, request))
 
-        # Submit synchronous (blocking) loads first as a single merged batch so
-        # they are enqueued ahead of the asynchronous loads for this pass.
+        # Submit synchronous (blocking) loads first, batched per group so
+        # multiple sync requests do not overwrite each other's layer tasks.
+        sync_batches: dict[int, tuple[list[int], list[str]]] = {}
+        for _, request in sync_reqs:
+            for group_id in range(len(self.groups)):
+                if not self.group_enabled[group_id] or not self.groups[group_id][1]:
+                    continue
+                block_ids, block_hashes = request.for_group(group_id)
+                batch = sync_batches.setdefault(group_id, ([], []))
+                batch[0].extend(block_ids)
+                batch[1].extend(block_hashes)
+
         self._current_get_tasks = None
-        if sync_block_ids:
-            self._current_get_tasks = self._store().get(
-                block_indices=sync_block_ids,
-                block_hashs=sync_block_hashes,
+        for group_id, (block_ids, block_hashes) in sync_batches.items():
+            tasks = self._store().get(
+                block_indices=block_ids,
+                block_hashs=block_hashes,
+                layer_names=self.groups[group_id][1],
+                label=self.group_labels[group_id],
             )
+            if self._current_get_tasks is None:
+                self._current_get_tasks = {}
+            self._current_get_tasks.update(tasks)
 
         # Wait only on promoted requests scheduled in this forward; a no-forward batch waits on none.
         if forward_context.attn_metadata is not None:
@@ -672,16 +845,16 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             load_bundle_id = self._next_load_bundle_id
             self._next_load_bundle_id += 1
             tasks: dict[str, Any] = {}
-            for index, (is_mamba, layer_names) in enumerate(self.groups):
-                if not layer_names:  # draft-only group
+            for group_id, (is_mamba, layer_names) in enumerate(self.groups):
+                if not self.group_enabled[group_id] or not layer_names:
                     continue
-                block_ids, block_hashes = request.for_group(index)
+                block_ids, block_hashes = request.for_group(group_id)
                 tasks.update(self._store().get(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
                     layer_names=layer_names,
                     description=req_id,
-                    label="mamba" if is_mamba else None,
+                    label=self.group_labels[group_id],
                     priorities=priorities,
                     bundle_id=load_bundle_id,
                 ))
@@ -692,6 +865,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
+            return
+        # Draft (MTP) layers past the base model's hidden layers are not
+        # registered, but they do run attention and therefore reach this hook.
+        if layer_name not in self._layer_key:
             return
 
         layer_keys = [self._layer_key[layer_name]]
@@ -730,44 +907,61 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        # Draft (MTP) layers are not registered.
-        if self._connector_metadata is None or layer_name not in self.layer_group:
+        # Draft (MTP) layers past the base model's hidden layers are not
+        # registered, but they do run attention and therefore reach this hook.
+        if self._connector_metadata is None or layer_name not in self._layer_group:
             return
 
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
-        group_idx = self.layer_group[layer_name]
+        group_id = self._layer_group[layer_name]
         layer_keys = [self._layer_key[layer_name]]
+        self._hook_saved.add(layer_keys[0])
         for req_id, request in metadata.reqs_to_save.requests.items():
-            block_ids, block_hashes = request.for_group(group_idx)
+            block_ids, block_hashes = request.for_group(group_id)
             if not block_ids:
                 continue
             tasks = self._store().put(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
                 layer_names=layer_keys,
+                label=self.group_labels[group_id],
             )
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
     def wait_for_save(self) -> None:
-        # Mamba layers have no save hook: submit their states after forward.
-        if self._connector_metadata is None or not self.has_mamba:
+        if self._connector_metadata is None:
             return
         metadata = self._get_connector_metadata()
+        if not isinstance(metadata, KVShrinkConnectorMetadata):
+            raise TypeError("Unexpected connector metadata")
+
         for req_id, request in metadata.reqs_to_save.requests.items():
-            for index, (is_mamba, layer_names) in enumerate(self.groups):
-                block_ids, block_hashes = request.for_group(index)
-                if not is_mamba or not block_ids:
+            for group_id, (is_mamba, layer_names) in enumerate(self.groups):
+                if not self.group_enabled[group_id] or not layer_names:
+                    continue
+                # The per-layer hook already stored these during the forward;
+                # save whatever it did not reach (hookless caches, or models
+                # whose attention never calls the hook).
+                layer_names = [k for k in layer_names if k not in self._hook_saved]
+                if not layer_names:
+                    continue
+                block_ids, block_hashes = request.for_group(group_id)
+                if not block_ids:
                     continue
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
                     layer_names=layer_names,
-                    label="mamba",
+                    label=self.group_labels[group_id],
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
+
+        # Nothing waits here: request_finished() asks vLLM to keep the blocks
+        # until get_finished() sees every queued copy land.
+        self._hook_saved.clear()
 
     def get_finished(
         self, finished_req_ids: set[str]
