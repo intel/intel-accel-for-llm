@@ -2,6 +2,7 @@
 """vLLM general plugin (entry point group ``vllm.general_plugins``)."""
 
 import dataclasses
+import sys
 
 from vllm.logger import init_logger
 
@@ -67,18 +68,22 @@ def _patch_mamba_block_size_validator() -> None:
     rebuild_dataclass(VllmConfig, force=True)
 
 
-def _patch_kimi_k3_mla_kv_transfer() -> None:
+def patch_kimi_k3_mla_kv_transfer() -> None:
+    """Hook Kimi-K3's MLA layers into the KV connector; no-op unless the model loaded them."""
+    mla_module = sys.modules.get("vllm.models.kimi_k3.nvidia.mla")
+    if mla_module is None:
+        return
     from vllm.compilation.breakable_cudagraph import eager_break_during_capture
     from vllm.model_executor.layers.attention.kv_transfer_utils import (
         maybe_transfer_kv_layer,
     )
-    from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 
+    attention_class = mla_module.MultiHeadLatentAttention
     # eager_break_during_capture keeps the undecorated function in __wrapped__.
     raw_attention = getattr(
-        MultiHeadLatentAttention._attention,
+        attention_class._attention,
         "__wrapped__",
-        MultiHeadLatentAttention._attention,
+        attention_class._attention,
     )
 
     @maybe_transfer_kv_layer
@@ -93,7 +98,8 @@ def _patch_kimi_k3_mla_kv_transfer() -> None:
         )
 
     # The hook sits inside the eager break so CUDA graph replay still runs it.
-    MultiHeadLatentAttention._attention = eager_break_during_capture(_attention)
+    attention_class._attention = eager_break_during_capture(_attention)
+    logger.info("Kimi-K3 MLA KV transfer hook registered")
 
 
 def register() -> None:
@@ -103,9 +109,8 @@ def register() -> None:
         return
     _patch_mamba_cache_mode()
     _patch_mamba_block_size_validator()
-    _patch_kimi_k3_mla_kv_transfer()
     MambaModelConfig._mamba_align_patched = True
     logger.info(
         "Mamba align patch registered: MambaModelConfig.verify_and_update_config, "
-        "VllmConfig.validate_mamba_block_size; Kimi-K3 MLA KV transfer hook registered"
+        "VllmConfig.validate_mamba_block_size"
     )

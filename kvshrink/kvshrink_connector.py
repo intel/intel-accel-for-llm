@@ -41,6 +41,7 @@ from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .async_load_config import load_async_load_layer_config_from_env
+from .vllm_patch import patch_kimi_k3_mla_kv_transfer
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -267,6 +268,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self.kvstore = None
+            # The model is loaded by now and CUDA graphs are captured after this.
+            patch_kimi_k3_mla_kv_transfer()
             if not iaxl_envs.IAXL_RDMA_ENABLE:  # compression/DSA run on the daemon node
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
