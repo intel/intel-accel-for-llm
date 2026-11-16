@@ -209,8 +209,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._reqs_to_save = RequestMetadata()
         self._current_get_tasks: Optional[dict[str, Any]] = None
         self._current_put_tasks: dict[ReqId, list[dict[str, Any]]] = {}
-        # KV cache groups whose layers called save_kv_layer in the current step.
-        self._groups_saved_by_hook: set[int] = set()
         self._deferred_finished_req_ids: set[ReqId] = set()
         self._last_layer_name: Optional[str] = None
         # vLLM layer name -> KVStore key (the layer index as a string): short keys
@@ -759,7 +757,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             raise TypeError("Unexpected connector metadata")
 
         group_idx = self.layer_group[layer_name]
-        self._groups_saved_by_hook.add(group_idx)
         layer_keys = [self._layer_key[layer_name]]
         for req_id, request in metadata.reqs_to_save.requests.items():
             block_ids, block_hashes = request.for_group(group_idx)
@@ -773,25 +770,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
     def wait_for_save(self) -> None:
-        # Mamba layers and attention layers whose forward skips save_kv_layer are saved here.
-        if self._connector_metadata is None:
+        # Mamba layers have no save hook: submit their states after forward.
+        if self._connector_metadata is None or not self.has_mamba:
             return
         metadata = self._get_connector_metadata()
         for req_id, request in metadata.reqs_to_save.requests.items():
             for index, (is_mamba, layer_names) in enumerate(self.groups):
-                if index in self._groups_saved_by_hook or not layer_names:
-                    continue
                 block_ids, block_hashes = request.for_group(index)
-                if not block_ids:
+                if not is_mamba or not block_ids:
                     continue
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
                     layer_names=layer_names,
-                    label="mamba" if is_mamba else None,
+                    label="mamba",
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
-        self._groups_saved_by_hook.clear()
 
     def get_finished(
         self, finished_req_ids: set[str]

@@ -67,6 +67,35 @@ def _patch_mamba_block_size_validator() -> None:
     rebuild_dataclass(VllmConfig, force=True)
 
 
+def _patch_kimi_k3_mla_kv_transfer() -> None:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+    from vllm.model_executor.layers.attention.kv_transfer_utils import (
+        maybe_transfer_kv_layer,
+    )
+    from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+
+    # eager_break_during_capture keeps the undecorated function in __wrapped__.
+    raw_attention = getattr(
+        MultiHeadLatentAttention._attention,
+        "__wrapped__",
+        MultiHeadLatentAttention._attention,
+    )
+
+    @maybe_transfer_kv_layer
+    def attention_with_kv_transfer(
+        layer, positions, q, kv_c_normed, k_pe, attn_out, layer_name
+    ) -> None:
+        raw_attention(layer, positions, q, kv_c_normed, k_pe, attn_out)
+
+    def _attention(self, positions, q, kv_c_normed, k_pe, attn_out) -> None:
+        attention_with_kv_transfer(
+            self, positions, q, kv_c_normed, k_pe, attn_out, self.layer_name
+        )
+
+    # The hook sits inside the eager break so CUDA graph replay still runs it.
+    MultiHeadLatentAttention._attention = eager_break_during_capture(_attention)
+
+
 def register() -> None:
     from vllm.model_executor.models.config import MambaModelConfig
 
@@ -74,8 +103,9 @@ def register() -> None:
         return
     _patch_mamba_cache_mode()
     _patch_mamba_block_size_validator()
+    _patch_kimi_k3_mla_kv_transfer()
     MambaModelConfig._mamba_align_patched = True
     logger.info(
         "Mamba align patch registered: MambaModelConfig.verify_and_update_config, "
-        "VllmConfig.validate_mamba_block_size"
+        "VllmConfig.validate_mamba_block_size; Kimi-K3 MLA KV transfer hook registered"
     )
