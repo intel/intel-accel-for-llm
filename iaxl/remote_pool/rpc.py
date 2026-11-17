@@ -238,7 +238,8 @@ class KVStoreService:
             rt = RemoteTensor(peer, t["base"], shape, dtype, t["dev_id"])
             # One Remote pool per layer name; hybrid layers sharing a buffer share its RDMA dlist.
             torch_ext.register_kv_pool_remote(name, peer, rt.base, list(shape), rt.element_size(),
-                                              dtype, rt.dev_id, block_dim)
+                                              dtype, rt.dev_id, block_dim,
+                                              t.get("chunk_stride", 0))
             self.remote_names.append(name)
             kv_caches[name] = rt
         self.kvstore = KVStoreLocal(model_name=req["model_name"], block_dim=block_dim, kv_caches=kv_caches,

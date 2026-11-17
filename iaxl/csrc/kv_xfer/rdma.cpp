@@ -42,9 +42,13 @@ namespace {
 
 // NIXL state of one registered buffer; pools sharing a base (hybrid layers) share it.
 struct Reg {
-    nixlDlistH *dlist = nullptr; // Remote: VRAM descs; CPU: DRAM descs, built at first transfer
-    int64_t outer_dims = 0;      // sub-block geometry of a CPU dlist
-    int64_t inner_size = 0;
+    struct StagingDlist {
+        int64_t outer_dims = 0;
+        int64_t inner_size = 0;
+        nixlDlistH *handle = nullptr;
+    };
+    nixlDlistH *dlist = nullptr;            // Remote: VRAM descs, one per buffer
+    std::vector<StagingDlist> staging;      // CPU: DRAM descs, one per page size
     int refs = 0;
 };
 
@@ -95,8 +99,13 @@ void on_register(const KVPool &p) {
         NIXL_CHECK(r.agent().prepXferDlist(p.peer, descs, it->second.dlist, &r.opt));
     } else {
         const bool gpu = p.device == PoolDevice::GPU;
+        // `total_bytes` counts a full stride after the last page; on a packed layer
+        // that tail reaches past the allocation, so register up to the last page end.
+        const size_t span = (static_cast<size_t>(p.outer_dims - 1) * p.outer_block_size) +
+                            (static_cast<size_t>(p.num_blocks - 1) * p.chunk_stride) +
+                            static_cast<size_t>(p.inner_size);
         nixl_reg_dlist_t mem(gpu ? VRAM_SEG : DRAM_SEG);
-        mem.addDesc(nixlBlobDesc(p.base, p.total_bytes, gpu ? p.dev_id : 0, ""));
+        mem.addDesc(nixlBlobDesc(p.base, span, gpu ? p.dev_id : 0, ""));
         NIXL_CHECK(r.agent().registerMem(mem, &r.opt));
         r.mem_regs.push_back(std::move(mem));
     }
@@ -110,6 +119,8 @@ void on_unregister(const KVPool &p) {
         return;
     if (it->second.dlist)
         NIXL_CHECK(r.agent().releasedDlistH(it->second.dlist));
+    for (auto &d : it->second.staging)
+        NIXL_CHECK(r.agent().releasedDlistH(d.handle));
     r.regs.erase(it);
 }
 
@@ -124,23 +135,24 @@ Reg &reg_of(Rdma &r, const KVPool &p) {
 nixlDlistH *local_dlist(Rdma &r, const KVPool &local, const KVPool &remote) {
     std::lock_guard<std::mutex> lock(r.mu);
     Reg &reg = reg_of(r, local);
-    if (reg.dlist) {
-        IAXL_CHECK(reg.outer_dims == remote.outer_dims && reg.inner_size == remote.inner_size,
-                   "scratch pool geometry differs between layers");
-        return reg.dlist;
-    }
     const int64_t od = remote.outer_dims, is = remote.inner_size;
+    // Mixed page sizes share one max-page staging pool, so a dlist is built per
+    // remote geometry: its descriptors point at the first `is` bytes of a block.
+    IAXL_CHECK(local.inner_size >= is, "staging block is smaller than the remote page");
+    for (const auto &d : reg.staging)
+        if (d.outer_dims == od && d.inner_size == is)
+            return d.handle;
     nixl_xfer_dlist_t descs(DRAM_SEG, local.num_blocks * od);
     for (int64_t b = 0; b < local.num_blocks; b++)
         for (int64_t o = 0; o < od; o++)
             descs[b * od + o] =
                 nixlBasicDesc(reinterpret_cast<uintptr_t>(local.block_ptr(b)) + o * is, is, 0);
-    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, reg.dlist, &r.opt));
-    reg.outer_dims = od;
-    reg.inner_size = is;
+    nixlDlistH *handle = nullptr;
+    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, handle, &r.opt));
+    reg.staging.push_back({od, is, handle});
     fprintf(stderr, "[kv_xfer/rdma] pool %s: %ld blocks x %ld descs of %ld B\n",
             local.name.c_str(), local.num_blocks, od, is);
-    return reg.dlist;
+    return handle;
 }
 
 } // namespace

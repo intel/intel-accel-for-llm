@@ -7,6 +7,7 @@ itself (RDMA READ for put, RDMA WRITE for get); this side only registers the
 kv_caches and tracks per-job completion pushed back by the daemon."""
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -18,6 +19,24 @@ from .nixl_impl import parse_nic_ips, rdma_xfer
 from .rpc import RpcChannel, rank_port
 
 logger = logging.getLogger(__name__)
+
+
+def _span_view(t: torch.Tensor, block_dim: int) -> torch.Tensor:
+    """A 1-D uint8 view of the bytes this pool spans.
+
+    Packed pages leave a gap between blocks that belongs to no page, but a
+    per-block DMA still lands inside the buffer. Registering the span keeps
+    the peer inside our registration.
+    """
+    num_blocks = t.shape[block_dim]
+    page = math.prod(s for i, s in enumerate(t.shape) if i != block_dim) * t.element_size()
+    stride = t.stride(block_dim) * t.element_size()
+    span = (num_blocks - 1) * stride + page if num_blocks else 0
+    if span == t.numel() * t.element_size():
+        return t
+    offset = t.storage_offset() * t.element_size()
+    view = torch.tensor([], dtype=torch.uint8, device=t.device)
+    return view.set_(t.untyped_storage(), offset, (span,))
 
 
 @dataclass
@@ -73,14 +92,21 @@ class KVStoreRemote:
             for t in kv_caches.values():
                 if t.data_ptr() not in registered:
                     registered.add(t.data_ptr())
-                    self.xfer.register_memory(t)
+                    self.xfer.register_memory(_span_view(t, block_dim))
         self.xfer.connect(self.peer, ip, port, timeout_s=envs.IAXL_API_TIMEOUT)
         self.rpc.handshake()
 
         if kv_caches is not None:
+            # RDMA pre-builds one descriptor per staging block, so it assumes a
+            # single block geometry. Mixed layouts are unsupported: let it crash.
             layers = {
                 n: {"base": t.data_ptr(), "shape": list(t.shape),
-                    "dtype": str(t.dtype).split(".")[-1], "dev_id": t.get_device()}
+                    "dtype": str(t.dtype).split(".")[-1], "dev_id": t.get_device(),
+                    # Packed pages are strided on the block dimension; the daemon
+                    # needs the byte stride to address them.
+                    "chunk_stride": (
+                        t.stride(block_dim) * t.element_size() if block_dim == 0 else 0
+                    )}
                 for n, t in kv_caches.items()
             }
             self.rpc.call(rpc.REGISTER_KV_CACHES, rpc.pack_json({
