@@ -41,6 +41,7 @@ from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .async_load_config import load_async_load_layer_config_from_env
+from .vllm_patch import patch_kimi_k3_mla_kv_transfer
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -136,11 +137,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # (is_mamba, layer_names) per KV cache group; all groups share one
         # block size, which is the enlarged one on hybrid models.
         self.groups: list[tuple[bool, list[str]]] = []
+        # Whether a mamba group writes in-prefill checkpoints (FlashKDA).
+        self.has_prefill_checkpoint = False
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = next(iter(spec.kv_cache_specs.values()))
             self.groups.append((isinstance(spec, MambaSpec), list(group.layer_names)))
+            if isinstance(spec, MambaSpec) and spec.num_prefill_checkpoint_blocks > 0:
+                self.has_prefill_checkpoint = True
         self.has_mamba = any(is_mamba for is_mamba, _ in self.groups)
         if self.has_mamba and vllm_config.cache_config.mamba_cache_mode != "align":
             raise ValueError(
@@ -151,12 +156,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         block_sizes = {g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups}
         assert len(block_sizes) == 1, block_sizes
         self.block_size = block_sizes.pop()
+        if self.has_prefill_checkpoint:
+            from vllm.models.kimi_k3.nvidia.kda_metadata import FLASHKDA_CHUNK_SIZE
+
+            # FlashKDA writes a checkpoint only at offsets that are a multiple of its chunk size.
+            if self.block_size % FLASHKDA_CHUNK_SIZE != 0:
+                raise ValueError(
+                    f"KVShrinkConnector needs block_size {self.block_size} to be a "
+                    f"multiple of FLASHKDA_CHUNK_SIZE {FLASHKDA_CHUNK_SIZE}"
+                )
         logger.info(
             "KVShrinkConnector(%s): block_size=%d, has_mamba=%s, "
-            "mamba_cache_mode=%r, prefix caching=%s",
+            "prefill checkpoint=%s, mamba_cache_mode=%r, prefix caching=%s",
             role.name,
             self.block_size,
             self.has_mamba,
+            self.has_prefill_checkpoint,
             vllm_config.cache_config.mamba_cache_mode,
             vllm_config.cache_config.enable_prefix_caching,
         )
@@ -253,6 +268,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             self.kvstore = None
+            # The model is loaded by now and CUDA graphs are captured after this.
+            patch_kimi_k3_mla_kv_transfer()
             if not iaxl_envs.IAXL_RDMA_ENABLE:  # compression/DSA run on the daemon node
                 self._bind_cpu_affinity()
                 self._bind_intel_accel()
@@ -410,11 +427,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if end <= start:
             return
 
-        # Attention saves every full block; mamba only holds the state at the
-        # end of a block-aligned chunk, in slot end - 1.
+        # Attention saves every full block; mamba saves only the state in slot end - 1.
+        chunk_ends_on_block = end * self.block_size == num_tokens
+        # FlashKDA writes the state at the chunk's last full block when the chunk starts on one.
+        prefill_checkpoint = (
+            self.has_prefill_checkpoint and num_computed_tokens % self.block_size == 0
+        )
         save_mamba = (
             self.has_mamba
-            and end * self.block_size == num_tokens
+            and (chunk_ends_on_block or prefill_checkpoint)
             and not state.mamba_existence_cache[end - 1]
         )
         block_ids = tuple(
