@@ -2,6 +2,7 @@
 """vLLM general plugin (entry point group ``vllm.general_plugins``)."""
 
 import dataclasses
+import os
 import sys
 
 from vllm.logger import init_logger
@@ -68,6 +69,104 @@ def _patch_mamba_block_size_validator() -> None:
     rebuild_dataclass(VllmConfig, force=True)
 
 
+def _force_external() -> bool:
+    """Every KV block must come from the connector, not the local prefix cache."""
+    return os.getenv("KVSHRINK_FORCE_EXTERNAL", "0") == "1"
+
+
+def _patch_force_external() -> None:
+    """Zero the local prefix lookup so the connector supplies the whole prefix.
+
+    Prefix caching stays on, so vLLM still hashes blocks and still produces the
+    mamba boundary hand-offs the connector saves.
+    """
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    orig_connector = KVCacheManager.get_computed_blocks_for_connector
+    orig = KVCacheManager.get_computed_blocks
+
+    def get_computed_blocks_for_connector(self, request, max_cache_hit_length=None):
+        if _force_external():
+            return self.empty_kv_cache_blocks, 0, 0, False
+        return orig_connector(self, request, max_cache_hit_length)
+
+    def get_computed_blocks(self, request, max_cache_hit_length=None):
+        if _force_external():
+            return self.empty_kv_cache_blocks, 0, 0
+        return orig(self, request, max_cache_hit_length)
+
+    KVCacheManager.get_computed_blocks_for_connector = get_computed_blocks_for_connector
+    KVCacheManager.get_computed_blocks = get_computed_blocks
+    logger.info(
+        "KVShrink force-external patch registered (active when "
+        "KVSHRINK_FORCE_EXTERNAL=1): KVCacheManager local prefix lookup disabled"
+    )
+
+
+def _patch_qsa_per_layer() -> bool:
+    """Wrap Qwen4Exp QSA attention with per-layer load/save hooks."""
+    if os.getenv("IAXL_QSA_PER_LAYER_PATCH", "0") != "1":
+        return True
+    try:
+        from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from vllm.model_executor.layers.attention.attention import (
+            get_attention_context,
+        )
+    except Exception:  # vLLM too old for these helpers
+        return False
+
+    # qsa.py and model.py import each other, so importing the submodule before
+    # the model exists raises. Once the model is built it is already cached.
+    module = sys.modules.get("vllm.models.qwen4_exp.nvidia.qsa")
+    if module is None:
+        try:
+            from vllm.models.qwen4_exp.nvidia import qsa as module  # type: ignore[no-redef]
+        except Exception:  # not this model, or not imported yet
+            return False
+
+    cls = getattr(module, "Qwen4ExpQSAAttention", None)
+    if cls is None:
+        return False
+    original = cls._run_qsa
+    if getattr(original, "_iaxl_per_layer", False):
+        return True
+
+    @eager_break_during_capture  # outermost: wait/save run in the eager segment
+    def _run_qsa(self, projected_qk, positions, query, key, value, output,
+                 output_gate, qkv):
+        if not has_kv_transfer_group():
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        connector = get_kv_transfer_group()
+        if not connector.has_connector_metadata():
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        layer_name = self.layer_name
+        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        if attn_metadata is None:
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        connector.wait_for_layer_load(layer_name)
+        result = original(self, projected_qk, positions, query, key, value,
+                          output, output_gate, qkv)
+        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+        return result
+
+    _run_qsa._iaxl_per_layer = True
+    cls._run_qsa = _run_qsa
+    logger.info("QSA per-layer KV transfer patch installed")
+    return True
+
+
+def maybe_install_qsa_per_layer() -> bool:
+    """Call once the model is built; the worker connector does this."""
+    return _patch_qsa_per_layer()
+
+
 def patch_kimi_k3_mla_kv_transfer() -> None:
     """Hook Kimi-K3's MLA layers into the KV connector; no-op unless the model loaded them."""
     mla_module = sys.modules.get("vllm.models.kimi_k3.nvidia.mla")
@@ -110,6 +209,7 @@ def register() -> None:
     _patch_mamba_cache_mode()
     _patch_mamba_block_size_validator()
     MambaModelConfig._mamba_align_patched = True
+    _patch_force_external()
     logger.info(
         "Mamba align patch registered: MambaModelConfig.verify_and_update_config, "
         "VllmConfig.validate_mamba_block_size"
