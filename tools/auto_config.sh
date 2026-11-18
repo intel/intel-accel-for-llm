@@ -266,21 +266,48 @@ qat_auto_detect() {
     echo "$result"
 }
 
+# Assign one distinct enabled, dedicated user work queue per worker.  Several
+# work queues may belong to the same physical DSA device; dedicated queues may
+# not be assigned to more than one worker.  Keep the existing strict NUMA
+# affinity: no cross-node fallback that could silently hurt transfer latency.
 dsa_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
+    local sysfs_root=${IAXL_DSA_SYSFS_ROOT:-/sys}
     local gpu_output rank gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
-    local selected_dsa selected_wq result
-    local -a gpu_rows=() dsa_paths=() used_dsa=() rank_wqs=() candidate_wqs=()
+    local selected_dsa selected_wq wq result total_wqs=0
+    local -a gpu_rows=() dsa_paths=() rank_wqs=() candidate_wqs=()
+    local -A used_wqs=()
 
+    validate_tp_size "$tp_size" || return 1
     gpu_output=$(gpu_rows "$tp_size") || return 1
     mapfile -t gpu_rows <<<"$gpu_output"
     mapfile -t dsa_paths < <(
-        for dsa_path in /sys/bus/dsa/devices/dsa[0-9]*; do
+        for dsa_path in "$sysfs_root"/bus/dsa/devices/dsa[0-9]*; do
             [[ -d "$dsa_path" ]] && echo "$dsa_path"
         done | sort -V
     )
-    if ((${#dsa_paths[@]} < tp_size)); then
-        echo "ERROR: TP_SIZE=$tp_size requires at least $tp_size DSA devices, but only ${#dsa_paths[@]} were found" >&2
+
+    # Discover all eligible WQs, not merely one queue per DSA device.
+    # The overrideable root makes the topology deterministic in unit tests.
+    for dsa_path in "${dsa_paths[@]}"; do
+        dsa_name=${dsa_path##*/}
+        [[ -r "$dsa_path/numa_node" ]] || continue
+        dsa_numa=$(<"$dsa_path/numa_node")
+        dsa_id=${dsa_name#dsa}
+        mapfile -t candidate_wqs < <(
+            for wq_path in "$sysfs_root"/bus/dsa/devices/wq"$dsa_id".*; do
+                [[ -e "$wq_path" ]] || continue
+                [[ -r "$wq_path/type" && -r "$wq_path/state" && -r "$wq_path/mode" ]] || continue
+                [[ "$(<"$wq_path/type")" == "user" ]] || continue
+                [[ "$(<"$wq_path/state")" == "enabled" ]] || continue
+                [[ "$(<"$wq_path/mode")" == "dedicated" ]] || continue
+                basename "$wq_path"
+            done | sort -V
+        )
+        total_wqs=$((total_wqs + ${#candidate_wqs[@]}))
+    done
+    if ((total_wqs < tp_size)); then
+        echo "ERROR: TP_SIZE=$tp_size requires $tp_size enabled dedicated user DSA work queues; found $total_wqs across ${#dsa_paths[@]} DSA devices" >&2
         return 1
     fi
 
@@ -292,30 +319,34 @@ dsa_auto_detect() {
         selected_wq=""
         for dsa_path in "${dsa_paths[@]}"; do
             dsa_name=${dsa_path##*/}
-            [[ " ${used_dsa[*]} " == *" $dsa_name "* ]] && continue
+            [[ -r "$dsa_path/numa_node" ]] || continue
             dsa_numa=$(<"$dsa_path/numa_node")
             [[ "$dsa_numa" == "$gpu_numa" ]] || continue
 
             dsa_id=${dsa_name#dsa}
             mapfile -t candidate_wqs < <(
-                for wq_path in /sys/bus/dsa/devices/wq"$dsa_id".*; do
+                for wq_path in "$sysfs_root"/bus/dsa/devices/wq"$dsa_id".*; do
                     [[ -e "$wq_path" ]] || continue
+                    [[ -r "$wq_path/type" && -r "$wq_path/state" && -r "$wq_path/mode" ]] || continue
                     [[ "$(<"$wq_path/type")" == "user" ]] || continue
                     [[ "$(<"$wq_path/state")" == "enabled" ]] || continue
+                    [[ "$(<"$wq_path/mode")" == "dedicated" ]] || continue
                     basename "$wq_path"
                 done | sort -V
             )
-            ((${#candidate_wqs[@]} > 0)) || continue
-            selected_dsa=$dsa_name
-            selected_wq=${candidate_wqs[0]}
-            break
+            for wq in "${candidate_wqs[@]}"; do
+                [[ -z "${used_wqs[$wq]:-}" ]] || continue
+                selected_dsa=$dsa_name
+                selected_wq=$wq
+                break 2
+            done
         done
 
-        if [[ -z "$selected_dsa" ]]; then
-            echo "ERROR: no unused DSA with enabled user WQs is available on NUMA $gpu_numa for GPU $gpu_index" >&2
+        if [[ -z "$selected_wq" ]]; then
+            echo "ERROR: no unused enabled dedicated user DSA work queue on NUMA $gpu_numa for GPU $gpu_index (rank $rank)" >&2
             return 1
         fi
-        used_dsa+=("$selected_dsa")
+        used_wqs[$selected_wq]=1
         rank_wqs+=("$selected_wq")
         echo "KVShrink GPU rank $rank: DSA=$selected_dsa WQ=$selected_wq" >&2
     done
