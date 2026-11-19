@@ -114,9 +114,8 @@ _HOOKED_KERNELS = frozenset(
 
 
 def _is_cache_module(module: Any) -> bool:
-    """A cache module only registers itself: ``def forward(self) -> None: ...``."""
-    code = getattr(type(module).forward, "__code__", None)
-    return code is not None and len(code.co_code) <= 2
+    """Whether this layer is a passive cache (a patch declares it)."""
+    return bool(getattr(type(module), "_iaxl_cache", False))
 
 
 def _forward_calls_hook(module: Any) -> bool:

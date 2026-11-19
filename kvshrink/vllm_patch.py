@@ -161,6 +161,7 @@ def _patch_qsa_per_layer() -> bool:
     # _run_qsa, so one hook covers them together.
     declare_hooked_class(cls)
     declare_hooked_class(QSACompressedKeyCache)
+    declare_cache_class(QSACompressedKeyCache)
     logger.info("QSA per-layer KV transfer patch installed")
     return True
 
@@ -217,6 +218,7 @@ def _patch_indexer_per_layer() -> bool:
         cls.forward = forward
         # The registered layer is the cache, not the indexer that owns it.
         declare_hooked_class(DeepseekV32IndexerCache)
+        declare_cache_class(DeepseekV32IndexerCache)
         patched = True
         logger.info("Indexer per-layer KV transfer patch installed on %s", module_name)
     return patched
@@ -227,6 +229,15 @@ def maybe_install_qsa_per_layer() -> bool:
     installed = _patch_qsa_per_layer()
     _patch_indexer_per_layer()
     return installed
+
+
+def declare_cache_class(module_class: type) -> None:
+    """Mark a class whose instances are passive caches (no forward of their own).
+
+    The connector must not let such a layer's hook capture a sibling cache that
+    another layer's forward has not written yet.
+    """
+    module_class._iaxl_cache = True
 
 
 def declare_hooked_class(module_class: type) -> None:
