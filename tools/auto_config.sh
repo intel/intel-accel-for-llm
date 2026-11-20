@@ -272,7 +272,6 @@ qat_auto_detect() {
 # affinity: no cross-node fallback that could silently hurt transfer latency.
 dsa_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
-    local sysfs_root=${IAXL_DSA_SYSFS_ROOT:-/sys}
     local gpu_output rank gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
     local selected_dsa selected_wq selected_count dsa_count wq result total_wqs=0
     local -a gpu_rows=() dsa_paths=() rank_wqs=() candidate_wqs=()
@@ -282,20 +281,19 @@ dsa_auto_detect() {
     gpu_output=$(gpu_rows "$tp_size") || return 1
     mapfile -t gpu_rows <<<"$gpu_output"
     mapfile -t dsa_paths < <(
-        for dsa_path in "$sysfs_root"/bus/dsa/devices/dsa[0-9]*; do
+        for dsa_path in /sys/bus/dsa/devices/dsa[0-9]*; do
             [[ -d "$dsa_path" ]] && echo "$dsa_path"
         done | sort -V
     )
 
     # Discover all eligible WQs, not merely one queue per DSA device.
-    # The overrideable root makes the topology deterministic in unit tests.
     for dsa_path in "${dsa_paths[@]}"; do
         dsa_name=${dsa_path##*/}
         [[ -r "$dsa_path/numa_node" ]] || continue
         dsa_numa=$(<"$dsa_path/numa_node")
         dsa_id=${dsa_name#dsa}
         mapfile -t candidate_wqs < <(
-            for wq_path in "$sysfs_root"/bus/dsa/devices/wq"$dsa_id".*; do
+            for wq_path in /sys/bus/dsa/devices/wq"$dsa_id".*; do
                 [[ -e "$wq_path" ]] || continue
                 [[ -r "$wq_path/type" && -r "$wq_path/state" && -r "$wq_path/mode" ]] || continue
                 [[ "$(<"$wq_path/type")" == "user" ]] || continue
@@ -333,7 +331,7 @@ dsa_auto_detect() {
 
             dsa_id=${dsa_name#dsa}
             mapfile -t candidate_wqs < <(
-                for wq_path in "$sysfs_root"/bus/dsa/devices/wq"$dsa_id".*; do
+                for wq_path in /sys/bus/dsa/devices/wq"$dsa_id".*; do
                     [[ -e "$wq_path" ]] || continue
                     [[ -r "$wq_path/type" && -r "$wq_path/state" && -r "$wq_path/mode" ]] || continue
                     [[ "$(<"$wq_path/type")" == "user" ]] || continue
