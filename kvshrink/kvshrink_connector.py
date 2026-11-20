@@ -133,21 +133,6 @@ def _hookless_layer_names(
     return layers, hookless
 
 
-def _owned_caches(
-    layers: dict[str, Any], cache_layers: dict[str, torch.Tensor]
-) -> dict[str, list[str]]:
-    """Return, per layer, the registered caches held in its module tree."""
-    cache_names = {id(module): name for name, module in layers.items() if name in cache_layers}
-    owned: dict[str, list[str]] = {}
-    for name, module in layers.items():
-        for holder in module.modules():
-            for value in vars(holder).values():
-                cache_name = cache_names.get(id(value))
-                if cache_name is not None and cache_name != name:
-                    owned.setdefault(name, []).append(cache_name)
-    return owned
-
-
 def _is_cache_module(module: Any) -> bool:
     """Whether this layer is a passive cache (a patch declares it)."""
     return bool(getattr(type(module), "_iaxl_cache", False))
@@ -704,37 +689,15 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 for ordinal, ln in enumerate(sorted(names)):
                     self._layer_key[ln] = f"{index}.{ordinal}"
 
-        # Which caches a hook covers: the layer's own KV plus the caches its
-        # module owns. Ownership comes from the module graph, so a cache read by
-        # another layer's forward (an indexer ahead of MLA) is never captured
-        # before that layer wrote it.
-        owned = _owned_caches(layers, kv_caches)
-
-        self._hook_keys: dict[str, list[str]] = {}
+        # A layer that runs real work covers every cache of its transformer
+        # layer; a cache module covers only itself.
+        self._hook_coverage: dict[str, list[str]] = {}
         for ln in kv_caches:
-            keys = [self._layer_key[ln]]
-            keys += [
-                self._layer_key[cache_ln]
-                for cache_ln in owned.get(ln, ())
-                if cache_ln in kv_caches
-            ]
             module = layers.get(ln)
             if module is not None and not _is_cache_module(module):
-                # A layer that runs real work also covers the sibling caches of
-                # its transformer layer; a cache module covers only itself.
-                keys += [
-                    self._layer_key[sibling]
-                    for sibling in by_index[extract_layer_index(ln)]
-                    if sibling != ln and sibling not in owned.get(ln, ())
-                ]
-            self._hook_keys[ln] = keys
-
-        self._layer_group_all = {
-            ln: group_id
-            for group_id, group in self.groups.items()
-            for ln in group.layer_names
-            if ln in kv_caches
-        }
+                self._hook_coverage[ln] = list(by_index[extract_layer_index(ln)])
+            else:
+                self._hook_coverage[ln] = [ln]
 
         # Layers whose attention runs the per-layer transfer hook; anything
         # else is left to wait_for_save().
@@ -746,24 +709,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         }
 
         # Layers the per-layer hook never covers: wait_for_save submits these.
-        self._hookless_keys: dict[int, list[str]] = {}
-        for ln in hookless_layers:
-            key = self._layer_key.get(ln)
-            group_id = self._layer_group_all.get(ln)
-            if key is not None and group_id is not None:
-                self._hookless_keys.setdefault(group_id, []).append(key)
+        self._hookless_group_layers: dict[int, list[str]] = {}
+        for group_id, group in self.groups.items():
+            names = [ln for ln in group.layer_names if ln in hookless_layers]
+            if names:
+                self._hookless_group_layers[group_id] = names
 
-        self._key_group = {
-            self._layer_key[ln]: group_id for ln, group_id in self._layer_group.items()
-        }
-
-        # Replace scheduler layer names with the short keys the KVStore uses.
-        for group in self.groups.values():
-            group.layer_names = [
-                self._layer_key[ln] for ln in group.layer_names if ln in kv_caches
-            ]
         self._last_layer_name = next(reversed(kv_caches)) if kv_caches else None
-        self._layer_names = [self._layer_key[ln] for ln in kv_caches]
+        self._layer_names = list(kv_caches)
         self.num_mamba_layers = sum(
             len(group.layer_names)
             for group in self.groups.values()
@@ -837,7 +790,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             tasks = self._store().get(
                 block_indices=block_ids,
                 block_hashs=block_hashes,
-                layer_names=self.groups[group_id].layer_names,
+                layer_names=[self._layer_key[ln] for ln in self.groups[group_id].layer_names],
                 label=self.groups[group_id].label,
             )
             if self._current_get_tasks is None:
@@ -885,9 +838,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             for layer_index, layer_name in enumerate(self._layer_names):
                 # -1 promotes only after every layer is loaded.
                 if prefetch_layers == -1 or layer_index < prefetch_layers:
-                    priorities[layer_name] = LOAD_PRIORITY_P1
+                    priorities[self._layer_key[layer_name]] = LOAD_PRIORITY_P1
                 else:
-                    priorities[layer_name] = LOAD_PRIORITY_P2
+                    priorities[self._layer_key[layer_name]] = LOAD_PRIORITY_P2
                     has_remaining_layers = True
             load_bundle_id = self._next_load_bundle_id
             self._next_load_bundle_id += 1
@@ -899,7 +852,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 tasks.update(self._store().get(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=group.layer_names,
+                    layer_names=[self._layer_key[ln] for ln in group.layer_names],
                     description=req_id,
                     label=group.label,
                     priorities=priorities,
@@ -918,12 +871,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if layer_name not in self._layer_key:
             return
 
-        layer_keys = self._hook_keys[layer_name]
+        covered = [self._layer_key[name] for name in self._hook_coverage[layer_name]]
         # Wait for the synchronous (batched) loads for this layer.
         if self._current_get_tasks:
             success = self._store().get_wait(
                 get_results=self._current_get_tasks,
-                layer_names=layer_keys,
+                layer_names=covered,
             )
             if not success:
                 raise RuntimeError(
@@ -936,7 +889,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for tasks in self._active_promoted_tasks.values():
             success = self._store().get_wait(
                 get_results=tasks,
-                layer_names=layer_keys,
+                layer_names=covered,
             )
             if not success:
                 raise RuntimeError(
@@ -965,20 +918,20 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # The hook covers this layer's own KV and the caches its module owns;
         # each of them lives in its own group.
-        keys_by_group: dict[int, list[str]] = {}
-        for key in self._hook_keys[layer_name]:
-            group_id = self._key_group.get(key)
+        layers_by_group: dict[int, list[str]] = {}
+        for name in self._hook_coverage[layer_name]:
+            group_id = self._layer_group.get(name)
             if group_id is not None:
-                keys_by_group.setdefault(group_id, []).append(key)
+                layers_by_group.setdefault(group_id, []).append(name)
         for req_id, request in metadata.reqs_to_save.requests.items():
-            for group_id, layer_keys in keys_by_group.items():
+            for group_id, layer_names in layers_by_group.items():
                 block_ids, block_hashes = request.for_group(group_id)
                 if not block_ids:
                     continue
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=layer_keys,
+                    layer_names=[self._layer_key[ln] for ln in layer_names],
                     label=self.groups[group_id].label,
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
@@ -987,21 +940,21 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # Layers without a per-layer hook (mamba state, unclaimed caches) are
         # submitted after the forward; nothing waits here: request_finished()
         # keeps the blocks alive until every queued copy lands.
-        if self._connector_metadata is None or not self._hookless_keys:
+        if self._connector_metadata is None or not self._hookless_group_layers:
             return
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, KVShrinkConnectorMetadata):
             raise TypeError("Unexpected connector metadata")
 
         for req_id, request in metadata.reqs_to_save.requests.items():
-            for group_id, layer_keys in self._hookless_keys.items():
+            for group_id, layer_names in self._hookless_group_layers.items():
                 block_ids, block_hashes = request.for_group(group_id)
                 if not block_ids:
                     continue
                 tasks = self._store().put(
                     block_indices=block_ids,
                     block_hashs=block_hashes,
-                    layer_names=layer_keys,
+                    layer_names=[self._layer_key[ln] for ln in layer_names],
                     label=self.groups[group_id].label,
                 )
                 self._current_put_tasks.setdefault(req_id, []).append(tasks)
@@ -1023,7 +976,10 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             else:
                 # Early promote once the first N layers are loaded; the remaining
                 # layers are waited on-demand in wait_for_layer_load().
-                first_n_layers = self._layer_names[:async_load_layers]
+                first_n_layers = [
+                    self._layer_key[name]
+                    for name in self._layer_names[:async_load_layers]
+                ]
                 if self._store().get_wait(
                     get_results=tasks, layer_names=first_n_layers, wait=False
                 ):
