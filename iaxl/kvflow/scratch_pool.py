@@ -9,10 +9,9 @@ A single max-page pool wastes memory: a 41.25 KB indexer page would sit in an
 stages through a slot sized for it.
 
 Capacity is split by layer count: every layer gets the same number of blocks,
-so a class's bytes stay proportional to ``layers * page_bytes``. When the
-exact pool runs dry, ``allocate`` borrows from the smallest larger pool of the
-same dtype; the caller gets the pool name back and must return the blocks to
-that same pool.
+so a class's bytes stay proportional to ``layers * page_bytes``. A class only
+serves its own geometry: two layers of the same geometry share one class, and a
+dry class waits for in-flight transfers instead of taking another class's slots.
 
 allocate()/release() are not thread-safe: call them from one thread only.
 """
@@ -48,7 +47,6 @@ class _Class:
         self._free: List[int] = list(range(num_blocks))  # LIFO: pop from the end
         self._allocate_count = 0
         self._release_count = 0
-        self.borrowed = 0
 
     @property
     def num_blocks(self) -> int:
@@ -142,21 +140,13 @@ class ScratchPool:
 
     def allocate(self, count: int, shape: Sequence[int],
                  dtype: torch.dtype) -> Optional[List[int]]:
-        """Global block indices for one transfer: exact pool first, then the smallest larger one."""
+        """Global block indices for one transfer, or None when this geometry is dry."""
         cls = self._exact(shape, dtype)
         if cls is None:
             return None
-        if (blocks := cls.take(count)) is not None:
-            return [cls.base | i for i in blocks]
-        for other in self._classes:
-            if other is cls or other.dtype != dtype or other.block_bytes <= cls.block_bytes:
-                continue
-            if (blocks := other.take(count)) is not None:
-                other.borrowed += count
-                logger.debug("ScratchPool: borrowed %d x %d B from %s for %s",
-                             count, cls.block_bytes, other.name, cls.name)
-                return [other.base | i for i in blocks]
-        return None
+        if (blocks := cls.take(count)) is None:
+            return None
+        return [cls.base | i for i in blocks]
 
     def release(self, indices: List[int]) -> None:
         by_class: Dict[int, List[int]] = {}
@@ -186,13 +176,13 @@ class ScratchPool:
     def classes(self) -> List[dict]:
         return [
             {"name": cls.name, "page_bytes": cls.block_bytes, "dtype": str(cls.dtype),
-             "blocks": cls.num_blocks, "free": cls.free(), "borrowed": cls.borrowed}
+             "blocks": cls.num_blocks, "free": cls.free()}
             for cls in self._classes
         ]
 
     def status(self) -> str:
         parts = [
-            f"{cls.name}: {cls.free()}/{cls.num_blocks} free, borrowed={cls.borrowed}"
+            f"{cls.name}: {cls.free()}/{cls.num_blocks} free"
             for cls in self._classes
         ]
         return "ScratchPool: " + "; ".join(parts)
