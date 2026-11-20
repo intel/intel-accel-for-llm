@@ -43,9 +43,11 @@ class Context {
         ctx.pool_ = &kv_pool::get_kv_pool(pool_name);
         ctx.cpu_pool_ = &kv_pool::get_kv_pool(cpu_pool);
         IAXL_CHECK(ctx.cpu_pool_->device == PoolDevice::CPU, "cpu_pool is not in CPU memory");
-        ctx.pool_->check_same_block_geometry(*ctx.cpu_pool_);
 
         const kv_pool::KVPool &p = *ctx.pool_;
+        // Mixed page sizes share one max-page staging pool, remote pools included:
+        // the staging block only has to cover the block being transferred.
+        ctx.pool_->check_staging_geometry(*ctx.cpu_pool_);
         if (p.device == PoolDevice::Remote) {
 #ifdef CPU_SUPPORT
             TORCH_CHECK(false, "RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link");
