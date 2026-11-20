@@ -267,9 +267,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if role == KVConnectorRole.SCHEDULER:
-            # One transferred block must correspond to exactly one block hash;
-            # finer hash granularity (several hashes per block) needs the
-            # per-group hash mapping that this connector does not implement.
             _, hash_block_size = resolve_kv_cache_block_sizes(
                 kv_cache_config, vllm_config
             )
