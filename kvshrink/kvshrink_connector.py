@@ -20,6 +20,7 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -266,6 +267,17 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         if role == KVConnectorRole.SCHEDULER:
+            # One transferred block must correspond to exactly one block hash;
+            # finer hash granularity (several hashes per block) needs the
+            # per-group hash mapping that this connector does not implement.
+            _, hash_block_size = resolve_kv_cache_block_sizes(
+                kv_cache_config, vllm_config
+            )
+            if hash_block_size != self.block_size:
+                raise ValueError(
+                    "KVShrinkConnector needs one vLLM block hash per "
+                    f"{self.block_size} tokens, got hash_block_size={hash_block_size}"
+                )
             hash_algo = vllm_config.cache_config.prefix_caching_hash_algo
             if (
                 hash_algo in ("xxhash", "xxhash_cbor")
