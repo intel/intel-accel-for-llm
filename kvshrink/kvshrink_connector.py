@@ -170,15 +170,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # are not transferable keep their id but carry no layers.
         self.num_groups = len(kv_cache_config.kv_cache_groups)
         self.groups: dict[int, Group] = {}
-        # Whether a mamba group writes in-prefill checkpoints (FlashKDA).
-        self.has_prefill_checkpoint = False
         for group_id, kv_group in enumerate(kv_cache_config.kv_cache_groups):
             spec = kv_group.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = next(iter(spec.kv_cache_specs.values()))
             is_mamba = isinstance(spec, MambaSpec)
-            if is_mamba and spec.num_prefill_checkpoint_blocks > 0:
-                self.has_prefill_checkpoint = True
             if not (kv_group.enable_kv_transfer and kv_group.kv_cache_spec.prefix_cacheable):
                 continue
             self.groups[group_id] = Group(
@@ -199,24 +195,12 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         }
         assert len(block_sizes) == 1, block_sizes
         self.block_size = block_sizes.pop()
-        if self.has_prefill_checkpoint:
-            from vllm.models.kimi_k3.nvidia import kda_metadata
-
-            # FlashKDA writes a checkpoint only at offsets that are a multiple of its chunk size.
-            # Older builds have no such constant, and mamba state is saved from boundary offloads.
-            chunk_size = getattr(kda_metadata, "FLASHKDA_CHUNK_SIZE", None)
-            if chunk_size is not None and self.block_size % chunk_size != 0:
-                raise ValueError(
-                    f"KVShrinkConnector needs block_size {self.block_size} to be a "
-                    f"multiple of FLASHKDA_CHUNK_SIZE {chunk_size}"
-                )
         logger.info(
             "KVShrinkConnector(%s): block_size=%d, has_mamba=%s, "
-            "prefill checkpoint=%s, mamba_cache_mode=%r, prefix caching=%s",
+            "mamba_cache_mode=%r, prefix caching=%s",
             role.name,
             self.block_size,
             self.has_mamba,
-            self.has_prefill_checkpoint,
             vllm_config.cache_config.mamba_cache_mode,
             vllm_config.cache_config.enable_prefix_caching,
         )
