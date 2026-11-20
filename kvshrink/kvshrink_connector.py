@@ -377,7 +377,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._req_states[request.request_id] = state
 
         matched_blocks = next(
-            (index for index, exists in enumerate(existence_cache) if not exists),
+            (
+                index
+                for index, exists in enumerate(existence_cache)
+                if not exists
+            ),
             len(existence_cache),
         )
         if self.has_mamba:
