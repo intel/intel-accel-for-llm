@@ -678,11 +678,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # A transformer layer can own more than one cache module (e.g. MLA and
         # its indexer). Append an ordinal to keep the short KVStore keys unique.
-        by_index: dict[int, list[str]] = {}
+        index_layers: dict[int, list[str]] = {}
         for ln in kv_caches:
-            by_index.setdefault(extract_layer_index(ln), []).append(ln)
+            index_layers.setdefault(extract_layer_index(ln), []).append(ln)
         self._layer_key = {}
-        for index, names in by_index.items():
+        for index, names in index_layers.items():
             if len(names) == 1:
                 self._layer_key[names[0]] = str(index)
             else:
@@ -695,7 +695,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         for ln in kv_caches:
             module = layers.get(ln)
             if module is not None and not _is_cache_module(module):
-                self._hook_coverage[ln] = list(by_index[extract_layer_index(ln)])
+                self._hook_coverage[ln] = list(index_layers[extract_layer_index(ln)])
             else:
                 self._hook_coverage[ln] = [ln]
 
