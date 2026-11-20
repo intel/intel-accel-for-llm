@@ -866,8 +866,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._current_get_tasks and not self._active_promoted_tasks:
             return
-        # Draft (MTP) layers past the base model's hidden layers are not
-        # registered, but they do run attention and therefore reach this hook.
+        # Draft (MTP) layers are not registered.
         if layer_name not in self._layer_key:
             return
 
@@ -907,8 +906,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        # Draft (MTP) layers past the base model's hidden layers are not
-        # registered, but they do run attention and therefore reach this hook.
+        # Draft (MTP) layers are not registered.
         if self._connector_metadata is None or layer_name not in self._layer_group:
             return
 
