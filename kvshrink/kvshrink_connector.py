@@ -113,6 +113,41 @@ _HOOKED_KERNELS = frozenset(
 )
 
 
+def _hookless_layer_names(
+    vllm_config: VllmConfig, kv_caches: dict[str, torch.Tensor]
+) -> tuple[dict[str, Any], set[str]]:
+    """Return the registered layer modules and the names without a per-layer hook."""
+    from vllm.config.vllm import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+    layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    hookless = {
+        name
+        for name in kv_caches
+        if name not in layers
+        or not (
+            getattr(type(layers[name]), "_iaxl_per_layer", False)
+            or _forward_calls_hook(layers[name])
+        )
+    }
+    return layers, hookless
+
+
+def _owned_caches(
+    layers: dict[str, Any], cache_layers: dict[str, torch.Tensor]
+) -> dict[str, list[str]]:
+    """Return, per layer, the registered caches held in its module tree."""
+    cache_names = {id(module): name for name, module in layers.items() if name in cache_layers}
+    owned: dict[str, list[str]] = {}
+    for name, module in layers.items():
+        for holder in module.modules():
+            for value in vars(holder).values():
+                cache_name = cache_names.get(id(value))
+                if cache_name is not None and cache_name != name:
+                    owned.setdefault(name, []).append(cache_name)
+    return owned
+
+
 def _is_cache_module(module: Any) -> bool:
     """Whether this layer is a passive cache (a patch declares it)."""
     return bool(getattr(type(module), "_iaxl_cache", False))
@@ -637,19 +672,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
 
-        from vllm.config.vllm import get_layers_from_vllm_config
-        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
-        layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
-        hookless_layers = {
-            ln
-            for ln in kv_caches
-            if ln not in layers
-            or not (
-                getattr(type(layers[ln]), "_iaxl_per_layer", False)
-                or _forward_calls_hook(layers[ln])
-            )
-        }
+        layers, hookless_layers = _hookless_layer_names(self.vllm_config, kv_caches)
         self.num_hookless_layers = len(hookless_layers)
         logger.info(
             "KVShrinkConnector: %d of %d registered layers have no per-layer hook",
@@ -685,15 +708,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         # module owns. Ownership comes from the module graph, so a cache read by
         # another layer's forward (an indexer ahead of MLA) is never captured
         # before that layer wrote it.
-        cache_names = {id(module): ln for ln, module in layers.items() if ln in kv_caches}
-        owned: dict[str, list[str]] = {}
-        for ln, module in layers.items():
-            # A registered layer may hold its cache on a submodule.
-            for holder in module.modules():
-                for value in vars(holder).values():
-                    cache_ln = cache_names.get(id(value))
-                    if cache_ln is not None and cache_ln != ln:
-                        owned.setdefault(ln, []).append(cache_ln)
+        owned = _owned_caches(layers, kv_caches)
 
         self._hook_keys: dict[str, list[str]] = {}
         for ln in kv_caches:
