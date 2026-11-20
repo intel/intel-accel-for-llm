@@ -418,9 +418,11 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         selected_layers = self._async_load_layer_config.select(
             len(self._req_states)
         )
-        # The worker widens the first-loaded layer count to cover the layers
-        # nobody waits on, so the scheduler only says whether to load at all.
-        use_async = num_new_tokens > 0
+        # A synchronous load lets vLLM zero the blocks on the compute stream
+        # under our copy, which a hybrid model cannot survive; otherwise the
+        # policy may still ask for it. The worker widens the first-loaded layer
+        # count when the load is asynchronous.
+        use_async = num_new_tokens > 0 and (selected_layers != 0 or self.has_mamba)
         state.is_async = use_async
         if use_async:
             state.async_load_layers = selected_layers
