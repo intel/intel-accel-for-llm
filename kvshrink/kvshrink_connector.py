@@ -365,10 +365,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         # vLLM always computes the last prompt token, so it is never loaded.
         num_blocks = (request.num_tokens - 1) // self.block_size
-        block_hashes = [
-            block_hash.hex()
-            for block_hash in request.block_hashes[:num_blocks]
-        ]
+        block_hashes: list[str] = []
+        for block_hash in request.block_hashes[:num_blocks]:
+            block_hashes.append(block_hash.hex())
         existence_cache = self._store().has(block_hashes)
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
