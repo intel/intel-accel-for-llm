@@ -224,11 +224,10 @@ def _patch_indexer_per_layer() -> bool:
     return patched
 
 
-def maybe_install_qsa_per_layer() -> bool:
+def install_per_layer_patches() -> None:
     """Call once the model is built; the worker connector does this."""
-    installed = _patch_qsa_per_layer()
+    _patch_qsa_per_layer()
     _patch_indexer_per_layer()
-    return installed
 
 
 def declare_cache_class(module_class: type) -> None:

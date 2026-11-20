@@ -20,7 +20,6 @@ from vllm.distributed.parallel_state import (
 )
 import vllm.envs as envs
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -41,7 +40,7 @@ from iaxl.envs import envs as iaxl_envs
 from iaxl.utils.affinity import bind_cpu_affinity, bind_intel_accel
 
 from .async_load_config import load_async_load_layer_config_from_env
-from .vllm_patch import patch_kimi_k3_mla_kv_transfer
+from .vllm_patch import install_per_layer_patches, patch_kimi_k3_mla_kv_transfer
 
 setup_root_logger(show_pid_tid=False)
 logger = logging.getLogger(__name__)
@@ -221,11 +220,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.cache_config.mamba_cache_mode,
             vllm_config.cache_config.enable_prefix_caching,
         )
-        self.num_mamba_layers = sum(
-            len(group.layer_names)
-            for group in self.groups.values()
-            if group.is_mamba
-        )
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.num_layers = self.model_config.get_num_layers(
             vllm_config.parallel_config
@@ -260,8 +254,8 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         self._current_put_tasks: dict[ReqId, list[dict[str, Any]]] = {}
         self._deferred_finished_req_ids: set[ReqId] = set()
         self._last_layer_name: Optional[str] = None
-        # vLLM layer name -> KVStore key (the layer index as a string): short keys
-        # cut the per-block hashing/RPC cost of the long module names.
+        # vLLM layer name -> KVStore key: the transformer layer index, plus an
+        # ordinal when one layer owns several caches.
         self._layer_key: dict[str, str] = {}
         self._layer_group: dict[str, int] = {}
         self.num_hookless_layers = 0
@@ -382,17 +376,18 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
             block_hash.hex()
             for block_hash in request.block_hashes[:num_blocks]
         ]
+        existence_cache = self._store().has(block_hashes)
         state = ReqState(
             num_computed_tokens=num_computed_tokens,
+            existence_cache=existence_cache,
             block_hashes=block_hashes,
         )
         self._req_states[request.request_id] = state
 
-        # One namespace per kind of content: attention and mamba boundary state.
-        matched_blocks = len(block_hashes)
-        state.existence_cache = self._store().has(block_hashes)
-        while matched_blocks > 0 and not state.existence_cache[matched_blocks - 1]:
-            matched_blocks -= 1
+        matched_blocks = next(
+            (index for index, exists in enumerate(existence_cache) if not exists),
+            len(existence_cache),
+        )
         if self.has_mamba:
             attention_matched_blocks = matched_blocks
             # A hit must end at a block whose mamba state was saved.
@@ -639,11 +634,9 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         return views
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        # Model-side patches (Qwen4Exp per-layer QSA transfer) need the model
-        # classes, which exist by the time the worker registers its caches.
-        from .vllm_patch import maybe_install_qsa_per_layer
-
-        maybe_install_qsa_per_layer()
+        # Model-side per-layer patches need the model classes, which exist by
+        # the time the worker registers its caches.
+        install_per_layer_patches()
 
         if not kv_caches:
             raise ValueError("kv_caches must not be empty")
@@ -705,10 +698,6 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                     cache_ln = cache_names.get(id(value))
                     if cache_ln is not None and cache_ln != ln:
                         owned.setdefault(ln, []).append(cache_ln)
-
-        by_index: dict[int, list[str]] = {}
-        for ln in kv_caches:
-            by_index.setdefault(extract_layer_index(ln), []).append(ln)
 
         self._hook_keys: dict[str, list[str]] = {}
         for ln in kv_caches:
