@@ -41,14 +41,20 @@ for id in 0 2 4 6; do
     add_wq "$id" 1
 done
 
-expected='wq0.0|wq0.1|wq2.0|wq2.1|wq4.0|wq4.1|wq6.0|wq6.1'
+expected='wq0.0|wq2.0|wq0.1|wq2.1|wq4.0|wq6.0|wq4.1|wq6.1'
 actual=$(dsa_auto_detect 8 2>"$workdir/success.log")
 [[ "$actual" == "$expected" ]] || { echo "FAIL TP=8: $actual"; exit 1; }
-echo 'PASS TP=8 maps two unique dedicated queues per physical DSA'
+echo 'PASS TP=8 balances ranks across NUMA-local DSAs'
 
 actual=$(dsa_auto_detect 4 2>"$workdir/tp4.log")
-[[ "$actual" == 'wq0.0|wq0.1|wq2.0|wq2.1' ]] || { echo "FAIL TP=4: $actual"; exit 1; }
-echo 'PASS TP=4 remains supported'
+[[ "$actual" == 'wq0.0|wq2.0|wq0.1|wq2.1' ]] || { echo "FAIL TP=4: $actual"; exit 1; }
+echo 'PASS TP=4 balances ranks across DSAs'
+
+# Regression: with two physical DSAs on NUMA 0, TP=2 must use both
+# before allocating a second work queue from either device.
+actual=$(dsa_auto_detect 2 2>"$workdir/tp2.log")
+[[ "$actual" == 'wq0.0|wq2.0' ]] || { echo "FAIL TP=2: $actual"; exit 1; }
+echo 'PASS TP=2 spreads work across physical DSAs'
 
 # Insufficient total queues: one WQ disabled.
 printf '%s\n' disabled >"$root/wq6.1/state"

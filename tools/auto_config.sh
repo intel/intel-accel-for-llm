@@ -274,9 +274,9 @@ dsa_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
     local sysfs_root=${IAXL_DSA_SYSFS_ROOT:-/sys}
     local gpu_output rank gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
-    local selected_dsa selected_wq wq result total_wqs=0
+    local selected_dsa selected_wq selected_count dsa_count wq result total_wqs=0
     local -a gpu_rows=() dsa_paths=() rank_wqs=() candidate_wqs=()
-    local -A used_wqs=()
+    local -A used_wqs=() dsa_rank_count=()
 
     validate_tp_size "$tp_size" || return 1
     gpu_output=$(gpu_rows "$tp_size") || return 1
@@ -317,11 +317,19 @@ dsa_auto_detect() {
 
         selected_dsa=""
         selected_wq=""
+        selected_count=0
         for dsa_path in "${dsa_paths[@]}"; do
             dsa_name=${dsa_path##*/}
             [[ -r "$dsa_path/numa_node" ]] || continue
             dsa_numa=$(<"$dsa_path/numa_node")
             [[ "$dsa_numa" == "$gpu_numa" ]] || continue
+
+            # Spread ranks across NUMA-local physical DSAs before sharing a DSA.
+            # dsa_paths is sorted numerically; retain the first device on ties.
+            dsa_count=${dsa_rank_count[$dsa_name]:-0}
+            if [[ -n "$selected_wq" ]] && ((dsa_count >= selected_count)); then
+                continue
+            fi
 
             dsa_id=${dsa_name#dsa}
             mapfile -t candidate_wqs < <(
@@ -338,7 +346,8 @@ dsa_auto_detect() {
                 [[ -z "${used_wqs[$wq]:-}" ]] || continue
                 selected_dsa=$dsa_name
                 selected_wq=$wq
-                break 2
+                selected_count=$dsa_count
+                break
             done
         done
 
@@ -347,6 +356,7 @@ dsa_auto_detect() {
             return 1
         fi
         used_wqs[$selected_wq]=1
+        dsa_rank_count[$selected_dsa]=$((${dsa_rank_count[$selected_dsa]:-0} + 1))
         rank_wqs+=("$selected_wq")
         echo "KVShrink GPU rank $rank: DSA=$selected_dsa WQ=$selected_wq" >&2
     done
