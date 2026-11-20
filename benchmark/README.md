@@ -56,3 +56,13 @@ bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --flamegraph tensor_xfer_fla
 ```
 
 This needs `perf` installed in the container and `kernel.perf_event_paranoid <= 2` on the host. Use `--flamegraph-call-graph dwarf` when binaries are built without frame pointers, and `--flamegraph-freq` to change the sampling rate. Profiling perturbs the timings, so use it for analysis runs rather than for reported numbers.
+
+### Full-duplex H2D/D2H
+
+`tensor_xfer_benchmark_bidir.py` runs both directions at the same time, one thread per direction, for `--seconds` (default 1), and reports each direction's GB/s while the other is active. `iaxl` uses the IAXL transfer path in both directions with `IAXL_KV_XFER_FULL_DUPLEX=1` (the script's default), so H2D goes to DSA and D2H to the CUDA copy engine as for the KV cache; export `IAXL_KV_XFER_FULL_DUPLEX=0` to compare with DSA in both directions. `cuda` and `batch` use two CUDA streams.
+
+```bash
+IAXL_DSA_GD_ENABLE=1 source setvars.sh
+LD_PRELOAD=$IAXL_LD_PRELOAD numactl --cpunodebind=0 --membind=0 \
+    python3 benchmark/tensor_xfer/tensor_xfer_benchmark_bidir.py --methods iaxl batch
+```

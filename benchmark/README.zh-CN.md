@@ -56,3 +56,13 @@ bash benchmark/tensor_xfer/tensor_xfer_benchmark.sh --flamegraph tensor_xfer_fla
 ```
 
 要求容器内已安装 `perf`，且宿主机 `kernel.perf_event_paranoid <= 2`。二进制文件未保留帧指针时可用 `--flamegraph-call-graph dwarf`，`--flamegraph-freq` 用于调整采样频率。采样会干扰计时，因此仅用于分析，不要用于上报性能数据。
+
+### 全双工 H2D/D2H
+
+`tensor_xfer_benchmark_bidir.py` 同时运行两个方向，每个方向一个线程，持续 `--seconds`（默认 1 秒），分别报告另一方向同时在跑时本方向的 GB/s。`iaxl` 两个方向都走 IAXL 传输路径，并默认设置 `IAXL_KV_XFER_FULL_DUPLEX=1`，即与 KV cache 一样 H2D 走 DSA、D2H 走 CUDA 拷贝引擎；导出 `IAXL_KV_XFER_FULL_DUPLEX=0` 可对比两个方向都走 DSA 的情况。`cuda` 和 `batch` 使用两个 CUDA stream。
+
+```bash
+IAXL_DSA_GD_ENABLE=1 source setvars.sh
+LD_PRELOAD=$IAXL_LD_PRELOAD numactl --cpunodebind=0 --membind=0 \
+    python3 benchmark/tensor_xfer/tensor_xfer_benchmark_bidir.py --methods iaxl batch
+```

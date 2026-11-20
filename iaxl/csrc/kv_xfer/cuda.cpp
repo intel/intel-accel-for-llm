@@ -264,12 +264,16 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
                 inner_size / 1024.0, chunk_indices.size());
     });
 #if defined(DSA_SUPPORT)
-
-    if (dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
+    // IAXL_KV_XFER_FULL_DUPLEX: DSA does H2D while the GPU copy engine does D2H, so the two
+    // directions run concurrently instead of sharing the DSA engine.
+    const bool use_dsa = h2d || !envs.IAXL_KV_XFER_FULL_DUPLEX;
+    if (use_dsa &&
+        dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
                               outer_block_size, h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
-            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");
+            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend%s\n",
+                    envs.IAXL_KV_XFER_FULL_DUPLEX ? " for H2D (D2H via CUDA)" : "");
         });
         return;
     }
