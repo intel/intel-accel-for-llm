@@ -5,7 +5,7 @@ import os
 import time
 import torch
 import logging
-from typing import Dict, Optional, List, Any, Union
+from typing import Dict, Optional, List, Any, Tuple, Union
 from dataclasses import dataclass, field
 
 from ..utils.profiler import (
@@ -164,23 +164,38 @@ class KVFlow:
         logger.info("CUDA/XPU streams created (lazy init, device=%s)", self.device_type)
 
     def _register_kv_caches(self, kv_caches: Dict[str, Union[torch.Tensor, RemoteTensor]], block_dim: int):
-        """Register every layer as a KV pool keyed by layer name, plus the "scratch" staging pool.
+        """Register every layer as a KV pool keyed by layer name, plus the scratch staging pools.
         RemoteTensor layers are registered by rpc.py (Remote pools) under the same names."""
         assert not self._in_place or block_dim == 0, "CPU KV blocks must be chunked on axis 0"
+        self._layer_geom: Dict[str, Tuple[Tuple[int, ...], torch.dtype]] = {}
         for name, t in kv_caches.items():
+            # Remote layers stage through the scratch pools too, so keep their
+            # geometry even though rpc.py registers the pool itself.
+            self._layer_geom[name] = (
+                tuple(size for d, size in enumerate(t.shape) if d != block_dim), t.dtype)
             if isinstance(t, RemoteTensor):
                 continue
+            # Packed layouts give each layer a page view whose outer stride
+            # may be larger than the page itself. Outer-dimension layouts
+            # (block_dim > 0) keep the contiguous-segment contract.
+            chunk_stride = (
+                t.stride(block_dim) * t.element_size() if block_dim == 0 else 0
+            )
             if t.is_cpu:
-                _iqt.register_kv_pool_cpu(name, t, block_dim)
+                _iqt.register_kv_pool_cpu(name, t, block_dim, chunk_stride)
             else:
-                _iqt.register_kv_pool_gpu(name, t, block_dim)
+                _iqt.register_kv_pool_gpu(name, t, block_dim, chunk_stride)
             self._registered.append(name)
         if not self._in_place:
-            first = next(iter(kv_caches.values()))
-            block_shape = tuple(s for d, s in enumerate(first.shape) if d != block_dim)
-            self.chunk_pool = ScratchPool(
-                block_shape, first.dtype, pin_memory=self.device_type not in (None, "cpu")
-            )
+            # Remote layers count too: the daemon stages their blocks through these
+            # pools even though it never registers them locally.
+            geometries = list(self._layer_geom.values())
+            if geometries:
+                self.chunk_pool = ScratchPool(
+                    geometries,
+                    int(envs.IAXL_SCRATCH_POOL_SIZE_GB * 1024**3),
+                    pin_memory=self.device_type not in (None, "cpu"),
+                )
 
     def close(self):
         if self.chunk_pool is not None:
@@ -190,9 +205,21 @@ class KVFlow:
             _iqt.unregister_kv_pool(name)
         self._registered.clear()
 
-    def _allocate(self, count: int) -> List[int]:
+    def _stage(self, num_chunks: int, tensor_key: str, chunk_indices):
+        """Staging blocks for one tensor: (pool name, global blocks, pool-local blocks)."""
+        if self._in_place:
+            return None, chunk_indices, chunk_indices
+        blocks = self._allocate(num_chunks, tensor_key)
+        return (
+            self.chunk_pool.name_of(blocks[0]),
+            blocks,
+            [b & 0xFFFFFFFF for b in blocks],  # indices inside that pool
+        )
+
+    def _allocate(self, count: int, tensor_key: str) -> List[int]:
+        shape, dtype = self._layer_geom[tensor_key]
         rounds, start = 0, 0.0
-        while (blocks := self.chunk_pool.allocate(count)) is None:
+        while (allocated := self.chunk_pool.allocate(count, shape, dtype)) is None:
             if not (self._pending_puts or self._pending_gets):
                 raise RuntimeError(f"ScratchPool exhausted: need {count}, {self.chunk_pool.status()}")
             if rounds == 1:
@@ -204,11 +231,12 @@ class KVFlow:
         if rounds > 1:
             logger.warning("ScratchPool exhausted: waited %.3f ms (%d rounds) for %d blocks",
                            (time.perf_counter() - start) * 1e3, rounds, count)
-        return blocks
+        return allocated
 
-    def _create_ctx(self, tensor_key: str, direction, description, work_stream):
+    def _create_ctx(self, tensor_key: str, direction, description, work_stream,
+                    staging_pool: Optional[str] = None):
         # tensor_key must be a registered pool (KVFlow.__init__ or rpc.py); C++ aborts otherwise.
-        cpu_pool = tensor_key if self._in_place else ScratchPool.NAME
+        cpu_pool = tensor_key if self._in_place else staging_pool
         return Context.create(tensor_key, cpu_pool, direction, description, work_stream=work_stream)
 
     @profile_func(
@@ -245,22 +273,23 @@ class KVFlow:
         num_chunks = len(chunk_indices)
 
         for tensor_index, tensor_key in enumerate(tensor_keys):
+            staging_pool, blocks, staging_blocks = self._stage(
+                num_chunks, tensor_key, chunk_indices
+            )
             ctx = self._create_ctx(
-                tensor_key, GpuTransferDirection.D2H, description, work_stream=self.put_stream
+                tensor_key, GpuTransferDirection.D2H, description,
+                work_stream=self.put_stream, staging_pool=staging_pool
             )
             if first_tensor:
                 if self.device_type is not None:
                     ctx.xfer_wait_cur_stream(sync_cur_stream=True)
                 first_tensor = False
-            if self._in_place:
-                blocks = chunk_indices
-            else:
-                blocks = self._allocate(num_chunks)
-                ctx.xfer_chunks_batch(chunk_indices, blocks)
+            if not self._in_place:
+                ctx.xfer_chunks_batch(chunk_indices, staging_blocks)
             ctx.xfer_finish()
 
             compress = tensor_index >= skip_compression_count
-            ctx.zip_to_mem(self.mem, label, tensor_key, chunk_labels, blocks, compress)
+            ctx.zip_to_mem(self.mem, label, tensor_key, chunk_labels, staging_blocks, compress)
 
             results[tensor_key] = task = Task(
                 ctx=ctx,
@@ -345,14 +374,17 @@ class KVFlow:
 
         first_tensor = True
         for tensor_key in tensor_keys:
+            staging_pool, blocks, staging_blocks = self._stage(
+                num_chunks, tensor_key, chunk_indices
+            )
             ctx = self._create_ctx(
-                tensor_key, GpuTransferDirection.H2D, description, work_stream=self.get_stream
+                tensor_key, GpuTransferDirection.H2D, description,
+                work_stream=self.get_stream, staging_pool=staging_pool
             )
             if first_tensor:
                 if stream_sync_on_get and self.device_type is not None:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
-            blocks = chunk_indices if self._in_place else self._allocate(num_chunks)
             priority = 0 if priorities is None else priorities[tensor_key]
             sort_key = -1 if sort_keys is None else sort_keys[tensor_key]
             ctx.unzip_from_mem(
@@ -361,7 +393,7 @@ class KVFlow:
                 tensor_key,
                 chunk_labels,
                 chunk_indices,
-                blocks,
+                staging_blocks,
                 priority=priority,
                 bundle_id=bundle_id,
                 sort_key=sort_key,
@@ -477,17 +509,11 @@ class KVFlow:
             pool_total_tensors = pool_total_bytes = pool_available = pool_in_use = 0
             pool_shapes = []
         else:
-            pool_total_tensors = pool.num_blocks
+            pool_total_tensors = pool.total_count()
             pool_total_bytes = pool.total_bytes()
             pool_available = pool.available_count()
             pool_in_use = pool_total_tensors - pool_available
-            pool_shapes = [
-                {
-                    "shape": list(pool.block_shape),
-                    "dtype": str(pool.dtype),
-                    "available": pool_available,
-                }
-            ]
+            pool_shapes = pool.classes()
 
         return {
             "has_only_mode": False,
