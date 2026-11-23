@@ -524,7 +524,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 ids = state.block_ids[group_id]
                 candidates = (
                     (index, ids[index])
-                    for index in range(start, min(len(ids), end, len(blocks)))
+                    for index in range(start, min(len(ids), end))
                 )
             for index, block_id in candidates:
                 if block_id and start <= index < end and not exists[index]:
@@ -717,14 +717,14 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._last_layer_name = next(reversed(kv_caches)) if kv_caches else None
         self._layer_names = list(kv_caches)
-        self.num_mamba_layers = sum(
+        num_mamba_layers = sum(
             len(group.layer_names)
             for group in self.groups.values()
             if group.is_mamba
         )
         logger.info(
             "KVShrinkConnector: %d of %d registered layers are mamba state",
-            self.num_mamba_layers,
+            num_mamba_layers,
             len(kv_caches),
         )
 
@@ -745,7 +745,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info(
             "Registered %d KV cache layers (%d mamba) with shape %s",
             len(kv_caches),
-            self.num_mamba_layers,
+            num_mamba_layers,
             list(first_kv_cache.shape),
         )
 
@@ -923,16 +923,7 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
                 layers_by_group.setdefault(group_id, []).append(name)
         for req_id, request in metadata.reqs_to_save.requests.items():
             for group_id, layer_names in layers_by_group.items():
-                block_ids, block_hashes = request.for_group(group_id)
-                if not block_ids:
-                    continue
-                tasks = self._store().put(
-                    block_indices=block_ids,
-                    block_hashs=block_hashes,
-                    layer_names=[self._layer_key[ln] for ln in layer_names],
-                    label=self.groups[group_id].label,
-                )
-                self._current_put_tasks.setdefault(req_id, []).append(tasks)
+                self._put_group(req_id, request, group_id, layer_names)
 
     def wait_for_save(self) -> None:
         # Layers without a per-layer hook (mamba state, unclaimed caches) are
@@ -946,16 +937,22 @@ class KVShrinkConnector(KVConnectorBase_V1, SupportsHMA):
 
         for req_id, request in metadata.reqs_to_save.requests.items():
             for group_id, layer_names in self._hookless_group_layers.items():
-                block_ids, block_hashes = request.for_group(group_id)
-                if not block_ids:
-                    continue
-                tasks = self._store().put(
-                    block_indices=block_ids,
-                    block_hashs=block_hashes,
-                    layer_names=[self._layer_key[ln] for ln in layer_names],
-                    label=self.groups[group_id].label,
-                )
-                self._current_put_tasks.setdefault(req_id, []).append(tasks)
+                self._put_group(req_id, request, group_id, layer_names)
+
+    def _put_group(
+        self, req_id: ReqId, request: ReqMeta, group_id: int, layer_names: list[str]
+    ) -> None:
+        """Queue one group's caches of a request for writing."""
+        block_ids, block_hashes = request.for_group(group_id)
+        if not block_ids:
+            return
+        tasks = self._store().put(
+            block_indices=block_ids,
+            block_hashs=block_hashes,
+            layer_names=[self._layer_key[ln] for ln in layer_names],
+            label=self.groups[group_id].label,
+        )
+        self._current_put_tasks.setdefault(req_id, []).append(tasks)
 
     def get_finished(
         self, finished_req_ids: set[str]

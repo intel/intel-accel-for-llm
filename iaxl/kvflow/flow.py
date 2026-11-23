@@ -205,6 +205,17 @@ class KVFlow:
             _iqt.unregister_kv_pool(name)
         self._registered.clear()
 
+    def _stage(self, num_chunks: int, tensor_key: str, chunk_indices):
+        """Staging blocks for one tensor: (pool name, global blocks, pool-local blocks)."""
+        if self._in_place:
+            return None, chunk_indices, chunk_indices
+        blocks = self._allocate(num_chunks, tensor_key)
+        return (
+            self.chunk_pool.name_of(blocks[0]),
+            blocks,
+            [b & 0xFFFFFFFF for b in blocks],  # indices inside that pool
+        )
+
     def _allocate(self, count: int, tensor_key: str) -> List[int]:
         shape, dtype = self._layer_geom[tensor_key]
         rounds, start = 0, 0.0
@@ -262,12 +273,9 @@ class KVFlow:
         num_chunks = len(chunk_indices)
 
         for tensor_index, tensor_key in enumerate(tensor_keys):
-            if self._in_place:
-                staging_pool, blocks, staging_blocks = None, chunk_indices, chunk_indices
-            else:
-                blocks = self._allocate(num_chunks, tensor_key)
-                staging_pool = self.chunk_pool.name_of(blocks[0])
-                staging_blocks = [b & 0xFFFFFFFF for b in blocks]  # indices inside that pool
+            staging_pool, blocks, staging_blocks = self._stage(
+                num_chunks, tensor_key, chunk_indices
+            )
             ctx = self._create_ctx(
                 tensor_key, GpuTransferDirection.D2H, description,
                 work_stream=self.put_stream, staging_pool=staging_pool
@@ -366,12 +374,9 @@ class KVFlow:
 
         first_tensor = True
         for tensor_key in tensor_keys:
-            if self._in_place:
-                staging_pool, blocks, staging_blocks = None, chunk_indices, chunk_indices
-            else:
-                blocks = self._allocate(num_chunks, tensor_key)
-                staging_pool = self.chunk_pool.name_of(blocks[0])
-                staging_blocks = [b & 0xFFFFFFFF for b in blocks]
+            staging_pool, blocks, staging_blocks = self._stage(
+                num_chunks, tensor_key, chunk_indices
+            )
             ctx = self._create_ctx(
                 tensor_key, GpuTransferDirection.H2D, description,
                 work_stream=self.get_stream, staging_pool=staging_pool

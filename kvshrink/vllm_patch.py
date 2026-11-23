@@ -103,7 +103,7 @@ def _patch_force_external() -> None:
     )
 
 
-def _patch_qsa_per_layer() -> bool:
+def _patch_qsa_per_layer() -> None:
     """Wrap Qwen4Exp QSA attention with per-layer load/save hooks."""
     try:
         from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -116,7 +116,7 @@ def _patch_qsa_per_layer() -> bool:
         )
         from vllm.models.qwen4_exp.common.qsa_cache import QSACompressedKeyCache
     except Exception:  # vLLM too old for these helpers
-        return False
+        return
 
     # qsa.py and model.py import each other, so importing the submodule before
     # the model exists raises. Once the model is built it is already cached.
@@ -125,14 +125,14 @@ def _patch_qsa_per_layer() -> bool:
         try:
             from vllm.models.qwen4_exp.nvidia import qsa as module  # type: ignore[no-redef]
         except Exception:  # not this model, or not imported yet
-            return False
+            return
 
     cls = getattr(module, "Qwen4ExpQSAAttention", None)
     if cls is None:
-        return False
+        return
     original = cls._run_qsa
     if getattr(original, "_iaxl_per_layer", False):
-        return True
+        return
 
     @eager_break_during_capture  # outermost: wait/save run in the eager segment
     def _run_qsa(self, projected_qk, positions, query, key, value, output,
@@ -163,10 +163,9 @@ def _patch_qsa_per_layer() -> bool:
     declare_hooked_class(QSACompressedKeyCache)
     declare_cache_class(QSACompressedKeyCache)
     logger.info("QSA per-layer KV transfer patch installed")
-    return True
 
 
-def _patch_indexer_per_layer() -> bool:
+def _patch_indexer_per_layer() -> None:
     """Hook the DSA sparse indexer so its compressed K cache moves per layer.
 
     The indexer cache is its own prefix-cacheable layer (``tokens_per_state``
@@ -183,9 +182,8 @@ def _patch_indexer_per_layer() -> bool:
         )
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
     except Exception:
-        return False
+        return
 
-    patched = False
     for module_name in (
         "vllm.models.glm5next.common.attention",
         "vllm.model_executor.models.deepseek_v2",
@@ -195,7 +193,6 @@ def _patch_indexer_per_layer() -> bool:
         if cls is None:
             continue
         if getattr(cls.forward, "_iaxl_per_layer", False):
-            patched = True
             continue
         original = cls.forward
 
@@ -219,9 +216,7 @@ def _patch_indexer_per_layer() -> bool:
         # The registered layer is the cache, not the indexer that owns it.
         declare_hooked_class(DeepseekV32IndexerCache)
         declare_cache_class(DeepseekV32IndexerCache)
-        patched = True
         logger.info("Indexer per-layer KV transfer patch installed on %s", module_name)
-    return patched
 
 
 def install_per_layer_patches() -> None:

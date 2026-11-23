@@ -23,7 +23,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 from .. import torch_ext as _iqt
-from ..envs import envs
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +44,6 @@ class _Class:
         assert not pin_memory or self.pool.is_pinned(), "ScratchPool: pin_memory=True did not take effect"
         _iqt.register_kv_pool_cpu(self.name, self.pool)
         self._free: List[int] = list(range(num_blocks))  # LIFO: pop from the end
-        self._allocate_count = 0
-        self._release_count = 0
 
     @property
     def num_blocks(self) -> int:
@@ -62,12 +59,10 @@ class _Class:
         cut = len(free) - count  # not free[-count:], which is the whole list for count == 0
         idx = free[cut:]
         del free[cut:]
-        self._allocate_count += count
         return idx
 
     def give(self, indices: List[int]) -> None:
         self._free.extend(indices)
-        self._release_count += len(indices)
 
     def close(self) -> None:
         _iqt.unregister_kv_pool(self.name)
@@ -121,13 +116,6 @@ class ScratchPool:
         page = math.prod(shape) * torch.tensor([], dtype=dtype).element_size()
         return self._by_geom.get((page, dtype))
 
-    def name_for(self, shape: Sequence[int], dtype: torch.dtype) -> str:
-        """Pool a layer of this geometry should stage through."""
-        cls = self._exact(shape, dtype)
-        if cls is None:
-            raise RuntimeError(f"ScratchPool: no pool for page {math.prod(shape)} x {dtype}")
-        return cls.name
-
     # ---- allocation ----
 
     def _class_of(self, idx: int) -> Tuple[_Class, int]:
@@ -163,9 +151,6 @@ class ScratchPool:
 
     def total_bytes(self) -> int:
         return sum(cls.pool.nbytes for cls in self._classes)
-
-    def available_bytes(self) -> int:
-        return sum(cls.free() * cls.block_bytes for cls in self._classes)
 
     def total_count(self) -> int:
         return sum(cls.num_blocks for cls in self._classes)
