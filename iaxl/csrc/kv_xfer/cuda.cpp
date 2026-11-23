@@ -208,7 +208,14 @@ void context_record_event(context_t ctx, event_t event) {
 }
 
 void context_work_wait_event(context_t ctx, event_t event) {
-    gpu_stream_wait_event(as_ctx(ctx)->work_stream, static_cast<GpuEvent_t>(event));
+    XferContext *x = as_ctx(ctx);
+    gpu_set_device(x->device_index);
+    gpu_stream_wait_event(x->work_stream, static_cast<GpuEvent_t>(event));
+#if defined(DSA_SUPPORT)
+    // DSA copies do not run on work_stream, so the thread that submits them waits instead.
+    if (x->gpu_bar_base)
+        gpu_event_synchronize(static_cast<GpuEvent_t>(event));
+#endif
 }
 
 void context_cur_wait_event(context_t ctx, event_t event) {
@@ -264,33 +271,60 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
                 inner_size / 1024.0, chunk_indices.size());
     });
 #if defined(DSA_SUPPORT)
-
-    if (dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
+    // IAXL_KV_XFER_FULL_DUPLEX: DSA does H2D while the GPU copy engine does D2H, so the two
+    // directions run concurrently instead of sharing the DSA engine.
+    const bool use_dsa = h2d || !envs.IAXL_KV_XFER_FULL_DUPLEX;
+    if (use_dsa &&
+        dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
                               outer_block_size, h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
         static std::once_flag dsa_noted;
         std::call_once(dsa_noted, [] {
-            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");
+            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend%s\n",
+                    envs.IAXL_KV_XFER_FULL_DUPLEX ? " for H2D (D2H via CUDA)" : "");
         });
         return;
     }
 #endif
 
 #if USE_CUDA_MEMCPY_3D_BATCH
-    static const char *kCudaApi = "cudaMemcpy3DBatchAsync";
+    const char *cuda_api = outer_dims == 1 ? "cudaMemcpyBatchAsync" : "cudaMemcpy3DBatchAsync";
 #elif USE_CUDA_MEMCPY_2D
-    static const char *kCudaApi = "cudaMemcpy2DAsync";
+    const char *cuda_api = "cudaMemcpy2DAsync";
 #else
-    static const char *kCudaApi = "cudaMemcpyAsync";
+    const char *cuda_api = "cudaMemcpyAsync";
 #endif
     static std::once_flag cuda_noted;
-    std::call_once(cuda_noted, [] {
-        fprintf(stderr, "[kv_xfer] copy_chunks_batch: using CUDA backend (%s)\n", kCudaApi);
+    std::call_once(cuda_noted, [cuda_api] {
+        fprintf(stderr, "[kv_xfer] copy_chunks_batch: using CUDA backend (%s)\n", cuda_api);
     });
 
     GpuStream_t stream = x->work_stream;
 #if USE_CUDA_MEMCPY_3D_BATCH
 
     size_t num_chunks = chunk_indices.size();
+    if (outer_dims == 1) {
+        // A block stored as one run is a plain copy, which the plain batch API moves with
+        // much less overhead per block than a 3D op.
+        std::vector<void *> dsts(num_chunks), srcs(num_chunks);
+        std::vector<size_t> sizes(num_chunks, static_cast<size_t>(inner_size));
+        for (size_t i = 0; i < num_chunks; i++) {
+            void *gpu_ptr = gpu_base_ptr + chunk_indices[i] * chunk_stride;
+            dsts[i] = h2d ? gpu_ptr : cpu_ptrs[i];
+            srcs[i] = h2d ? cpu_ptrs[i] : gpu_ptr;
+        }
+        cudaMemcpyAttributes attrs = {};
+        attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attrs_index = 0;
+#if CUDART_VERSION >= 13000
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), num_chunks, &attrs,
+                                        &attrs_index, 1, stream));
+#else
+        size_t fail_index = SIZE_MAX;
+        CUDA_CHECK(cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), num_chunks, &attrs,
+                                        &attrs_index, 1, &fail_index, stream));
+#endif
+        return;
+    }
     std::vector<cudaMemcpy3DBatchOp> ops(num_chunks);
 
     for (size_t i = 0; i < num_chunks; i++) {

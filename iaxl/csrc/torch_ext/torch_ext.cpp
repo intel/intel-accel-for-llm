@@ -14,6 +14,15 @@ using namespace profiler;
 
 namespace py = pybind11;
 
+// Block indices given as a tensor skip the per-element Python conversion of a list.
+static std::vector<int64_t> index_vector(const torch::Tensor &indices) {
+    if (!indices.is_cpu() || indices.dim() != 1 || indices.scalar_type() != torch::kInt64 ||
+        !indices.is_contiguous())
+        throw std::invalid_argument("block indices must be a contiguous 1-D int64 CPU tensor");
+    const int64_t *data = indices.data_ptr<int64_t>();
+    return {data, data + indices.numel()};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #if defined(CUDA_SUPPORT) && defined(DSA_SUPPORT)
     // Before any KV pool is registered, so the DSA hooks see every GPU KV pool.
@@ -108,6 +117,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Wait for stream to complete current work before starting transfers.\n"
              "CUDA: async (returns True), XPU: sync blocking (returns False)",
              py::arg("cur_stream"))
+        .def("xfer_after", &Context::xfer_after,
+             "The transfers submitted to this context from now on start once the transfers\n"
+             "submitted to `other` so far are complete, whichever engines run them (async)",
+             py::arg("other"), py::call_guard<py::gil_scoped_release>())
+        .def(
+            "xfer_chunks_batch",
+            [](Context &ctx, const torch::Tensor &chunk_indices,
+               const torch::Tensor &cpu_block_indices) {
+                const auto chunks = index_vector(chunk_indices);
+                const auto cpu_blocks = index_vector(cpu_block_indices);
+                py::gil_scoped_release release;
+                ctx.xfer_chunks_batch(chunks, cpu_blocks);
+            },
+            "Transfer pool[chunk_indices[i]] <-> cpu_pool[cpu_block_indices[i]] (async), the\n"
+            "indices given as 1-D int64 CPU tensors",
+            py::arg("chunk_indices"), py::arg("cpu_block_indices"))
         .def("xfer_chunks_batch", &Context::xfer_chunks_batch,
              "Transfer pool[chunk_indices[i]] <-> cpu_pool[cpu_block_indices[i]] (async)",
              py::arg("chunk_indices"), py::arg("cpu_block_indices"),

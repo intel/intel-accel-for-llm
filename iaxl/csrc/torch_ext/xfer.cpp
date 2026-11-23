@@ -4,6 +4,7 @@
 #include "context.h"
 
 #include <chrono>
+#include <memory>
 #include <vector>
 
 void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
@@ -115,5 +116,26 @@ bool Context::xfer_wait_stream(pybind11::object cur_stream) {
         return true;
     }
     return false;
+}
+
+void Context::xfer_after(Context &other) {
+    PROFILE_SCOPE_FMT("xfer_after(%s<-%s)", name_.c_str(), other.name_.c_str());
+    IAXL_CHECK(ops_ == other.ops_, "xfer_after: the contexts use different transfer backends");
+    auto ops = ops_;
+    auto x = xctx_;
+    auto other_x = other.xctx_;
+    // other's thread records the event behind the transfers it has issued so far; the copies
+    // that run outside of its stream (DSA) are covered by other's ticket.
+    kv_xfer::event_t event = ops->event_acquire();
+    auto recorded = std::make_shared<std::future<void>>(
+        other.queue_->submit([=]() { ops->context_record_event(other_x, event); }));
+    queue_->submit([=]() {
+        PROFILE_SCOPE("wait_context");
+        recorded->get();
+        if (ops->copy_wait)
+            ops->copy_wait(other_x);
+        ops->context_work_wait_event(x, event);
+        ops->event_release(event);
+    });
 }
 
