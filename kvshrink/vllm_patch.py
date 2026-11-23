@@ -2,6 +2,7 @@
 """vLLM general plugin (entry point group ``vllm.general_plugins``)."""
 
 import dataclasses
+import os
 import sys
 
 from vllm.logger import init_logger
@@ -68,6 +69,117 @@ def _patch_mamba_block_size_validator() -> None:
     rebuild_dataclass(VllmConfig, force=True)
 
 
+def _force_external() -> bool:
+    """Every KV block must come from the connector, not the local prefix cache."""
+    return os.getenv("KVSHRINK_FORCE_EXTERNAL", "0") == "1"
+
+
+def _patch_force_external() -> None:
+    """Zero the local prefix lookup so the connector supplies the whole prefix.
+
+    Prefix caching stays on, so vLLM still hashes blocks and still produces the
+    mamba boundary hand-offs the connector saves.
+    """
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    orig_connector = KVCacheManager.get_computed_blocks_for_connector
+    orig = KVCacheManager.get_computed_blocks
+
+    def get_computed_blocks_for_connector(self, request, max_cache_hit_length=None):
+        if _force_external():
+            return self.empty_kv_cache_blocks, 0, 0, False
+        return orig_connector(self, request, max_cache_hit_length)
+
+    def get_computed_blocks(self, request, max_cache_hit_length=None):
+        if _force_external():
+            return self.empty_kv_cache_blocks, 0, 0
+        return orig(self, request, max_cache_hit_length)
+
+    KVCacheManager.get_computed_blocks_for_connector = get_computed_blocks_for_connector
+    KVCacheManager.get_computed_blocks = get_computed_blocks
+    logger.info(
+        "KVShrink force-external patch registered (active when "
+        "KVSHRINK_FORCE_EXTERNAL=1): KVCacheManager local prefix lookup disabled"
+    )
+
+
+def _patch_indexer_per_layer() -> None:
+    """Hook the DSA sparse indexer so its compressed K cache moves per layer.
+
+    The indexer cache is its own prefix-cacheable layer (``tokens_per_state``
+    is the pool ratio, not 1), and its kernels read and write it inside
+    ``Indexer.forward``, which runs before MLA attention in the same layer. So a
+    wait at the top and a save at the bottom cover it exactly like an attention
+    layer's own KV.
+    """
+    try:
+        from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+    except Exception:
+        return
+
+    for module_name in (
+        "vllm.models.glm5next.common.attention",
+        "vllm.model_executor.models.deepseek_v2",
+    ):
+        module = sys.modules.get(module_name)
+        cls = getattr(module, "Indexer", None) if module is not None else None
+        if cls is None:
+            continue
+        if getattr(cls.forward, "_iaxl_per_layer", False):
+            continue
+        original = cls.forward
+
+        @eager_break_during_capture  # outermost: wait/save run in the eager segment
+        def forward(self, *args, original=original, **kwargs):
+            cache = getattr(self, "k_cache", None)
+            if (
+                cache is None
+                or not has_kv_transfer_group()
+                or not get_kv_transfer_group().has_connector_metadata()
+            ):
+                return original(self, *args, **kwargs)
+            connector = get_kv_transfer_group()
+            connector.wait_for_layer_load(cache.prefix)
+            result = original(self, *args, **kwargs)
+            connector.save_kv_layer(cache.prefix, None, None)
+            return result
+
+        forward._iaxl_per_layer = True
+        cls.forward = forward
+        # The registered layer is the cache, not the indexer that owns it.
+        declare_hooked_class(DeepseekV32IndexerCache)
+        declare_cache_class(DeepseekV32IndexerCache)
+        logger.info("Indexer per-layer KV transfer patch installed on %s", module_name)
+
+
+def install_per_layer_patches() -> None:
+    """Call once the model is built; the worker connector does this."""
+    _patch_indexer_per_layer()
+
+
+def declare_cache_class(module_class: type) -> None:
+    """Mark a class whose instances are passive caches (no forward of their own).
+
+    The connector must not let such a layer's hook capture a sibling cache that
+    another layer's forward has not written yet.
+    """
+    module_class._iaxl_cache = True
+
+
+def declare_hooked_class(module_class: type) -> None:
+    """Mark a class whose forward a patch wired to the per-layer hook.
+
+    The mark lives on the class, so the connector sees it even if the patch
+    module was imported twice (plugin entry point and package import).
+    """
+    module_class._iaxl_per_layer = True
+
+
 def patch_kimi_k3_mla_kv_transfer() -> None:
     """Hook Kimi-K3's MLA layers into the KV connector; no-op unless the model loaded them."""
     mla_module = sys.modules.get("vllm.models.kimi_k3.nvidia.mla")
@@ -110,6 +222,7 @@ def register() -> None:
     _patch_mamba_cache_mode()
     _patch_mamba_block_size_validator()
     MambaModelConfig._mamba_align_patched = True
+    _patch_force_external()
     logger.info(
         "Mamba align patch registered: MambaModelConfig.verify_and_update_config, "
         "VllmConfig.validate_mamba_block_size"
