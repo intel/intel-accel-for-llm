@@ -103,6 +103,68 @@ def _patch_force_external() -> None:
     )
 
 
+def _patch_qsa_per_layer() -> None:
+    """Wrap Qwen4Exp QSA attention with per-layer load/save hooks."""
+    try:
+        from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from vllm.model_executor.layers.attention.attention import (
+            get_attention_context,
+        )
+        from vllm.models.qwen4_exp.common.qsa_cache import QSACompressedKeyCache
+    except Exception:  # vLLM too old for these helpers
+        return
+
+    # qsa.py and model.py import each other, so importing the submodule before
+    # the model exists raises. Once the model is built it is already cached.
+    module = sys.modules.get("vllm.models.qwen4_exp.nvidia.qsa")
+    if module is None:
+        try:
+            from vllm.models.qwen4_exp.nvidia import qsa as module  # type: ignore[no-redef]
+        except Exception:  # not this model, or not imported yet
+            return
+
+    cls = getattr(module, "Qwen4ExpQSAAttention", None)
+    if cls is None:
+        return
+    original = cls._run_qsa
+    if getattr(original, "_iaxl_per_layer", False):
+        return
+
+    @eager_break_during_capture  # outermost: wait/save run in the eager segment
+    def _run_qsa(self, projected_qk, positions, query, key, value, output,
+                 output_gate, qkv):
+        if not has_kv_transfer_group():
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        connector = get_kv_transfer_group()
+        if not connector.has_connector_metadata():
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        layer_name = self.layer_name
+        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        if attn_metadata is None:
+            return original(self, projected_qk, positions, query, key, value,
+                            output, output_gate, qkv)
+        connector.wait_for_layer_load(layer_name)
+        result = original(self, projected_qk, positions, query, key, value,
+                          output, output_gate, qkv)
+        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+        return result
+
+    _run_qsa._iaxl_per_layer = True
+    cls._run_qsa = _run_qsa
+    # The layer and the compressed K cache it owns are both written inside
+    # _run_qsa, so one hook covers them together.
+    declare_hooked_class(cls)
+    declare_hooked_class(QSACompressedKeyCache)
+    declare_cache_class(QSACompressedKeyCache)
+    logger.info("QSA per-layer KV transfer patch installed")
+
+
 def _patch_indexer_per_layer() -> None:
     """Hook the DSA sparse indexer so its compressed K cache moves per layer.
 
@@ -159,6 +221,7 @@ def _patch_indexer_per_layer() -> None:
 
 def install_per_layer_patches() -> None:
     """Call once the model is built; the worker connector does this."""
+    _patch_qsa_per_layer()
     _patch_indexer_per_layer()
 
 
