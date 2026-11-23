@@ -256,6 +256,7 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
     int64_t outer_dims = x->outer_dims;
     int64_t inner_size = x->inner_size;
     int64_t outer_block_size = x->outer_block_size;
+    const char *direction = h2d ? "H2D" : "D2H";
 
     static std::once_flag layout_noted;
     std::call_once(layout_noted, [&] {
@@ -267,9 +268,11 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
 
     if (dsa_copy_chunks_batch(x->gpu_bar_base, chunk_stride, outer_dims, inner_size,
                               outer_block_size, h2d, chunk_indices, cpu_ptrs, x->dsa_ticket)) {
-        static std::once_flag dsa_noted;
-        std::call_once(dsa_noted, [] {
-            fprintf(stderr, "[kv_xfer] copy_chunks_batch: using Intel DSA backend\n");
+        static std::once_flag dsa_h2d_noted;
+        static std::once_flag dsa_d2h_noted;
+        std::call_once(h2d ? dsa_h2d_noted : dsa_d2h_noted, [direction] {
+            fprintf(stderr, "[kv_xfer] copy_chunks_batch %s: using Intel DSA backend\n",
+                    direction);
         });
         return;
     }
@@ -282,9 +285,11 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
 #else
     static const char *kCudaApi = "cudaMemcpyAsync";
 #endif
-    static std::once_flag cuda_noted;
-    std::call_once(cuda_noted, [] {
-        fprintf(stderr, "[kv_xfer] copy_chunks_batch: using CUDA backend (%s)\n", kCudaApi);
+    static std::once_flag cuda_h2d_noted;
+    static std::once_flag cuda_d2h_noted;
+    std::call_once(h2d ? cuda_h2d_noted : cuda_d2h_noted, [direction] {
+        fprintf(stderr, "[kv_xfer] copy_chunks_batch %s: using CUDA backend (%s)\n", direction,
+                kCudaApi);
     });
 
     GpuStream_t stream = x->work_stream;

@@ -71,6 +71,8 @@ struct Envs {
     int IAXL_CACHE_CACHEGROUP_NUM;
 
     bool IAXL_DSA_GD_ENABLE;
+    int IAXL_DSA_H2D_CROSSOVER_KB;
+    int IAXL_DSA_D2H_CROSSOVER_KB;
     const char *(*IAXL_DSA_WQS)(void);
 
     bool IAXL_DEBUG_LOG;

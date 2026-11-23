@@ -10,6 +10,7 @@
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/../setvars.sh"
 : "${MODEL:?Set MODEL in setvars.sh or the environment}"
+set -o pipefail
 
 export LD_PRELOAD="$IAXL_LD_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}"
 
@@ -30,10 +31,17 @@ if [[ -n "${VLLM_SERVE_CMDLINE_ARGS:-}" ]]; then
 fi
 read -r -a extra_args <<<"${VLLM_SERVE_EXTRA_ARGS:-}"
 
-vllm serve "$MODEL" \
-    --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
-    "${parallel_args[@]}" \
-    "${block_args[@]}" \
-    "${serve_args[@]}" \
-    "${extra_args[@]}" \
-    2>&1 | tee log.kvshrink-vllm
+{
+    if env_truthy "$IAXL_DSA_GD_ENABLE"; then
+        crossovers=$(python3 "$SCRIPT_DIR/../tools/calibration/dsa_calibration.py") || exit 1
+        read -r IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB <<<"$crossovers"
+        export IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB
+    fi
+
+    vllm serve "$MODEL" \
+        --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
+        "${parallel_args[@]}" \
+        "${block_args[@]}" \
+        "${serve_args[@]}" \
+        "${extra_args[@]}"
+} 2>&1 | tee log.kvshrink-vllm
