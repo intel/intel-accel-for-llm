@@ -77,6 +77,10 @@ class Context {
     void xfer_wait_cur_stream(bool sync_cur_stream = false);
     void xfer_wait_stream(kv_xfer::event_t wait_event);
     bool xfer_wait_stream(pybind11::object cur_stream);
+    // The transfers submitted to this context from now on start once the transfers submitted
+    // to `other` so far are complete, whichever threads and engines run them. Lets a load into
+    // GPU blocks follow a save of them (H2D and D2H run on separate threads and overlap).
+    void xfer_after(Context &other);
 
     void zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std::string &tensor_key,
                     const std::vector<std::string> &chunk_labels,
