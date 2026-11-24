@@ -37,6 +37,10 @@ read -r -a extra_args <<<"${VLLM_SERVE_EXTRA_ARGS:-}"
         read -r IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB <<<"$crossovers"
         export IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB
     fi
+    if env_truthy "$IAXL_KV_COMPRESSION" && env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE"; then
+        IAXL_ZIP_SEGMENT_SIZE_KB=$(python3 "$SCRIPT_DIR/../tools/calibration/zip_calibration.py") || exit 1
+        export IAXL_ZIP_SEGMENT_SIZE_KB
+    fi
 
     vllm serve "$MODEL" \
         --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \

@@ -20,13 +20,13 @@ import sys
 import time
 from dataclasses import dataclass
 
-# 128 MiB per copy, 2 warmup + 10 timed copies, keep the fastest: most stable in the 6000d test.
+# 128 MiB per copy, 2 warmup + 3 timed copies, keep the fastest.
 COPY_BYTES = 128 << 20
 FIRST_COPY_SIZE = 256 << 10
 COPY_SIZE_STEP = 128 << 10
 LAST_COPY_SIZE = 4 << 20
 WARMUP_COPIES = 2
-TIMED_COPIES = 10
+TIMED_COPIES = 3
 START_SLACK_S = 0.002  # covers barrier wake-up jitter before the shared start time
 WORKER_POLL_S = 1.0
 DIRECTIONS = ("H2D", "D2H")

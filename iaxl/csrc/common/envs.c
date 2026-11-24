@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <limits.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,29 @@ static int available_cpu_count(void) {
     return n > 0 ? (int)n : 1;
 }
 
+static int env_nonnegative_int_list(const char *name, int *out, int max_count) {
+    const char *v = getenv(name);
+    int count = 0;
+    if (!v || !*v)
+        return 0;
+    const char *p = v;
+    while (1) {
+        char *end;
+        const long value = strtol(p, &end, 10);
+        if (end == p || value < 0 || value > INT_MAX || count == max_count ||
+            (*end != ',' && *end != '\0')) {
+            fprintf(stderr,
+                    "[iaxl] ERROR: %s=%s must be up to %d comma-separated non-negative integers\n",
+                    name, v, max_count);
+            abort();
+        }
+        out[count++] = (int)value;
+        if (*end == '\0')
+            return count;
+        p = end + 1;
+    }
+}
+
 __attribute__((constructor(101))) void envs_init(void) {
 
     envs.IAXL_ZIP_SRC_CAP = env_int("IAXL_ZIP_SRC_CAP", 256 * 1024);
@@ -62,7 +86,8 @@ __attribute__((constructor(101))) void envs_init(void) {
                 envs.IAXL_ZIP_LEVEL);
         abort();
     }
-    envs.IAXL_ZIP_SEGMENT_SIZE_KB = env_nonnegative_int("IAXL_ZIP_SEGMENT_SIZE_KB", 0);
+    envs.IAXL_ZIP_SEGMENT_SIZE_COUNT = env_nonnegative_int_list(
+        "IAXL_ZIP_SEGMENT_SIZE_KB", envs.IAXL_ZIP_SEGMENT_SIZE_KB, IAXL_ZIP_SEGMENT_SIZE_MAX_COUNT);
 
     envs.IAXL_QAT_ZIP_ENABLE = env_bool("IAXL_QAT_ZIP_ENABLE", 1);
     envs.IAXL_IAA_ZIP_ENABLE = env_bool("IAXL_IAA_ZIP_ENABLE", 0);
