@@ -22,7 +22,7 @@ from ..torch_ext import Mem, Storage
 from ..torch_ext import task_queue_set_bundles_priority, task_queue_sort_priority_level
 from .. import torch_ext as _iqt
 from ..utils import cuda_available
-from .scratch_pool import ScratchPool
+from .scratch_pool import SLOT_BYTES, ScratchAlloc, ScratchPool
 from ..remote_pool.remote_tensor import RemoteTensor
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def get_accelerator_device() -> str:
 @dataclass
 class Task:
     ctx: Any = None
-    block_indices: Optional[List[int]] = None  # scratch blocks to release once done
+    scratch: Optional[ScratchAlloc] = None  # scratch space to release once done
 
     label: str = None
     tensor_key: str = None
@@ -176,11 +176,7 @@ class KVFlow:
                 _iqt.register_kv_pool_gpu(name, t, block_dim)
             self._registered.append(name)
         if not self._in_place:
-            first = next(iter(kv_caches.values()))
-            block_shape = tuple(s for d, s in enumerate(first.shape) if d != block_dim)
-            self.chunk_pool = ScratchPool(
-                block_shape, first.dtype, pin_memory=self.device_type not in (None, "cpu")
-            )
+            self.chunk_pool = ScratchPool(pin_memory=self.device_type not in (None, "cpu"))
 
     def close(self):
         if self.chunk_pool is not None:
@@ -190,9 +186,11 @@ class KVFlow:
             _iqt.unregister_kv_pool(name)
         self._registered.clear()
 
-    def _allocate(self, count: int) -> List[int]:
+    def _allocate(self, count: int, tensor_key: str) -> ScratchAlloc:
+        # Layers may have different page sizes; the pool was registered by name (here or rpc.py).
+        page_bytes = _iqt.get_kv_pool(tensor_key).block_bytes
         rounds, start = 0, 0.0
-        while (blocks := self.chunk_pool.allocate(count)) is None:
+        while (blocks := self.chunk_pool.allocate(count, page_bytes)) is None:
             if not (self._pending_puts or self._pending_gets):
                 raise RuntimeError(f"ScratchPool exhausted: need {count}, {self.chunk_pool.status()}")
             if rounds == 1:
@@ -255,7 +253,8 @@ class KVFlow:
             if self._in_place:
                 blocks = chunk_indices
             else:
-                blocks = self._allocate(num_chunks)
+                scratch = self._allocate(num_chunks, tensor_key)
+                blocks = scratch.indices
                 ctx.xfer_chunks_batch(chunk_indices, blocks)
             ctx.xfer_finish()
 
@@ -264,7 +263,7 @@ class KVFlow:
 
             results[tensor_key] = task = Task(
                 ctx=ctx,
-                block_indices=None if self._in_place else blocks,
+                scratch=None if self._in_place else scratch,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
@@ -302,9 +301,9 @@ class KVFlow:
             result.ctx.zip_wait()
             result.ctx = None
 
-            if result.block_indices is not None:
-                self.chunk_pool.release(result.block_indices)
-                result.block_indices = None
+            if result.scratch is not None:
+                self.chunk_pool.release(result.scratch)
+                result.scratch = None
                 del self._pending_puts[id(result)]
 
         return True
@@ -352,7 +351,8 @@ class KVFlow:
                 if stream_sync_on_get and self.device_type is not None:
                     ctx.xfer_wait_cur_stream()
                 first_tensor = False
-            blocks = chunk_indices if self._in_place else self._allocate(num_chunks)
+            scratch = None if self._in_place else self._allocate(num_chunks, tensor_key)
+            blocks = chunk_indices if self._in_place else scratch.indices
             priority = 0 if priorities is None else priorities[tensor_key]
             sort_key = -1 if sort_keys is None else sort_keys[tensor_key]
             ctx.unzip_from_mem(
@@ -369,7 +369,7 @@ class KVFlow:
 
             results[tensor_key] = task = Task(
                 ctx=ctx,
-                block_indices=None if self._in_place else blocks,
+                scratch=None if self._in_place else scratch,
                 label=label,
                 tensor_key=tensor_key,
                 chunk_labels=chunk_labels,
@@ -430,9 +430,9 @@ class KVFlow:
 
             result.ctx = None
 
-            if result.block_indices is not None:
-                self.chunk_pool.release(result.block_indices)
-                result.block_indices = None
+            if result.scratch is not None:
+                self.chunk_pool.release(result.scratch)
+                result.scratch = None
                 del self._pending_gets[id(result)]
 
         return True
@@ -477,14 +477,14 @@ class KVFlow:
             pool_total_tensors = pool_total_bytes = pool_available = pool_in_use = 0
             pool_shapes = []
         else:
-            pool_total_tensors = pool.num_blocks
+            pool_total_tensors = pool.num_slots
             pool_total_bytes = pool.total_bytes()
             pool_available = pool.available_count()
             pool_in_use = pool_total_tensors - pool_available
             pool_shapes = [
                 {
-                    "shape": list(pool.block_shape),
-                    "dtype": str(pool.dtype),
+                    "shape": [SLOT_BYTES],
+                    "dtype": str(torch.uint8),
                     "available": pool_available,
                 }
             ]

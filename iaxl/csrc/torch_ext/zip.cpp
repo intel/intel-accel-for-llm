@@ -108,7 +108,7 @@ void Context::zip_to_mem(kv_pool::Mem &mem, const std::string &label, const std:
 
     const size_t n = cpu_block_indices.size();
     IAXL_CHECK(chunk_labels.size() == n, "zip_to_mem: chunk_labels and cpu_block_indices differ");
-    cpu_pool_->check_indices(cpu_block_indices);
+    cpu_pool_.check_indices(cpu_block_indices);
 
     reset_async_state();
 
@@ -156,7 +156,7 @@ void Context::unzip_from_mem(kv_pool::Mem &mem, const std::string &label,
                    chunk_indices.size() == cpu_block_indices.size(),
                "unzip_from_mem: chunk_labels, chunk_indices and cpu_block_indices differ");
     pool_->check_indices(chunk_indices);
-    cpu_pool_->check_indices(cpu_block_indices);
+    cpu_pool_.check_indices(cpu_block_indices);
 
     reset_async_state();
 

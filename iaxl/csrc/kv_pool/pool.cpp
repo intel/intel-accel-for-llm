@@ -24,6 +24,22 @@ void KVPool::check_same_block_geometry(const KVPool &other) const {
                "pools have different block geometry");
 }
 
+KVPool KVPool::staging_for(const KVPool &kv) const {
+    if (slot_bytes == 0) {
+        kv.check_same_block_geometry(*this);
+        return *this;
+    }
+    const int64_t slots = (kv.block_bytes + slot_bytes - 1) / slot_bytes;
+    IAXL_CHECK(slots <= num_blocks, "KV block is larger than the whole slot pool");
+    KVPool view = *this;
+    view.inner_size = view.block_bytes = kv.block_bytes;
+    // The codec picks shuffle / lossy masks by element type, so stage as the KV dtype.
+    view.elem_size = kv.elem_size;
+    view.dtype = kv.dtype;
+    view.num_blocks = num_blocks - slots + 1; // a block starting at the last valid slot still fits
+    return view;
+}
+
 std::vector<char *> KVPool::block_ptrs(const std::vector<int64_t> &idx) const {
     std::vector<char *> ptrs(idx.size());
     for (size_t i = 0; i < idx.size(); i++)
@@ -76,7 +92,8 @@ Registry &registry() {
 
 bool same_geometry(const KVPool &a, const KVPool &b) {
     return a.base == b.base && a.device == b.device && a.shape == b.shape &&
-           a.chunk_dim == b.chunk_dim && a.elem_size == b.elem_size && a.dtype == b.dtype;
+           a.chunk_dim == b.chunk_dim && a.elem_size == b.elem_size && a.dtype == b.dtype &&
+           a.slot_bytes == b.slot_bytes;
 }
 
 const KVPool &register_with_tensor(KVPool pool, const torch::Tensor *t) {
@@ -167,6 +184,15 @@ KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_
 const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim) {
     IAXL_CHECK(t.is_cpu(), "register_kv_pool_cpu: tensor is not on the CPU");
     KVPool p = kv_pool_from_tensor(t, PoolDevice::CPU, chunk_dim);
+    p.name = std::move(name);
+    return register_with_tensor(std::move(p), &t);
+}
+
+const KVPool &register_kv_pool_cpu_slots(std::string name, const torch::Tensor &t) {
+    IAXL_CHECK(t.is_cpu() && t.dim() == 2 && t.scalar_type() == torch::kUInt8,
+               "register_kv_pool_cpu_slots: expects a [num_slots, slot_bytes] uint8 CPU tensor");
+    KVPool p = kv_pool_from_tensor(t, PoolDevice::CPU, 0);
+    p.slot_bytes = p.block_bytes;
     p.name = std::move(name);
     return register_with_tensor(std::move(p), &t);
 }

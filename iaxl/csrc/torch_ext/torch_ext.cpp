@@ -36,6 +36,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("num_blocks", &kv_pool::KVPool::num_blocks)
         .def_readonly("block_bytes", &kv_pool::KVPool::block_bytes)
         .def_readonly("total_bytes", &kv_pool::KVPool::total_bytes)
+        .def_readonly("slot_bytes", &kv_pool::KVPool::slot_bytes)
         .def_property_readonly("dtype",
                                [](const kv_pool::KVPool &p) { return static_cast<at::ScalarType>(p.dtype); })
         .def("block_ptr",
@@ -51,6 +52,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("register_kv_pool_cpu", &kv_pool::register_kv_pool_cpu, py::arg("name"), py::arg("tensor"),
           py::arg("chunk_dim") = 0, py::return_value_policy::reference);
+    m.def("register_kv_pool_cpu_slots", &kv_pool::register_kv_pool_cpu_slots, py::arg("name"),
+          py::arg("tensor"), py::return_value_policy::reference);
     m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"), py::arg("tensor"),
           py::arg("chunk_dim"), py::return_value_policy::reference);
     m.def(

@@ -54,6 +54,9 @@ struct KVPool {
     int64_t outer_block_size = 0; // num_blocks * inner_size
     int64_t block_bytes = 0;      // outer_dims * inner_size
     size_t total_bytes = 0;
+    // Slot pool ("scratch"): blocks are slot_bytes slots and a staged block of any size
+    // occupies cdiv(block_bytes, slot_bytes) consecutive slots. 0 for every other pool.
+    int64_t slot_bytes = 0;
 
     // Hot path, no bounds checks.
     char *block_ptr(int64_t idx, int64_t o = 0) const {
@@ -72,6 +75,11 @@ struct KVPool {
     // Entry-point checks (caller thread), done once per call.
     void check_indices(const std::vector<int64_t> &idx) const;
     void check_same_block_geometry(const KVPool &other) const;
+
+    // This CPU pool as staging for blocks of `kv`: itself when the geometry matches, or for a
+    // slot pool a view whose block is kv.block_bytes long, starts at any slot and must not run
+    // past the last slot.
+    KVPool staging_for(const KVPool &kv) const;
 
     // ptrs[i] = block_ptr(idx[i]); only at the Ops::copy_chunks_batch boundary.
     std::vector<char *> block_ptrs(const std::vector<int64_t> &idx) const;
@@ -100,6 +108,8 @@ void add_pool_hooks(const PoolHooks &hooks);
 // ---- torch side (pool.cpp) ----
 // cpu/gpu: validates contiguity and device, records pinned, keeps `t` alive until unregistered.
 const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0);
+// A contiguous [num_slots, slot_bytes] uint8 tensor as a slot pool (see KVPool::slot_bytes).
+const KVPool &register_kv_pool_cpu_slots(std::string name, const torch::Tensor &t);
 const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim);
 const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,
                                       const std::vector<int64_t> &shape, int64_t elem_size,
