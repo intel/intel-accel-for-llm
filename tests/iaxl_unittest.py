@@ -148,6 +148,40 @@ class TestKVFlowMixedPages(unittest.TestCase):
             finally:
                 flow.close()
 
+    def test_packed_block_outermost_views(self):
+        """Layers viewed out of one block-outermost buffer: block stride > page, views
+        sharing a base, and padding between pages that transfers must not touch."""
+        import tempfile
+
+        from iaxl.envs import envs
+        from iaxl.kvflow.flow import KVFlow
+
+        num_blocks, block = 16, 32768  # bytes per block, holding both pages plus padding
+        raw = torch.randint(0, 255, (num_blocks * block,), dtype=torch.uint8, device="cuda")
+        expected = raw.clone()
+        caches = {  # 20,000 B at offset 0 (same base as the buffer), 8,192 B at offset 20,000
+            "a": raw.as_strided((num_blocks, 20000), (block, 1), 0),
+            "b": raw.as_strided((num_blocks, 8192), (block, 1), 20000),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            saved = envs.IAXL_CACHE_DIR
+            envs.IAXL_CACHE_DIR = d
+            try:
+                flow = KVFlow("packed", cache_size_gb=1, kv_caches=caches, block_dim=0)
+            finally:
+                envs.IAXL_CACHE_DIR = saved
+            try:
+                chunks = [1, 2, 7]
+                labels = [f"c{i}" for i in chunks]
+                flow.put_wait(flow.put("req", list(caches), chunks, labels))
+                for t in caches.values():
+                    t[chunks] = 0
+                flow.get_wait(flow.get("req", list(caches), chunks, labels))
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(raw, expected))  # pages restored, padding untouched
+            finally:
+                flow.close()
+
 
 if __name__ == "__main__":
     unittest.main()
