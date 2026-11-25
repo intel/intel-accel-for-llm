@@ -5,18 +5,19 @@
 (IAXL_SCRATCH_POOL_SIZE_GB), registered once as the slot pool `ScratchPool.NAME`.
 
 Layers with different page sizes share it: a page takes cdiv(page_bytes, SLOT_BYTES)
-consecutive slots, and its CPU block index is the first of them. Space is handed out
-as a ring: one allocation is contiguous and never wraps, and space comes back in
-allocation order, so release() of a later allocation waits for the earlier ones.
-No growth: allocate() returns None once the ring is full.
+consecutive slots, and its CPU block index is the first of them. The pages of one
+allocation need not be adjacent, so they are cut page by page from the free ranges,
+lowest address first. Released space is reusable at once, whatever order tasks finish
+in; a free range shorter than a page stays unused until a neighbour is released.
+No growth: allocate() returns None when the pages do not fit.
 
 allocate()/release() are not thread-safe: call them from one thread only.
 """
 
+import bisect
 import logging
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -30,16 +31,8 @@ SLOT_BYTES = 16 * 1024
 
 @dataclass
 class ScratchAlloc:
-    start: int     # first slot
-    slots: int     # slots held, including the ring tail skipped to keep this one contiguous
-    per_page: int  # slots per page
-    pages: int
-    done: bool = False
-
-    @property
-    def indices(self) -> List[int]:
-        """CPU block index of every page: its first slot."""
-        return [self.start + i * self.per_page for i in range(self.pages)]
+    indices: List[int]  # first slot of every page: its CPU block index
+    per_page: int       # slots per page
 
 
 class ScratchPool:
@@ -50,8 +43,7 @@ class ScratchPool:
         self.pool = torch.empty((num_slots, SLOT_BYTES), dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
         assert not pin_memory or self.pool.is_pinned(), "ScratchPool: pin_memory=True did not take effect"
         _iqt.register_kv_pool_cpu_slots(self.NAME, self.pool)
-        self._live: Deque[ScratchAlloc] = deque()  # allocation order
-        self._head = 0  # next free slot
+        self._free: List[Tuple[int, int]] = [(0, num_slots)]  # (start, length), sorted, never adjacent
         self._used = 0
         self._allocate_count = 0
         self._release_count = 0
@@ -67,27 +59,34 @@ class ScratchPool:
 
     def allocate(self, pages: int, page_bytes: int) -> Optional[ScratchAlloc]:
         per_page = -(-page_bytes // SLOT_BYTES)
-        need = pages * per_page
-        start, slots = self._head, need
-        if start + need > self.num_slots:  # skip the tail, start over at slot 0
-            start, slots = 0, need + self.num_slots - self._head
-        if self._used + slots > self.num_slots:
+        if sum(length // per_page for _, length in self._free) < pages:
             return None
-        alloc = ScratchAlloc(start, slots, per_page, pages)
-        self._live.append(alloc)
-        self._head = (start + need) % self.num_slots
-        self._used += slots
+        indices: List[int] = []
+        free: List[Tuple[int, int]] = []
+        for start, length in self._free:
+            take = min(length // per_page, pages - len(indices))
+            indices.extend(range(start, start + take * per_page, per_page))
+            if length > take * per_page:
+                free.append((start + take * per_page, length - take * per_page))
+        self._free = free
+        self._used += pages * per_page
         self._allocate_count += 1
-        return alloc
+        return ScratchAlloc(indices, per_page)
 
     def release(self, alloc: ScratchAlloc):
-        alloc.done = True
+        free = self._free
+        for start in alloc.indices:
+            end = start + alloc.per_page
+            i = bisect.bisect(free, (start,))
+            if i < len(free) and free[i][0] == end:  # merge the right neighbour
+                end += free.pop(i)[1]
+            if i > 0 and sum(free[i - 1]) == start:  # merge the left neighbour
+                start = free[i - 1][0]
+                free[i - 1] = (start, end - start)
+            else:
+                free.insert(i, (start, end - start))
+        self._used -= len(alloc.indices) * alloc.per_page
         self._release_count += 1
-        live = self._live
-        while live and live[0].done:
-            self._used -= live.popleft().slots
-        if not live:
-            self._head = 0
 
     def available_count(self) -> int:
         return self.num_slots - self._used
@@ -96,6 +95,7 @@ class ScratchPool:
         return self.pool.nbytes
 
     def status(self) -> str:
-        return (f"ScratchPool: {self.num_slots} slots x {SLOT_BYTES} B, {self.available_count()} available, "
-                f"{len(self._live)} allocations live, alloc/release={self._allocate_count}/{self._release_count}, "
-                f"{self.pool.nbytes / 2**20:.2f} MB")
+        largest = max((length for _, length in self._free), default=0)
+        return (f"ScratchPool: {self.num_slots} slots x {SLOT_BYTES} B, {self.available_count()} available "
+                f"in {len(self._free)} ranges (largest {largest}), "
+                f"alloc/release={self._allocate_count}/{self._release_count}, {self.pool.nbytes / 2**20:.2f} MB")

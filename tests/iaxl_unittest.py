@@ -49,8 +49,8 @@ class TestKvZip(unittest.TestCase):
             self.assertLess(b.numel(), t.numel() * t.element_size() * 0.6)
 
 
-class TestScratchRing(unittest.TestCase):
-    """The scratch pool hands out contiguous slot ranges in a ring."""
+class TestScratchPool(unittest.TestCase):
+    """The scratch pool cuts pages from free slot ranges, lowest address first."""
 
     def setUp(self):
         from iaxl.envs import envs
@@ -71,21 +71,42 @@ class TestScratchRing(unittest.TestCase):
         self.assertEqual(b.indices, [4, 5, 6])
         self.assertEqual(self.pool.available_count(), 3)
 
-    def test_wraps_without_splitting_and_frees_in_order(self):
-        a = self.pool.allocate(6, self.slot)
-        b = self.pool.allocate(2, self.slot)
-        self.assertIsNone(self.pool.allocate(3, self.slot))  # only 2 slots left
-        self.pool.release(b)  # later allocation: held until `a` is back
-        self.assertEqual(self.pool.available_count(), 2)
-        self.pool.release(a)
-        self.assertEqual(self.pool.available_count(), 10)
-        c = self.pool.allocate(1, self.slot)
-        d = self.pool.allocate(3, self.slot)  # would cross the end: starts over at slot 0
-        self.assertEqual(c.indices, [0])
-        self.assertEqual(d.indices, [1, 2, 3])
-        e = self.pool.allocate(5, self.slot)
-        self.assertEqual(e.indices, [4, 5, 6, 7, 8])
-        self.assertIsNone(self.pool.allocate(2, self.slot))  # tail slot 9 alone is too small
+    def test_release_in_any_order_and_reuse_holes(self):
+        a = self.pool.allocate(2, self.slot)  # slots 0-1
+        b = self.pool.allocate(3, self.slot)  # slots 2-4
+        c = self.pool.allocate(2, self.slot)  # slots 5-6
+        self.pool.release(a)  # free: 0-1 and 7-9, before b and c come back
+        d = self.pool.allocate(3, self.slot)  # one allocation spread over both holes
+        self.assertEqual(d.indices, [0, 1, 7])
+        e = self.pool.allocate(1, 2 * self.slot)
+        self.assertEqual(e.indices, [8])
+        self.assertIsNone(self.pool.allocate(1, self.slot))  # full
+        for x in (c, e, b, d):
+            self.pool.release(x)
+        self.assertEqual(self.pool._free, [(0, 10)])  # every neighbour merged back
+
+    def test_failure_changes_nothing(self):
+        self.pool.allocate(4, self.slot)
+        before = list(self.pool._free)
+        self.assertIsNone(self.pool.allocate(4, 2 * self.slot))  # 6 free slots hold 3 such pages
+        self.assertEqual(self.pool._free, before)
+
+    def test_random_mixed_pages_never_overlap(self):
+        import random
+
+        rng = random.Random(0)
+        live = []
+        for _ in range(2000):
+            if live and rng.random() < 0.5:
+                self.pool.release(live.pop(rng.randrange(len(live))))
+            else:
+                a = self.pool.allocate(rng.randint(1, 3), rng.choice([1, 2, 3]) * self.slot)
+                if a is not None:
+                    live.append(a)
+            held = sorted((i, i + a.per_page) for a in live for i in a.indices)
+            spans = sorted(held + [(s, s + n) for s, n in self.pool._free])
+            self.assertTrue(all(x[1] <= y[0] for x, y in zip(spans, spans[1:])))
+            self.assertEqual(sum(e - s for s, e in spans), 10)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
