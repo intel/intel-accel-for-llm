@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -50,10 +52,13 @@ struct KVPool {
     int64_t num_blocks = 0;       // shape[chunk_dim]
     int64_t outer_dims = 0;       // prod(shape[:chunk_dim])
     int64_t inner_size = 0;       // elem_size * prod(shape[chunk_dim+1:])
-    int64_t chunk_stride = 0;     // bytes between neighbouring blocks (== inner_size, contiguous)
-    int64_t outer_block_size = 0; // num_blocks * inner_size
+    int64_t chunk_stride = 0;     // bytes between neighbouring blocks (>= inner_size for packed pages)
+    int64_t outer_block_size = 0; // num_blocks * chunk_stride for packed pages
     int64_t block_bytes = 0;      // outer_dims * inner_size
     size_t total_bytes = 0;
+    // Slot pool ("scratch"): blocks are slot_bytes slots and a staged block of any size
+    // occupies cdiv(block_bytes, slot_bytes) consecutive slots. 0 for every other pool.
+    int64_t slot_bytes = 0;
 
     // Hot path, no bounds checks.
     char *block_ptr(int64_t idx, int64_t o = 0) const {
@@ -73,13 +78,18 @@ struct KVPool {
     void check_indices(const std::vector<int64_t> &idx) const;
     void check_same_block_geometry(const KVPool &other) const;
 
+    // This CPU pool as staging for blocks of `kv`: itself when the geometry matches, or for a
+    // slot pool a view whose block is kv.block_bytes long, starts at any slot and must not run
+    // past the last slot.
+    KVPool staging_for(const KVPool &kv) const;
+
     // ptrs[i] = block_ptr(idx[i]); only at the Ops::copy_chunks_batch boundary.
     std::vector<char *> block_ptrs(const std::vector<int64_t> &idx) const;
 };
 
 // The only geometry computation; `shape` is laid out contiguously.
 KVPool make_kv_pool(uintptr_t base, PoolDevice device, int dev_id, const std::vector<int64_t> &shape,
-                    int64_t elem_size, int32_t dtype, int chunk_dim);
+                    int64_t elem_size, int32_t dtype, int chunk_dim, int64_t chunk_stride = 0);
 
 // Process-wide registry keyed by name. Element addresses are stable, so a Context may
 // keep a `const KVPool *`. Re-registering a name requires the same base and geometry and
@@ -98,12 +108,18 @@ struct PoolHooks {
 void add_pool_hooks(const PoolHooks &hooks);
 
 // ---- torch side (pool.cpp) ----
-// cpu/gpu: validates contiguity and device, records pinned, keeps `t` alive until unregistered.
-const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0);
-const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim);
+// cpu/gpu: validates device and geometry, records pinned, keeps `t` alive until unregistered.
+// A zero `chunk_stride` means a contiguous tensor; a non-zero one addresses packed blocks.
+const KVPool &register_kv_pool_cpu(std::string name, const torch::Tensor &t, int chunk_dim = 0,
+                                   int64_t chunk_stride = 0);
+// A contiguous [num_slots, slot_bytes] uint8 tensor as a slot pool (see KVPool::slot_bytes).
+const KVPool &register_kv_pool_cpu_slots(std::string name, const torch::Tensor &t);
+const KVPool &register_kv_pool_gpu(std::string name, const torch::Tensor &t, int chunk_dim,
+                                   int64_t chunk_stride = 0);
 const KVPool &register_kv_pool_remote(std::string name, const std::string &peer, uintptr_t base,
                                       const std::vector<int64_t> &shape, int64_t elem_size,
-                                      int32_t dtype, int dev_id, int chunk_dim);
+                                      int32_t dtype, int dev_id, int chunk_dim,
+                                      int64_t chunk_stride = 0);
 
 // Block idx as a view of `t` (the tensor the pool was registered with).
 torch::Tensor block_tensor(const torch::Tensor &t, const KVPool &pool, int64_t idx);
@@ -114,7 +130,8 @@ torch::Tensor block_tensor(const KVPool &pool, int64_t idx);
 int64_t block_index_of(const KVPool &pool, const torch::Tensor &block);
 std::vector<int64_t> block_indices_of(const KVPool &pool, const std::vector<torch::Tensor> &blocks);
 int64_t tensor_bytes(const torch::Tensor &t);
-KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_dim);
+KVPool kv_pool_from_tensor(const torch::Tensor &t, PoolDevice device, int chunk_dim,
+                           int64_t chunk_stride = 0);
 
 inline constexpr char LABEL_SEP = ':';
 
@@ -259,6 +276,47 @@ class Storage {
   private:
     class Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// ---- scratch pool (scratch.cpp) ----
+// One pinned [num_slots, SCRATCH_SLOT_BYTES] uint8 tensor registered as the slot pool NAME.
+// A page takes cdiv(page_bytes, SCRATCH_SLOT_BYTES) consecutive slots and its CPU block index
+// is its first slot. Pages of one allocation need not be adjacent: they are cut page by page
+// from the free slot ranges, lowest address first, so released space is reusable at once
+// whatever order transfers finish in. Not thread-safe: call it from one thread.
+inline constexpr int64_t SCRATCH_SLOT_BYTES = 16 * 1024;
+
+struct ScratchAlloc {
+    std::vector<int64_t> indices; // first slot of every page
+    int64_t per_page = 0;         // slots per page
+};
+
+class ScratchPool {
+  public:
+    static constexpr const char *NAME = "scratch";
+
+    ScratchPool(size_t bytes, bool pin_memory);
+    ~ScratchPool();
+    ScratchPool(const ScratchPool &) = delete;
+    ScratchPool &operator=(const ScratchPool &) = delete;
+
+    // nullopt when the pages do not fit; nothing changes then.
+    std::optional<ScratchAlloc> allocate(int64_t pages, int64_t page_bytes);
+    void release(const ScratchAlloc &alloc);
+    void close(); // unregisters the pool and frees the tensor
+
+    int64_t num_slots() const { return num_slots_; }
+    int64_t available() const { return num_slots_ - used_; }
+    size_t total_bytes() const { return static_cast<size_t>(num_slots_) * SCRATCH_SLOT_BYTES; }
+    std::vector<std::pair<int64_t, int64_t>> free_ranges() const; // (start, length), ascending
+    std::string status() const;
+
+  private:
+    int64_t num_slots_ = 0;
+    int64_t used_ = 0;
+    std::map<int64_t, int64_t> free_; // start -> length; neighbours are always merged
+    uint64_t allocate_count_ = 0;
+    uint64_t release_count_ = 0;
 };
 
 class Mem {

@@ -36,6 +36,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("num_blocks", &kv_pool::KVPool::num_blocks)
         .def_readonly("block_bytes", &kv_pool::KVPool::block_bytes)
         .def_readonly("total_bytes", &kv_pool::KVPool::total_bytes)
+        .def_readonly("slot_bytes", &kv_pool::KVPool::slot_bytes)
         .def_property_readonly("dtype",
                                [](const kv_pool::KVPool &p) { return static_cast<at::ScalarType>(p.dtype); })
         .def("block_ptr",
@@ -50,18 +51,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("ptr"));
 
     m.def("register_kv_pool_cpu", &kv_pool::register_kv_pool_cpu, py::arg("name"), py::arg("tensor"),
-          py::arg("chunk_dim") = 0, py::return_value_policy::reference);
-    m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"), py::arg("tensor"),
-          py::arg("chunk_dim"), py::return_value_policy::reference);
+          py::arg("chunk_dim") = 0, py::arg("chunk_stride") = 0,
+          py::return_value_policy::reference);
+    m.def("register_kv_pool_cpu_slots", &kv_pool::register_kv_pool_cpu_slots, py::arg("name"),
+          py::arg("tensor"), py::return_value_policy::reference);
+    m.attr("SCRATCH_SLOT_BYTES") = kv_pool::SCRATCH_SLOT_BYTES;
+    py::class_<kv_pool::ScratchAlloc>(m, "ScratchAlloc", "Scratch slots of one allocation")
+        .def_readonly("indices", &kv_pool::ScratchAlloc::indices)
+        .def_readonly("per_page", &kv_pool::ScratchAlloc::per_page);
+    py::class_<kv_pool::ScratchPool> scratch(m, "ScratchPool",
+                                             "Pinned staging slots shared by every page size");
+    scratch.attr("NAME") = kv_pool::ScratchPool::NAME;
+    scratch.def(py::init<size_t, bool>(), py::arg("bytes"), py::arg("pin_memory") = true)
+        .def("allocate", &kv_pool::ScratchPool::allocate, py::arg("pages"), py::arg("page_bytes"))
+        .def("release", &kv_pool::ScratchPool::release, py::arg("alloc"))
+        .def("close", &kv_pool::ScratchPool::close)
+        .def_property_readonly("num_slots", &kv_pool::ScratchPool::num_slots)
+        .def("available_count", &kv_pool::ScratchPool::available)
+        .def("total_bytes", &kv_pool::ScratchPool::total_bytes)
+        .def("free_ranges", &kv_pool::ScratchPool::free_ranges)
+        .def("status", &kv_pool::ScratchPool::status);
+    m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"),
+          py::arg("tensor"), py::arg("chunk_dim"), py::arg("chunk_stride") = 0,
+          py::return_value_policy::reference);
     m.def(
         "register_kv_pool_remote",
         [](std::string name, const std::string &peer, uintptr_t base, const std::vector<int64_t> &shape,
-           int64_t elem_size, at::ScalarType dtype, int dev_id, int chunk_dim) -> const kv_pool::KVPool & {
+           int64_t elem_size, at::ScalarType dtype, int dev_id, int chunk_dim,
+           int64_t chunk_stride) -> const kv_pool::KVPool & {
             return kv_pool::register_kv_pool_remote(std::move(name), peer, base, shape, elem_size,
-                                                    static_cast<int32_t>(dtype), dev_id, chunk_dim);
+                                                    static_cast<int32_t>(dtype), dev_id, chunk_dim,
+                                                    chunk_stride);
         },
         py::arg("name"), py::arg("peer"), py::arg("base"), py::arg("shape"), py::arg("elem_size"),
-        py::arg("dtype"), py::arg("dev_id"), py::arg("chunk_dim"), py::return_value_policy::reference);
+        py::arg("dtype"), py::arg("dev_id"), py::arg("chunk_dim"), py::arg("chunk_stride") = 0,
+        py::return_value_policy::reference);
     m.def("unregister_kv_pool", &kv_pool::unregister_kv_pool, py::arg("name"));
     m.def("get_kv_pool", &kv_pool::get_kv_pool, py::arg("name"), py::return_value_policy::reference);
     m.def("find_kv_pool", &kv_pool::find_kv_pool, py::arg("name"), py::return_value_policy::reference);

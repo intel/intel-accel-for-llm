@@ -42,9 +42,14 @@ namespace {
 
 // NIXL state of one registered buffer; pools sharing a base (hybrid layers) share it.
 struct Reg {
-    nixlDlistH *dlist = nullptr; // Remote: VRAM descs; CPU: DRAM descs, built at first transfer
-    int64_t outer_dims = 0;      // sub-block geometry of a CPU dlist
-    int64_t inner_size = 0;
+    nixlDlistH *dlist = nullptr; // Remote: VRAM descs
+    // CPU: DRAM descs per staged sub-block geometry, built at first transfer. A slot pool
+    // stages layers of different page sizes, so it can hold several.
+    struct Local {
+        int64_t outer_dims, inner_size, num_blocks;
+        nixlDlistH *dlist;
+    };
+    std::vector<Local> locals;
     int refs = 0;
 };
 
@@ -70,7 +75,7 @@ struct Rdma {
 
 struct XferContext {
     const KVPool *remote;
-    const KVPool *local;
+    KVPool local; // staging view, owned: the Context's copy moves with the Context
     nixlDlistH *remote_dlist;
     nixlDlistH *local_dlist;
 };
@@ -110,6 +115,8 @@ void on_unregister(const KVPool &p) {
         return;
     if (it->second.dlist)
         NIXL_CHECK(r.agent().releasedDlistH(it->second.dlist));
+    for (const Reg::Local &l : it->second.locals)
+        NIXL_CHECK(r.agent().releasedDlistH(l.dlist));
     r.regs.erase(it);
 }
 
@@ -119,28 +126,27 @@ Reg &reg_of(Rdma &r, const KVPool &p) {
     return it->second;
 }
 
-// The CPU pool's descriptor list splits every block into the remote's outer_dims
-// sub-blocks of inner_size bytes, so it is built once the first remote pool is known.
+// A CPU descriptor list splits every staging block into the remote's outer_dims sub-blocks
+// of inner_size bytes. `local` is the staging view, so its num_blocks keeps every descriptor
+// inside the registered buffer.
 nixlDlistH *local_dlist(Rdma &r, const KVPool &local, const KVPool &remote) {
     std::lock_guard<std::mutex> lock(r.mu);
     Reg &reg = reg_of(r, local);
-    if (reg.dlist) {
-        IAXL_CHECK(reg.outer_dims == remote.outer_dims && reg.inner_size == remote.inner_size,
-                   "scratch pool geometry differs between layers");
-        return reg.dlist;
-    }
     const int64_t od = remote.outer_dims, is = remote.inner_size;
+    for (const Reg::Local &l : reg.locals)
+        if (l.outer_dims == od && l.inner_size == is && l.num_blocks == local.num_blocks)
+            return l.dlist;
     nixl_xfer_dlist_t descs(DRAM_SEG, local.num_blocks * od);
     for (int64_t b = 0; b < local.num_blocks; b++)
         for (int64_t o = 0; o < od; o++)
             descs[b * od + o] =
                 nixlBasicDesc(reinterpret_cast<uintptr_t>(local.block_ptr(b)) + o * is, is, 0);
-    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, reg.dlist, &r.opt));
-    reg.outer_dims = od;
-    reg.inner_size = is;
+    nixlDlistH *dlist = nullptr;
+    NIXL_CHECK(r.agent().prepXferDlist(NIXL_INIT_AGENT, descs, dlist, &r.opt));
+    reg.locals.push_back({od, is, local.num_blocks, dlist});
     fprintf(stderr, "[kv_xfer/rdma] pool %s: %ld blocks x %ld descs of %ld B\n",
             local.name.c_str(), local.num_blocks, od, is);
-    return reg.dlist;
+    return dlist;
 }
 
 } // namespace
@@ -220,7 +226,7 @@ void copy_chunks_batch(context_t ctx, const std::vector<int64_t> &chunk_indices,
     Rdma &r = Rdma::get();
     XferContext *x = as_ctx(ctx);
     const KVPool &remote = *x->remote;
-    const KVPool &local = *x->local;
+    const KVPool &local = x->local;
     const size_t n = chunk_indices.size();
     if (n == 0)
         return;
@@ -270,7 +276,7 @@ const Ops &rdma_ops() {
 context_t rdma_context_create(const KVPool &remote, const KVPool &local) {
     IAXL_CHECK(remote.device == PoolDevice::Remote, "rdma_context_create: pool is not remote");
     Rdma &r = Rdma::get();
-    XferContext *x = new XferContext{&remote, &local, nullptr, nullptr};
+    XferContext *x = new XferContext{&remote, local, nullptr, nullptr};
     {
         std::lock_guard<std::mutex> lock(r.mu);
         x->remote_dlist = reg_of(r, remote).dlist;

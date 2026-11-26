@@ -41,9 +41,10 @@ class Context {
         ctx.name_ = name;
         ctx.direction_ = direction;
         ctx.pool_ = &kv_pool::get_kv_pool(pool_name);
-        ctx.cpu_pool_ = &kv_pool::get_kv_pool(cpu_pool);
-        IAXL_CHECK(ctx.cpu_pool_->device == PoolDevice::CPU, "cpu_pool is not in CPU memory");
-        ctx.pool_->check_same_block_geometry(*ctx.cpu_pool_);
+        const kv_pool::KVPool &cpu = kv_pool::get_kv_pool(cpu_pool);
+        IAXL_CHECK(cpu.device == PoolDevice::CPU, "cpu_pool is not in CPU memory");
+        // A slot pool stages blocks of any size: the view makes block_bytes this pool's block.
+        ctx.cpu_pool_ = cpu.staging_for(*ctx.pool_);
 
         const kv_pool::KVPool &p = *ctx.pool_;
         if (p.device == PoolDevice::Remote) {
@@ -51,7 +52,7 @@ class Context {
             TORCH_CHECK(false, "RDMA (remote_pool) needs NIXL, which DEVICE=cpu builds do not link");
 #else
             ctx.ops_ = &kv_xfer::rdma_ops();
-            ctx.xctx_ = kv_xfer::rdma_context_create(p, *ctx.cpu_pool_);
+            ctx.xctx_ = kv_xfer::rdma_context_create(p, ctx.cpu_pool_);
 #endif
         } else {
             ctx.ops_ = &kv_xfer::gpu_ops();
@@ -102,7 +103,7 @@ class Context {
     TaskQueue &queue() const { return *queue_; }
     const std::string &name() const { return name_; }
     const kv_pool::KVPool &pool() const { return *pool_; }
-    const kv_pool::KVPool &cpu_pool() const { return *cpu_pool_; }
+    const kv_pool::KVPool &cpu_pool() const { return cpu_pool_; }
 
     Context() = default;
     ~Context() {
@@ -123,7 +124,7 @@ class Context {
             xctx_ = other.xctx_;
             stream_id_ = other.stream_id_;
             pool_ = other.pool_;
-            cpu_pool_ = other.cpu_pool_;
+            cpu_pool_ = std::move(other.cpu_pool_);
             direction_ = other.direction_;
             queue_ = other.queue_;
             event_ = other.event_;
@@ -171,7 +172,7 @@ class Context {
     kv_xfer::context_t xctx_ = nullptr;
     unsigned long long stream_id_ = 0;
     const kv_pool::KVPool *pool_ = nullptr;
-    const kv_pool::KVPool *cpu_pool_ = nullptr;
+    kv_pool::KVPool cpu_pool_; // staging view of the CPU pool for pool_'s blocks
     GpuTransferDirection direction_ = GpuTransferDirection::H2D;
     TaskQueue *queue_ = nullptr;
     kv_xfer::event_t event_ = nullptr;
