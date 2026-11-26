@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -274,6 +276,47 @@ class Storage {
   private:
     class Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// ---- scratch pool (scratch.cpp) ----
+// One pinned [num_slots, SCRATCH_SLOT_BYTES] uint8 tensor registered as the slot pool NAME.
+// A page takes cdiv(page_bytes, SCRATCH_SLOT_BYTES) consecutive slots and its CPU block index
+// is its first slot. Pages of one allocation need not be adjacent: they are cut page by page
+// from the free slot ranges, lowest address first, so released space is reusable at once
+// whatever order transfers finish in. Not thread-safe: call it from one thread.
+inline constexpr int64_t SCRATCH_SLOT_BYTES = 16 * 1024;
+
+struct ScratchAlloc {
+    std::vector<int64_t> indices; // first slot of every page
+    int64_t per_page = 0;         // slots per page
+};
+
+class ScratchPool {
+  public:
+    static constexpr const char *NAME = "scratch";
+
+    ScratchPool(size_t bytes, bool pin_memory);
+    ~ScratchPool();
+    ScratchPool(const ScratchPool &) = delete;
+    ScratchPool &operator=(const ScratchPool &) = delete;
+
+    // nullopt when the pages do not fit; nothing changes then.
+    std::optional<ScratchAlloc> allocate(int64_t pages, int64_t page_bytes);
+    void release(const ScratchAlloc &alloc);
+    void close(); // unregisters the pool and frees the tensor
+
+    int64_t num_slots() const { return num_slots_; }
+    int64_t available() const { return num_slots_ - used_; }
+    size_t total_bytes() const { return static_cast<size_t>(num_slots_) * SCRATCH_SLOT_BYTES; }
+    std::vector<std::pair<int64_t, int64_t>> free_ranges() const; // (start, length), ascending
+    std::string status() const;
+
+  private:
+    int64_t num_slots_ = 0;
+    int64_t used_ = 0;
+    std::map<int64_t, int64_t> free_; // start -> length; neighbours are always merged
+    uint64_t allocate_count_ = 0;
+    uint64_t release_count_ = 0;
 };
 
 class Mem {

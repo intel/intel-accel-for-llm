@@ -17,12 +17,11 @@ from ..utils.profiler import (
 )
 from ..envs import envs
 from ..torch_ext import Record
-from ..torch_ext import Context, GpuTransferDirection
+from ..torch_ext import SCRATCH_SLOT_BYTES, Context, GpuTransferDirection, ScratchAlloc, ScratchPool
 from ..torch_ext import Mem, Storage
 from ..torch_ext import task_queue_set_bundles_priority, task_queue_sort_priority_level
 from .. import torch_ext as _iqt
 from ..utils import cuda_available
-from .scratch_pool import SLOT_BYTES, ScratchAlloc, ScratchPool
 from ..remote_pool.remote_tensor import RemoteTensor
 
 logger = logging.getLogger(__name__)
@@ -179,7 +178,9 @@ class KVFlow:
                 _iqt.register_kv_pool_gpu(name, t, block_dim, chunk_stride)
             self._registered.append(name)
         if not self._in_place:
-            self.chunk_pool = ScratchPool(pin_memory=self.device_type not in (None, "cpu"))
+            self.chunk_pool = ScratchPool(int(envs.IAXL_SCRATCH_POOL_SIZE_GB * 1024**3),
+                                          pin_memory=self.device_type not in (None, "cpu"))
+            logger.info("%s", self.chunk_pool.status())
 
     def close(self):
         if self.chunk_pool is not None:
@@ -486,7 +487,7 @@ class KVFlow:
             pool_in_use = pool_total_tensors - pool_available
             pool_shapes = [
                 {
-                    "shape": [SLOT_BYTES],
+                    "shape": [SCRATCH_SLOT_BYTES],
                     "dtype": str(torch.uint8),
                     "available": pool_available,
                 }

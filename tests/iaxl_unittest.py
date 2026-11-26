@@ -53,15 +53,8 @@ class TestScratchPool(unittest.TestCase):
     """The scratch pool cuts pages from free slot ranges, lowest address first."""
 
     def setUp(self):
-        from iaxl.envs import envs
-        from iaxl.kvflow.scratch_pool import SLOT_BYTES, ScratchPool
-
-        self.slot = SLOT_BYTES
-        saved, envs.IAXL_SCRATCH_POOL_SIZE_GB = envs.IAXL_SCRATCH_POOL_SIZE_GB, 10 * SLOT_BYTES / 1024**3
-        try:
-            self.pool = ScratchPool(pin_memory=False)
-        finally:
-            envs.IAXL_SCRATCH_POOL_SIZE_GB = saved
+        self.slot = torch_ext.SCRATCH_SLOT_BYTES
+        self.pool = torch_ext.ScratchPool(10 * self.slot, pin_memory=False)
         self.addCleanup(self.pool.close)
 
     def test_pages_take_whole_slots(self):
@@ -83,13 +76,13 @@ class TestScratchPool(unittest.TestCase):
         self.assertIsNone(self.pool.allocate(1, self.slot))  # full
         for x in (c, e, b, d):
             self.pool.release(x)
-        self.assertEqual(self.pool._free, [(0, 10)])  # every neighbour merged back
+        self.assertEqual(self.pool.free_ranges(), [(0, 10)])  # every neighbour merged back
 
     def test_failure_changes_nothing(self):
         self.pool.allocate(4, self.slot)
-        before = list(self.pool._free)
+        before = self.pool.free_ranges()
         self.assertIsNone(self.pool.allocate(4, 2 * self.slot))  # 6 free slots hold 3 such pages
-        self.assertEqual(self.pool._free, before)
+        self.assertEqual(self.pool.free_ranges(), before)
 
     def test_random_mixed_pages_never_overlap(self):
         import random
@@ -104,7 +97,7 @@ class TestScratchPool(unittest.TestCase):
                 if a is not None:
                     live.append(a)
             held = sorted((i, i + a.per_page) for a in live for i in a.indices)
-            spans = sorted(held + [(s, s + n) for s, n in self.pool._free])
+            spans = sorted(held + [(s, s + n) for s, n in self.pool.free_ranges()])
             self.assertTrue(all(x[1] <= y[0] for x, y in zip(spans, spans[1:])))
             self.assertEqual(sum(e - s for s, e in spans), 10)
 

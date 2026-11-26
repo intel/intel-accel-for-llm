@@ -55,6 +55,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::return_value_policy::reference);
     m.def("register_kv_pool_cpu_slots", &kv_pool::register_kv_pool_cpu_slots, py::arg("name"),
           py::arg("tensor"), py::return_value_policy::reference);
+    m.attr("SCRATCH_SLOT_BYTES") = kv_pool::SCRATCH_SLOT_BYTES;
+    py::class_<kv_pool::ScratchAlloc>(m, "ScratchAlloc", "Scratch slots of one allocation")
+        .def_readonly("indices", &kv_pool::ScratchAlloc::indices)
+        .def_readonly("per_page", &kv_pool::ScratchAlloc::per_page);
+    py::class_<kv_pool::ScratchPool> scratch(m, "ScratchPool",
+                                             "Pinned staging slots shared by every page size");
+    scratch.attr("NAME") = kv_pool::ScratchPool::NAME;
+    scratch.def(py::init<size_t, bool>(), py::arg("bytes"), py::arg("pin_memory") = true)
+        .def("allocate", &kv_pool::ScratchPool::allocate, py::arg("pages"), py::arg("page_bytes"))
+        .def("release", &kv_pool::ScratchPool::release, py::arg("alloc"))
+        .def("close", &kv_pool::ScratchPool::close)
+        .def_property_readonly("num_slots", &kv_pool::ScratchPool::num_slots)
+        .def("available_count", &kv_pool::ScratchPool::available)
+        .def("total_bytes", &kv_pool::ScratchPool::total_bytes)
+        .def("free_ranges", &kv_pool::ScratchPool::free_ranges)
+        .def("status", &kv_pool::ScratchPool::status);
     m.def("register_kv_pool_gpu", &kv_pool::register_kv_pool_gpu, py::arg("name"),
           py::arg("tensor"), py::arg("chunk_dim"), py::arg("chunk_stride") = 0,
           py::return_value_policy::reference);
