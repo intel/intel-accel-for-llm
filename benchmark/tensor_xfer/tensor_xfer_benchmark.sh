@@ -2,7 +2,8 @@
 # Usage: tensor_xfer_benchmark.sh [--ranks N] [tensor_xfer_benchmark.py options]
 
 export IAXL_DSA_GD_ENABLE=1
-export IAXL_DSA_H2D_CROSSOVER_KB=0 IAXL_DSA_D2H_CROSSOVER_KB=0
+export IAXL_DSA_H2D_CROSSOVER_KB=0
+export IAXL_DSA_D2H_CROSSOVER_KB=0
 
 RANKS=1
 ARGS=()

@@ -94,25 +94,6 @@ case "${IAXL_DSA_GD_ENABLE,,}" in
         ;;
 esac
 
-printf '%s\n' \
-    "vLLM configuration:" \
-    "  MODEL=$MODEL" \
-    "  TP_SIZE=$TP_SIZE" \
-    "  DP_SIZE=$DP_SIZE" \
-    "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
-    "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
-    "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
-    "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
-    "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
-    "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
-    "  KVSHRINK_CPU_OMP_THREADS_BIND=$KVSHRINK_CPU_OMP_THREADS_BIND" \
-    "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
-    "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=$KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC" \
-    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
-
 # ---- Cache / compression ----------------------------------------------------
 export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy LSB truncation: 'auto', 0 (off), or N bits
 export IAXL_KV_DATA_SHUFFLE=${IAXL_KV_DATA_SHUFFLE:-1}                   # Byte-shuffle before compression (0/1)
@@ -229,6 +210,31 @@ fi
 export http_proxy="${http_proxy:-}"
 export https_proxy=$http_proxy
 
+# ---- Accelerator auto-config ------------------------------------------------
+accel_auto_config || return 1 2>/dev/null || exit 1 # Container only: sets IAXL_DSA_H2D_CROSSOVER_KB, IAXL_DSA_D2H_CROSSOVER_KB, IAXL_ZIP_SEGMENT_SIZE_KB
+
+printf '%s\n' \
+    "vLLM configuration:" \
+    "  MODEL=$MODEL" \
+    "  TP_SIZE=$TP_SIZE" \
+    "  DP_SIZE=$DP_SIZE" \
+    "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
+    "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
+    "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
+    "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
+    "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
+    "  IAXL_DSA_H2D_CROSSOVER_KB=${IAXL_DSA_H2D_CROSSOVER_KB:-unset}" \
+    "  IAXL_DSA_D2H_CROSSOVER_KB=${IAXL_DSA_D2H_CROSSOVER_KB:-unset}" \
+    "  IAXL_ZIP_SEGMENT_SIZE_KB=${IAXL_ZIP_SEGMENT_SIZE_KB:-unset}" \
+    "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
+    "  KVSHRINK_CPU_OMP_THREADS_BIND=$KVSHRINK_CPU_OMP_THREADS_BIND" \
+    "  KVSHRINK_QAT_DEVICES=${KVSHRINK_QAT_DEVICES:-disabled}" \
+    "  KVSHRINK_DSA_DEVICES=${KVSHRINK_DSA_DEVICES:-disabled}" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED=$KVSHRINK_VLLM_KV_ASYNC_LOAD_ENABLED" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC" \
+    "  KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP=$KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS_DYNAMIC_MAP"
+
 # ---- docker (used by start.sh) ---------------------------------------------
 # A recipe's setvars.post.sh may edit CONTAINER_NAME, ENV_VARS and DOCKER_RUN_ARGS; --name and
 # the -e flags for ENV_VARS are appended after it.
@@ -294,6 +300,7 @@ if [[ -f "${IAXL_RECIPE_DIR:-}/setvars.post.sh" ]]; then
 fi
 
 DOCKER_RUN_ARGS+=("--name" "$CONTAINER_NAME")
+DOCKER_RUN_ARGS+=("-e" "IAXL_IN_CONTAINER=1") # accel_auto_config only measures inside the container
 for var in "${ENV_VARS[@]}"; do
     DOCKER_RUN_ARGS+=("-e" "$var=${!var:-}")
 done

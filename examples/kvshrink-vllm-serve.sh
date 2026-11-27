@@ -8,9 +8,8 @@
 # Both *_ARGS are split on whitespace, so no value may contain a space.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/../setvars.sh"
+source "$SCRIPT_DIR/../setvars.sh" || exit 1
 : "${MODEL:?Set MODEL in setvars.sh or the environment}"
-set -o pipefail
 
 export LD_PRELOAD="$IAXL_LD_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}"
 
@@ -31,21 +30,10 @@ if [[ -n "${VLLM_SERVE_CMDLINE_ARGS:-}" ]]; then
 fi
 read -r -a extra_args <<<"${VLLM_SERVE_EXTRA_ARGS:-}"
 
-{
-    if env_truthy "$IAXL_DSA_GD_ENABLE"; then
-        crossovers=$(python3 "$SCRIPT_DIR/../tools/calibration/dsa_calibration.py") || exit 1
-        read -r IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB <<<"$crossovers"
-        export IAXL_DSA_H2D_CROSSOVER_KB IAXL_DSA_D2H_CROSSOVER_KB
-    fi
-    if env_truthy "$IAXL_KV_COMPRESSION" && env_truthy "$IAXL_QAT_ZIP_ENABLE" "$IAXL_IAA_ZIP_ENABLE"; then
-        IAXL_ZIP_SEGMENT_SIZE_KB=$(python3 "$SCRIPT_DIR/../tools/calibration/zip_calibration.py") || exit 1
-        export IAXL_ZIP_SEGMENT_SIZE_KB
-    fi
-
-    vllm serve "$MODEL" \
-        --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
-        "${parallel_args[@]}" \
-        "${block_args[@]}" \
-        "${serve_args[@]}" \
-        "${extra_args[@]}"
-} 2>&1 | tee log.kvshrink-vllm
+vllm serve "$MODEL" \
+    --kv-transfer-config '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}' \
+    "${parallel_args[@]}" \
+    "${block_args[@]}" \
+    "${serve_args[@]}" \
+    "${extra_args[@]}" \
+    2>&1 | tee log.kvshrink-vllm

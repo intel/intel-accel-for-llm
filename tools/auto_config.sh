@@ -563,6 +563,19 @@ validate_omp_config() {
         "  IAXL_USE_OMP=$IAXL_USE_OMP"
 }
 
+# Container only: exports what tools/accel_auto_config.py measures (DSA crossovers, zip segment sizes).
+accel_auto_config() {
+    local output setting
+    local -a settings
+
+    env_truthy "${IAXL_IN_CONTAINER:-0}" || return 0
+    output=$(LD_PRELOAD="$IAXL_LD_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}" python3 "$TOP_DIR/tools/accel_auto_config.py") || return 1
+    read -r -a settings <<<"$output"
+    for setting in "${settings[@]}"; do
+        export "$setting"
+    done
+}
+
 # A recipe (IAXL_RECIPE_DIR, resolved by setvars.sh) may add functions or redefine the functions
 # above; its definitions win because they are sourced last. doc/design/recipes.md lists the ones
 # meant to be redefined and their contract.
