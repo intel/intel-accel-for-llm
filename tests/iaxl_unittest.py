@@ -49,5 +49,132 @@ class TestKvZip(unittest.TestCase):
             self.assertLess(b.numel(), t.numel() * t.element_size() * 0.6)
 
 
+class TestScratchPool(unittest.TestCase):
+    """The scratch pool cuts pages from free slot ranges, lowest address first."""
+
+    def setUp(self):
+        self.slot = torch_ext.SCRATCH_SLOT_BYTES
+        self.pool = torch_ext.ScratchPool(10 * self.slot, pin_memory=False)
+        self.addCleanup(self.pool.close)
+
+    def test_pages_take_whole_slots(self):
+        a = self.pool.allocate(2, self.slot + 1)
+        self.assertEqual(a.indices, [0, 2])
+        b = self.pool.allocate(3, 100)
+        self.assertEqual(b.indices, [4, 5, 6])
+        self.assertEqual(self.pool.available_count(), 3)
+
+    def test_release_in_any_order_and_reuse_holes(self):
+        a = self.pool.allocate(2, self.slot)  # slots 0-1
+        b = self.pool.allocate(3, self.slot)  # slots 2-4
+        c = self.pool.allocate(2, self.slot)  # slots 5-6
+        self.pool.release(a)  # free: 0-1 and 7-9, before b and c come back
+        d = self.pool.allocate(3, self.slot)  # one allocation spread over both holes
+        self.assertEqual(d.indices, [0, 1, 7])
+        e = self.pool.allocate(1, 2 * self.slot)
+        self.assertEqual(e.indices, [8])
+        self.assertIsNone(self.pool.allocate(1, self.slot))  # full
+        for x in (c, e, b, d):
+            self.pool.release(x)
+        self.assertEqual(self.pool.free_ranges(), [(0, 10)])  # every neighbour merged back
+
+    def test_failure_changes_nothing(self):
+        self.pool.allocate(4, self.slot)
+        before = self.pool.free_ranges()
+        self.assertIsNone(self.pool.allocate(4, 2 * self.slot))  # 6 free slots hold 3 such pages
+        self.assertEqual(self.pool.free_ranges(), before)
+
+    def test_random_mixed_pages_never_overlap(self):
+        import random
+
+        rng = random.Random(0)
+        live = []
+        for _ in range(2000):
+            if live and rng.random() < 0.5:
+                self.pool.release(live.pop(rng.randrange(len(live))))
+            else:
+                a = self.pool.allocate(rng.randint(1, 3), rng.choice([1, 2, 3]) * self.slot)
+                if a is not None:
+                    live.append(a)
+            held = sorted((i, i + a.per_page) for a in live for i in a.indices)
+            spans = sorted(held + [(s, s + n) for s, n in self.pool.free_ranges()])
+            self.assertTrue(all(x[1] <= y[0] for x, y in zip(spans, spans[1:])))
+            self.assertEqual(sum(e - s for s, e in spans), 10)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+class TestKVFlowMixedPages(unittest.TestCase):
+    """Layers of different page sizes share the scratch pool through put and get."""
+
+    def test_roundtrip(self):
+        import tempfile
+
+        from iaxl.envs import envs
+        from iaxl.kvflow.flow import KVFlow
+
+        num_blocks = 16
+        # 20,000 B pages (2 slots, not slot-aligned) and 2,048 B pages (1 slot, mostly empty).
+        caches = {
+            "big": torch.randn(num_blocks, 10000, dtype=torch.bfloat16, device="cuda"),
+            "small": torch.randn(num_blocks, 1024, dtype=torch.bfloat16, device="cuda"),
+        }
+        expected = {k: v.clone() for k, v in caches.items()}
+        with tempfile.TemporaryDirectory() as d:
+            saved = envs.IAXL_CACHE_DIR
+            envs.IAXL_CACHE_DIR = d
+            try:
+                flow = KVFlow("mixed", cache_size_gb=1, kv_caches=caches, block_dim=0)
+            finally:
+                envs.IAXL_CACHE_DIR = saved
+            try:
+                chunks = [1, 3, 4, 9]
+                labels = [f"c{i}" for i in chunks]
+                flow.put_wait(flow.put("req", list(caches), chunks, labels))
+                for t in caches.values():
+                    t.zero_()
+                flow.get_wait(flow.get("req", list(caches), chunks, labels))
+                torch.cuda.synchronize()
+                for k, t in caches.items():
+                    self.assertTrue(torch.equal(t[chunks], expected[k][chunks]), k)
+                    others = [i for i in range(num_blocks) if i not in chunks]
+                    self.assertEqual(t[others].count_nonzero().item(), 0, k)
+            finally:
+                flow.close()
+
+    def test_packed_block_outermost_views(self):
+        """Layers viewed out of one block-outermost buffer: block stride > page, views
+        sharing a base, and padding between pages that transfers must not touch."""
+        import tempfile
+
+        from iaxl.envs import envs
+        from iaxl.kvflow.flow import KVFlow
+
+        num_blocks, block = 16, 32768  # bytes per block, holding both pages plus padding
+        raw = torch.randint(0, 255, (num_blocks * block,), dtype=torch.uint8, device="cuda")
+        expected = raw.clone()
+        caches = {  # 20,000 B at offset 0 (same base as the buffer), 8,192 B at offset 20,000
+            "a": raw.as_strided((num_blocks, 20000), (block, 1), 0),
+            "b": raw.as_strided((num_blocks, 8192), (block, 1), 20000),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            saved = envs.IAXL_CACHE_DIR
+            envs.IAXL_CACHE_DIR = d
+            try:
+                flow = KVFlow("packed", cache_size_gb=1, kv_caches=caches, block_dim=0)
+            finally:
+                envs.IAXL_CACHE_DIR = saved
+            try:
+                chunks = [1, 2, 7]
+                labels = [f"c{i}" for i in chunks]
+                flow.put_wait(flow.put("req", list(caches), chunks, labels))
+                for t in caches.values():
+                    t[chunks] = 0
+                flow.get_wait(flow.get("req", list(caches), chunks, labels))
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(raw, expected))  # pages restored, padding untouched
+            finally:
+                flow.close()
+
+
 if __name__ == "__main__":
     unittest.main()

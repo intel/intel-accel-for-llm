@@ -13,7 +13,7 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
     IAXL_CHECK(chunk_indices.size() == cpu_block_indices.size(),
                "xfer_chunks_batch: chunk_indices and cpu_block_indices must have the same length");
     pool_->check_indices(chunk_indices);
-    cpu_pool_->check_indices(cpu_block_indices);
+    cpu_pool_.check_indices(cpu_block_indices);
 
     const bool h2d = (direction_ == GpuTransferDirection::H2D);
     auto x = xctx_;
@@ -23,7 +23,7 @@ void Context::xfer_chunks_batch(const std::vector<int64_t> &chunk_indices,
         PROFILE_SCOPE_FMT("xfer_chunks_batch(%s,stream=%llu,n=%zu,i0=%ld)", name_.c_str(),
                           stream_id_, chunk_indices.size(), chunk_indices[0]);
         xfer_metrics_begin(chunk_indices.size() * pool_->block_bytes);
-        ops->copy_chunks_batch(x, chunk_indices, cpu_pool_->block_ptrs(cpu_block_indices), h2d);
+        ops->copy_chunks_batch(x, chunk_indices, cpu_pool_.block_ptrs(cpu_block_indices), h2d);
     });
 }
 
