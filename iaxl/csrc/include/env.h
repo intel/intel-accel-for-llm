@@ -41,12 +41,15 @@ static inline int env_bool(const char *name, int fallback) {
     return atoi(v) != 0;
 }
 
+#define IAXL_ZIP_SEGMENT_SIZE_MAX_COUNT 16
+
 struct Envs {
 
     int IAXL_ZIP_SRC_CAP;
     int IAXL_ZIP_DST_CAP;
     int IAXL_ZIP_LEVEL;
-    int IAXL_ZIP_SEGMENT_SIZE_KB;
+    int IAXL_ZIP_SEGMENT_SIZE_KB[IAXL_ZIP_SEGMENT_SIZE_MAX_COUNT];
+    int IAXL_ZIP_SEGMENT_SIZE_COUNT;
 
     bool IAXL_QAT_ZIP_ENABLE;
     bool IAXL_IAA_ZIP_ENABLE;
@@ -71,6 +74,8 @@ struct Envs {
     int IAXL_CACHE_CACHEGROUP_NUM;
 
     bool IAXL_DSA_GD_ENABLE;
+    int IAXL_DSA_H2D_CROSSOVER_KB;
+    int IAXL_DSA_D2H_CROSSOVER_KB;
     const char *(*IAXL_DSA_WQS)(void);
 
     bool IAXL_DEBUG_LOG;

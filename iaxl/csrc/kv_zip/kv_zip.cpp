@@ -76,16 +76,21 @@ struct SegmentRef {
     uint32_t index;
 };
 
+// The remainder joins the last segment, so a block under twice segment_size stays one segment.
 static uint32_t segment_count(uint32_t orig_size, uint32_t segment_size) {
     return std::max<uint32_t>(1, orig_size / segment_size);
 }
 
-// IAXL_ZIP_SEGMENT_SIZE_KB in bytes; 0, or a size not below the tensor's, keeps one segment.
+// First IAXL_ZIP_SEGMENT_SIZE_KB entry not above the tensor's size; 0, or none, keeps one segment.
 static uint32_t segment_size_for(uint32_t orig_size) {
-    const uint64_t size = uint64_t(envs.IAXL_ZIP_SEGMENT_SIZE_KB) * 1024;
-    if (size == 0 || size >= orig_size)
-        return std::max<uint32_t>(orig_size, 1);
-    return static_cast<uint32_t>(size);
+    for (int i = 0; i < envs.IAXL_ZIP_SEGMENT_SIZE_COUNT; i++) {
+        const uint64_t size = uint64_t(envs.IAXL_ZIP_SEGMENT_SIZE_KB[i]) * 1024;
+        if (size == 0)
+            break;
+        if (size <= orig_size)
+            return static_cast<uint32_t>(size);
+    }
+    return std::max<uint32_t>(orig_size, 1);
 }
 
 static BlockHeader make_header(size_t orig_size, uint16_t flags) {

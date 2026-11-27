@@ -8,7 +8,7 @@
 # Both *_ARGS are split on whitespace, so no value may contain a space.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/../setvars.sh"
+source "$SCRIPT_DIR/../setvars.sh" || exit 1
 : "${MODEL:?Set MODEL in setvars.sh or the environment}"
 
 export LD_PRELOAD="$IAXL_LD_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}"

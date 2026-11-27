@@ -91,6 +91,10 @@ bool dsa_copy_chunks_batch(char *gpu_bar_base, int64_t chunk_stride, int64_t out
 
     if (gpu_bar_base == nullptr) // IAXL_DSA_GD_ENABLE=0: the KV pool has no BAR mapping
         return false;
+    const int64_t crossover_kb =
+        is_h2d ? envs.IAXL_DSA_H2D_CROSSOVER_KB : envs.IAXL_DSA_D2H_CROSSOVER_KB;
+    if (crossover_kb > 0 && inner_size >= crossover_kb * 1024) // CUDA batch was measured faster
+        return false;
 
     std::lock_guard<std::mutex> lock(dsa_context_mutex);
 
