@@ -25,24 +25,41 @@ validate_tp_size() {
     fi
 }
 
+# gpu_rows <tp_size> [rank GPUs]: rank r uses the r-th entry (nvidia-smi index or UUID); none given = all GPUs in nvidia-smi order.
 gpu_rows() {
     local tp_size=$1
-    local gpu_output
+    local rank_gpus=${2:-}
+    local gpu_output rank_gpu row index pci_bus uuid
 
     validate_tp_size "$tp_size" || return 1
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "ERROR: nvidia-smi is required to detect GPU NUMA nodes" >&2
         return 1
     fi
-    if ! gpu_output=$(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits); then
+    if ! gpu_output=$(nvidia-smi --query-gpu=index,pci.bus_id,uuid --format=csv,noheader,nounits); then
         echo "ERROR: failed to query GPU PCI information with nvidia-smi" >&2
         return 1
     fi
 
-    local -a gpu_rows=()
-    mapfile -t gpu_rows <<<"$gpu_output"
+    local -a all_rows=() gpu_rows=()
+    mapfile -t all_rows <<<"$gpu_output"
+    if [[ -n "$rank_gpus" ]]; then
+        for rank_gpu in ${rank_gpus//,/ }; do
+            for row in "${all_rows[@]}"; do
+                IFS=, read -r index pci_bus uuid <<<"${row//[[:space:]]/}"
+                if [[ "$rank_gpu" == "$index" || "$rank_gpu" == "$uuid" ]]; then
+                    gpu_rows+=("$index, $pci_bus")
+                fi
+            done
+        done
+    else
+        for row in "${all_rows[@]}"; do
+            IFS=, read -r index pci_bus uuid <<<"${row//[[:space:]]/}"
+            gpu_rows+=("$index, $pci_bus")
+        done
+    fi
     if ((${#gpu_rows[@]} < tp_size)); then
-        echo "ERROR: TP_SIZE=$tp_size requires $tp_size GPUs, but only ${#gpu_rows[@]} were found" >&2
+        echo "ERROR: TP_SIZE=$tp_size requires $tp_size GPUs, but only ${#gpu_rows[@]} were found${rank_gpus:+ among $rank_gpus}" >&2
         return 1
     fi
     printf '%s\n' "${gpu_rows[@]}"
@@ -150,6 +167,7 @@ cpu_even_split() {
 
 cpu_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
+    local rank_gpus=${2:-}
     local gpu_output rank gpu_index pci_bus numa node_path cpu topology siblings
     local ranks local_rank cores_per_rank extra_cores core_count core_start offset cpu_group result
     local -a gpu_rows=() gpu_numas=() gpu_indices=() gpu_buses=() core_groups=()
@@ -157,7 +175,7 @@ cpu_auto_detect() {
     local -A ranks_per_numa=() next_rank_on_numa=() seen_cores=()
 
     validate_tp_size "$tp_size" || return 1
-    if ! gpu_output=$(gpu_rows "$tp_size" 2>/dev/null); then
+    if ! gpu_output=$(gpu_rows "$tp_size" "$rank_gpus" 2>/dev/null); then
         echo "WARNING: no usable NVIDIA GPU detected, splitting CPUs evenly across $tp_size ranks" >&2
         cpu_even_split "$tp_size"
         return
@@ -268,11 +286,12 @@ qat_auto_detect() {
 
 dsa_auto_detect() {
     local tp_size=${1:-${TP_SIZE:-}}
+    local rank_gpus=${2:-}
     local gpu_output rank gpu_index pci_bus gpu_numa dsa_path dsa_name dsa_numa dsa_id wq_path
     local selected_dsa selected_wq result
     local -a gpu_rows=() dsa_paths=() used_dsa=() rank_wqs=() candidate_wqs=()
 
-    gpu_output=$(gpu_rows "$tp_size") || return 1
+    gpu_output=$(gpu_rows "$tp_size" "$rank_gpus") || return 1
     mapfile -t gpu_rows <<<"$gpu_output"
     mapfile -t dsa_paths < <(
         for dsa_path in /sys/bus/dsa/devices/dsa[0-9]*; do

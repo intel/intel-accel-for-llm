@@ -70,7 +70,7 @@ export TP_SIZE="${TP_SIZE:-$IAXL_DEFAULT_TP_SIZE}" # Tensor-parallel worker coun
 export DP_SIZE="${DP_SIZE:-$IAXL_DEFAULT_DP_SIZE}" # Data-parallel group count (default 1)
 # Total workers = one per (dp, tp) pair; CPU/QAT/DSA specs are indexed per worker.
 NUM_WORKERS=$(iaxl_num_workers) || return 1 2>/dev/null || exit 1
-VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
+VLLM_CPU_OMP_THREADS_BIND="${VLLM_CPU_OMP_THREADS_BIND:-$(cpu_auto_detect "$NUM_WORKERS" "${CUDA_VISIBLE_DEVICES:-}")}" || return 1 2>/dev/null || exit 1
 export VLLM_CPU_OMP_THREADS_BIND # Per-worker CPU affinity (one entry per global rank)
 export KVSHRINK_CPU_OMP_THREADS_BIND="${KVSHRINK_CPU_OMP_THREADS_BIND:-$VLLM_CPU_OMP_THREADS_BIND}" # Per-worker CPUs for iaxl threads (one entry per global rank)
 rank_cpu_counts "$VLLM_CPU_OMP_THREADS_BIND" "$NUM_WORKERS" || return 1 2>/dev/null || exit 1
@@ -85,7 +85,7 @@ case "${IAXL_QAT_ZIP_ENABLE,,}" in
 esac
 case "${IAXL_DSA_GD_ENABLE,,}" in
     1|true|yes|on)
-        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$NUM_WORKERS")}" || return 1 2>/dev/null || exit 1
+        KVSHRINK_DSA_DEVICES="${KVSHRINK_DSA_DEVICES:-$(dsa_auto_detect "$NUM_WORKERS" "${CUDA_VISIBLE_DEVICES:-}")}" || return 1 2>/dev/null || exit 1
         export KVSHRINK_DSA_DEVICES # Per-rank DSA work queues
         export IAXL_DSA_WQS="${IAXL_DSA_WQS:-${KVSHRINK_DSA_DEVICES%%|*}}" # Use rank 0 DSA work queues by default
         ;;

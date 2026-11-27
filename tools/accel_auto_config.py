@@ -5,8 +5,8 @@
 """Measure accelerator settings before vLLM starts; run by accel_auto_config in tools/auto_config.sh.
 
 DSA (IAXL_DSA_GD_ENABLE): per direction, the smallest block size from which CUDA batch copies beat
-DSA, found by bisection; one process per vLLM worker (TP_SIZE * DP_SIZE), bound like the KVShrink
-connector binds that worker, all copying at the same time.
+DSA, found by bisection; one process per vLLM worker whose GPU is on rank 0's socket, bound like the
+KVShrink connector binds that worker, all copying at the same time.
 QAT (IAXL_KV_COMPRESSION and IAXL_QAT_ZIP_ENABLE): segment sizes ranked by decompression throughput,
 in one process bound like rank 0; the list also serves IAA. With only IAA: half of IAXL_ZIP_SRC_CAP.
 A variable that is already set is kept. Prints the variables to export on one line of stdout, e.g.
@@ -337,6 +337,47 @@ def calibrate_direction(workers: list, times_queue, block_kb_queues: list) -> in
     return crossover_kb
 
 
+def socket_of_numa_node(numa_node: int) -> int:
+    with open(f"/sys/devices/system/node/node{numa_node}/cpulist") as cpulist_file:
+        first_cpu = cpulist_file.read().split(",")[0].split("-")[0].strip()
+    with open(f"/sys/devices/system/cpu/cpu{first_cpu}/topology/physical_package_id") as package_file:
+        return int(package_file.read())
+
+
+def gpu_sockets(gpus: list[str]) -> list[int]:
+    """Socket of each CUDA_VISIBLE_DEVICES entry (index or UUID), found through NVML without initializing CUDA."""
+    import pynvml
+
+    pynvml.nvmlInit()
+    sockets = []
+    for gpu in gpus:
+        try:
+            if gpu.startswith("GPU-"):
+                handle = pynvml.nvmlDeviceGetHandleByUUID(gpu)
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu))
+            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
+        except (pynvml.NVMLError, ValueError) as error:
+            raise RuntimeError(f"cannot find GPU {gpu} of CUDA_VISIBLE_DEVICES: {error}") from error
+        if isinstance(bus_id, bytes):
+            bus_id = bus_id.decode()
+        pci_address = bus_id.lower()[-12:]  # NVML gives "00000000:38:00.0"; sysfs uses "0000:38:00.0"
+        with open(f"/sys/bus/pci/devices/{pci_address}/numa_node") as numa_file:
+            sockets.append(socket_of_numa_node(int(numa_file.read())))
+    pynvml.nvmlShutdown()
+    return sockets
+
+
+def dsa_socket(rank: int) -> int:
+    """Socket of the first DSA work queue KVSHRINK_DSA_DEVICES gives this rank (wq2.0 is on dsa2)."""
+    first_wq = os.environ["KVSHRINK_DSA_DEVICES"].split("|")[rank].split(",")[0].strip()
+    numa_path = f"/sys/bus/dsa/devices/dsa{first_wq[len('wq'):].split('.')[0]}/numa_node"
+    if not os.path.exists(numa_path):
+        raise RuntimeError(f"rank{rank}: DSA work queue {first_wq} of KVSHRINK_DSA_DEVICES does not exist")
+    with open(numa_path) as numa_file:
+        return socket_of_numa_node(int(numa_file.read()))
+
+
 def calibrate_dsa(context, num_workers: int) -> DsaCrossovers:
     started = time.monotonic()
     visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -346,12 +387,23 @@ def calibrate_dsa(context, num_workers: int) -> DsaCrossovers:
     else:
         for index in range(num_workers):
             gpus.append(str(index))
-    barrier = context.Barrier(num_workers)
+    sockets = gpu_sockets(gpus[:num_workers])
+    for rank in range(num_workers):
+        wq_socket = dsa_socket(rank)
+        if wq_socket != sockets[rank]:
+            wq = os.environ["KVSHRINK_DSA_DEVICES"].split("|")[rank]
+            raise RuntimeError(f"rank{rank}: GPU {gpus[rank]} is on socket {sockets[rank]} but DSA {wq} is on "
+                               f"socket {wq_socket}; fix KVSHRINK_DSA_DEVICES")
+    measured_ranks = []
+    for rank in range(num_workers):
+        if sockets[rank] == sockets[0]:
+            measured_ranks.append(rank)
+    barrier = context.Barrier(len(measured_ranks))
     deadline = context.Value("d", 0.0, lock=False)
     times_queue = context.Queue()
     block_kb_queues = []
     workers = []
-    for rank in range(num_workers):
+    for rank in measured_ranks:
         block_kb_queue = context.Queue()
         block_kb_queues.append(block_kb_queue)
         process = context.Process(
@@ -374,8 +426,8 @@ def calibrate_dsa(context, num_workers: int) -> DsaCrossovers:
         process.join()
     print(
         f"[accel_auto_config] DSA crossover H2D {crossover_kb['H2D']} KB, D2H {crossover_kb['D2H']} KB "
-        f"(0 = DSA faster up to {DSA_MAX_BLOCK_KB} KB), {num_workers} workers, "
-        f"{time.monotonic() - started:.1f} s",
+        f"(0 = DSA faster up to {DSA_MAX_BLOCK_KB} KB), {len(measured_ranks)} of {num_workers} workers "
+        f"(socket {sockets[0]}), {time.monotonic() - started:.1f} s",
         file=sys.stderr,
     )
     return DsaCrossovers(crossover_kb["H2D"], crossover_kb["D2H"])
